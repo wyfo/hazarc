@@ -25,44 +25,16 @@ const FALLBACK_STATE_MASK: usize = !FALLBACK_PTR_MASK;
 #[derive(Debug, Default)]
 pub struct Node {
     slots: CachePadded<[AtomicPtr<()>; SLOTS]>,
+    next_slot: Cell<usize>,
     fallback_slot: AtomicPtr<()>,
     free: AtomicBool,
     next: AtomicPtr<Node>,
 }
 
-pub struct LocalNode {
-    node: Cell<Option<&'static Node>>,
-    next_slot: Cell<usize>,
-}
-
-impl Default for LocalNode {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl LocalNode {
-    pub const fn new() -> Self {
-        Self {
-            node: Cell::new(None),
-            next_slot: Cell::new(0),
-        }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn insert_node<H: Hazard>(&self) -> &'static Node {
-        let node = H::global().new_node();
-        H::new_node(node);
-        self.node.set(Some(node));
-        node
-    }
-
-    #[inline(always)]
-    fn node<H: Hazard>(&self) -> &'static Node {
-        self.node.get().unwrap_or_else(|| self.insert_node::<H>())
-    }
-}
+// SAFETY: `next_slot` access is synchronized with `free`
+unsafe impl Send for Node {}
+// SAFETY: `next_slot` access is synchronized with `free`
+unsafe impl Sync for Node {}
 
 pub struct List {
     head: AtomicPtr<Node>,
@@ -84,10 +56,11 @@ impl List {
     pub fn new_node(&self) -> &'static Node {
         let mut node_ptr = &self.head;
         while let Some(node) = unsafe { node_ptr.load(Acquire).as_ref() } {
+            // Acquire load for `next_slot` synchronization
             if node.free.load(Relaxed)
                 && node
                     .free
-                    .compare_exchange(true, false, Relaxed, Relaxed)
+                    .compare_exchange(true, false, Acquire, Relaxed)
                     .is_ok()
             {
                 return node;
@@ -110,8 +83,7 @@ impl List {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe trait Hazard {
     fn global() -> &'static List;
-    fn with_local<F: Fn(&LocalNode) -> R, R>(f: F) -> R;
-    fn new_node(node: &'static Node);
+    fn local() -> &'static Node;
 }
 
 pub struct AtomicArc<T, H> {
@@ -133,18 +105,24 @@ impl<T, H: Hazard> AtomicArc<T, H> {
     #[inline]
     pub fn load(&self) -> Guard<T> {
         let ptr = self.ptr.load(Relaxed);
-        H::with_local(|local| self.load_local(ptr, local))
+        let node = H::local();
+        let slot_idx = node.next_slot.get() % SLOTS;
+        let slot = &node.slots[slot_idx];
+        if slot.load(Relaxed).is_null() {
+            self.load_with_slot(ptr, node, slot, slot_idx)
+        } else {
+            self.load_find_slot(ptr, node)
+        }
     }
 
     #[inline(always)]
-    fn load_local(&self, ptr: *mut T, local: &LocalNode) -> Guard<T> {
-        let node = local.node::<H>();
-        let slot_idx = local.next_slot.get() % SLOTS;
+    pub fn load_local(&self, ptr: *mut T, node: &'static Node) -> Guard<T> {
+        let slot_idx = node.next_slot.get() % SLOTS;
         let slot = &node.slots[slot_idx];
         if slot.load(Relaxed).is_null() {
-            self.load_with_slot(ptr, local, node, slot, slot_idx)
+            self.load_with_slot(ptr, node, slot, slot_idx)
         } else {
-            self.load_find_slot(ptr, local)
+            self.load_find_slot(ptr, node)
         }
     }
 
@@ -152,12 +130,11 @@ impl<T, H: Hazard> AtomicArc<T, H> {
     fn load_with_slot(
         &self,
         ptr: *mut T,
-        local: &LocalNode,
         node: &Node,
         slot: &'static AtomicPtr<()>,
         slot_idx: usize,
     ) -> Guard<T> {
-        local.next_slot.set(slot_idx + 1);
+        node.next_slot.set(slot_idx + 1);
         slot.store(ptr.cast(), SeqCst);
         let ptr_check = self.ptr.load(SeqCst);
         if ptr != ptr_check {
@@ -171,10 +148,9 @@ impl<T, H: Hazard> AtomicArc<T, H> {
 
     #[cold]
     #[inline(never)]
-    fn load_find_slot(&self, ptr: *mut T, local: &LocalNode) -> Guard<T> {
-        let node = unsafe { local.node.get().unwrap_unchecked() };
+    fn load_find_slot(&self, ptr: *mut T, node: &'static Node) -> Guard<T> {
         match (node.slots.iter().enumerate()).find(|(_, slot)| slot.load(Relaxed).is_null()) {
-            Some((slot_idx, slot)) => self.load_with_slot(ptr, local, node, slot, slot_idx),
+            Some((slot_idx, slot)) => self.load_with_slot(ptr, node, slot, slot_idx),
             None => self.load_fallback(ptr, node),
         }
     }
@@ -313,26 +289,31 @@ unsafe impl Hazard for Global {
         &LIST
     }
     #[inline(always)]
-    fn with_local<F: FnOnce(&LocalNode) -> R, R>(f: F) -> R {
+    fn local() -> &'static Node {
         extern crate std;
         std::thread_local! {
-            static LOCAL: LocalNode = const { LocalNode::new() };
+            static LOCAL: Cell<Option<&'static Node>> = const { Cell::new(None) };
         }
-        LOCAL.with(f)
-    }
-    fn new_node(_node: &'static Node) {
-        extern crate std;
-        struct NodeGuard<H: Hazard>(PhantomData<H>);
-        impl<H: Hazard> Drop for NodeGuard<H> {
-            fn drop(&mut self) {
-                if let Some(node) = H::with_local(|l| l.node.take()) {
-                    node.free.store(true, Relaxed);
+        #[cold]
+        #[inline(never)]
+        fn new_node() -> &'static Node {
+            struct NodeGuard;
+            impl Drop for NodeGuard {
+                fn drop(&mut self) {
+                    if let Some(node) = LOCAL.take() {
+                        // Release store for `next_slot` synchronization
+                        node.free.store(true, Release);
+                    }
                 }
             }
+            std::thread_local! {
+                static GUARD: NodeGuard = const { NodeGuard };
+            }
+            let node = Global::global().new_node();
+            LOCAL.set(Some(node));
+            GUARD.with(|_| ());
+            node
         }
-        std::thread_local! {
-            static GUARD: NodeGuard<Global> = const { NodeGuard(PhantomData) };
-        }
-        GUARD.with(|_| ())
+        LOCAL.get().unwrap_or_else(new_node)
     }
 }
