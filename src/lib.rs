@@ -4,6 +4,7 @@ extern crate alloc;
 use alloc::{boxed::Box, sync::Arc};
 use core::{
     cell::Cell,
+    iter,
     marker::PhantomData,
     mem::ManuallyDrop,
     ops::Deref,
@@ -15,6 +16,8 @@ use core::{
 };
 
 use crossbeam_utils::CachePadded;
+
+const NULL: *mut () = ptr::null_mut();
 
 const SLOTS: usize = 8;
 const FALLBACK_TRY_LOAD: usize = 1;
@@ -36,6 +39,20 @@ unsafe impl Send for Node {}
 // SAFETY: `next_slot` access is synchronized with `free`
 unsafe impl Sync for Node {}
 
+impl Node {
+    fn try_acquire(&self) -> bool {
+        // Acquire load for `next_slot` synchronization
+        self.free.load(Relaxed)
+            && (self.free.compare_exchange(true, false, Acquire, Relaxed)).is_ok()
+    }
+
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn release(&self) {
+        // Release store for `next_slot` synchronization
+        self.free.store(true, Release);
+    }
+}
+
 pub struct List {
     head: AtomicPtr<Node>,
 }
@@ -53,23 +70,27 @@ impl List {
         }
     }
 
+    fn nodes(&self) -> impl Iterator<Item = &'static Node> {
+        let mut node_ptr = &self.head;
+        iter::from_fn(move || {
+            let node = unsafe { node_ptr.load(Acquire).as_ref()? };
+            node_ptr = &node.next;
+            Some(node)
+        })
+    }
+
     pub fn new_node(&self) -> &'static Node {
         let mut node_ptr = &self.head;
+        // Cannot use `Self::nodes` because the final node pointer is needed for chaining
         while let Some(node) = unsafe { node_ptr.load(Acquire).as_ref() } {
-            // Acquire load for `next_slot` synchronization
-            if node.free.load(Relaxed)
-                && node
-                    .free
-                    .compare_exchange(true, false, Acquire, Relaxed)
-                    .is_ok()
-            {
+            if node.try_acquire() {
                 return node;
             }
             node_ptr = &node.next;
         }
         let new_node = Box::leak(Default::default());
         while let Err(node_ref) = node_ptr
-            .compare_exchange(ptr::null_mut(), ptr::from_mut(new_node), Release, Acquire)
+            .compare_exchange(ptr::null_mut(), ptr::from_mut(new_node), Release, Relaxed)
             .map_err(|err| unsafe { err.as_ref().unwrap_unchecked() })
         {
             // No need to check free, because it's highly improbable
@@ -95,6 +116,7 @@ unsafe impl<T, H> Send for AtomicArc<T, H> {}
 unsafe impl<T, H> Sync for AtomicArc<T, H> {}
 
 impl<T, H: Hazard> AtomicArc<T, H> {
+    #[inline]
     pub fn new(arc: Arc<T>) -> Self {
         Self {
             ptr: AtomicPtr::new(Arc::into_raw(arc).cast_mut().cast()),
@@ -158,23 +180,23 @@ impl<T, H: Hazard> AtomicArc<T, H> {
     #[cold]
     #[inline(never)]
     fn load_fallback(&self, ptr: *mut T, node: &Node) -> Guard<T> {
-        let ptr_try_load = ptr.map_addr(|addr| addr | FALLBACK_TRY_LOAD);
-        node.fallback_slot.store(ptr_try_load.cast(), SeqCst);
+        let ptr_try_load = ptr.map_addr(|addr| addr | FALLBACK_TRY_LOAD).cast();
+        node.fallback_slot.store(ptr_try_load, SeqCst);
         let ptr_check = self.ptr.load(SeqCst);
-        let ptr_confirm_load = ptr_check.map_addr(|addr| addr | FALLBACK_CONFIRM_LOAD);
+        let ptr_confirm_load = ptr_check
+            .map_addr(|addr| addr | FALLBACK_CONFIRM_LOAD)
+            .cast();
         let ptr_confirmed = match node.fallback_slot.compare_exchange(
-            ptr_try_load.cast(),
-            ptr_confirm_load.cast(),
+            ptr_try_load,
+            ptr_confirm_load,
             Relaxed,
             Acquire,
         ) {
             Ok(_) => {
-                match node.fallback_slot.compare_exchange(
-                    ptr_confirm_load.cast(),
-                    ptr::null_mut(),
-                    Relaxed,
-                    Acquire,
-                ) {
+                match node
+                    .fallback_slot
+                    .compare_exchange(ptr_confirm_load, NULL, Relaxed, Acquire)
+                {
                     Ok(_) => unsafe { Arc::increment_strong_count(ptr_check) },
                     Err(ptr) => {
                         debug_assert!(ptr.is_null());
@@ -196,13 +218,10 @@ impl<T, H: Hazard> AtomicArc<T, H> {
     pub fn swap(&self, arc: Arc<T>) -> Arc<T> {
         let new_ptr = Arc::into_raw(arc).cast_mut();
         let old_ptr = self.ptr.swap(new_ptr.cast(), SeqCst);
-        let mut node_ptr = &H::global().head;
-        while let Some(node) = unsafe { node_ptr.load(Acquire).as_ref() } {
+        for node in H::global().nodes() {
             for slot in node.slots.iter() {
                 if slot.load(SeqCst) == old_ptr.cast()
-                    && slot
-                        .compare_exchange(old_ptr.cast(), ptr::null_mut(), Release, Relaxed)
-                        .is_ok()
+                    && (slot.compare_exchange(old_ptr.cast(), NULL, Release, Relaxed)).is_ok()
                 {
                     unsafe { Arc::increment_strong_count(old_ptr) }
                 }
@@ -223,18 +242,15 @@ impl<T, H: Hazard> AtomicArc<T, H> {
                     if fallback_ptr.addr() & FALLBACK_PTR_MASK != new_ptr.addr() {
                         break;
                     }
-                    match node.fallback_slot.compare_exchange(
-                        fallback_ptr,
-                        ptr::null_mut(),
-                        Release,
-                        Relaxed,
-                    ) {
+                    match node
+                        .fallback_slot
+                        .compare_exchange(fallback_ptr, NULL, Release, Relaxed)
+                    {
                         Ok(_) => unsafe { Arc::increment_strong_count(new_ptr) },
                         Err(ptr) => fallback_ptr = ptr,
                     }
                 }
             }
-            node_ptr = &node.next;
         }
         unsafe { Arc::from_raw(old_ptr) }
     }
@@ -253,14 +269,8 @@ impl<T> Drop for Guard<T> {
     #[inline]
     fn drop(&mut self) {
         if let Some(slot) = self.slot
-            && slot
-                .compare_exchange(
-                    Arc::as_ptr(&self.arc).cast_mut().cast(),
-                    ptr::null_mut(),
-                    Release,
-                    Relaxed,
-                )
-                .is_ok()
+            && let ptr = Arc::as_ptr(&self.arc).cast_mut().cast()
+            && slot.compare_exchange(ptr, NULL, Release, Relaxed).is_ok()
         {
             return;
         }
@@ -301,8 +311,7 @@ unsafe impl Hazard for Global {
             impl Drop for NodeGuard {
                 fn drop(&mut self) {
                     if let Some(node) = LOCAL.take() {
-                        // Release store for `next_slot` synchronization
-                        node.free.store(true, Release);
+                        unsafe { node.release() };
                     }
                 }
             }
