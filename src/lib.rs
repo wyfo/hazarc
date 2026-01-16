@@ -20,10 +20,7 @@ use crossbeam_utils::CachePadded;
 const NULL: *mut () = ptr::null_mut();
 
 const SLOTS: usize = 8;
-const FALLBACK_TRY_LOAD: usize = 1;
-const FALLBACK_CONFIRM_LOAD: usize = 2;
-const FALLBACK_PTR_MASK: usize = usize::MAX << 2;
-const FALLBACK_STATE_MASK: usize = !FALLBACK_PTR_MASK;
+const FALLBACK_FLAG: usize = 1;
 
 #[derive(Debug, Default)]
 pub struct Node {
@@ -165,7 +162,7 @@ impl<T, H: Hazard> AtomicArc<T, H> {
         slot.store(ptr.cast(), SeqCst);
         let ptr_check = self.ptr.load(SeqCst);
         if ptr != ptr_check {
-            return self.load_fallback(ptr, node);
+            return self.load_fallback(node);
         }
         Guard {
             slot: Some(slot),
@@ -178,42 +175,27 @@ impl<T, H: Hazard> AtomicArc<T, H> {
     fn load_find_slot(&self, ptr: *mut T, node: &'static Node) -> Guard<T> {
         match (node.slots.iter().enumerate()).find(|(_, slot)| slot.load(Relaxed).is_null()) {
             Some((slot_idx, slot)) => self.load_with_slot(ptr, node, slot, slot_idx),
-            None => self.load_fallback(ptr, node),
+            None => self.load_fallback(node),
         }
     }
 
     #[cold]
     #[inline(never)]
-    fn load_fallback(&self, ptr: *mut T, node: &Node) -> Guard<T> {
-        let ptr_try_load = ptr.map_addr(|addr| addr | FALLBACK_TRY_LOAD).cast();
-        node.fallback_slot.store(ptr_try_load, SeqCst);
+    fn load_fallback(&self, node: &Node) -> Guard<T> {
+        let init_ptr = ptr::without_provenance_mut(FALLBACK_FLAG);
+        node.fallback_slot.store(init_ptr, SeqCst);
         let ptr_check = self.ptr.load(SeqCst);
-        let ptr_confirm_load = ptr_check
-            .map_addr(|addr| addr | FALLBACK_CONFIRM_LOAD)
-            .cast();
-        let ptr_confirmed = match node.fallback_slot.compare_exchange(
-            ptr_try_load,
-            ptr_confirm_load,
-            Relaxed,
-            Acquire,
-        ) {
+        let confirm_ptr = ptr_check.map_addr(|addr| addr | FALLBACK_FLAG).cast();
+        let mut ptr_confirmed = ptr_check;
+        match (node.fallback_slot).compare_exchange(init_ptr, confirm_ptr, Relaxed, Acquire) {
             Ok(_) => {
-                match node
-                    .fallback_slot
-                    .compare_exchange(ptr_confirm_load, NULL, Relaxed, Acquire)
-                {
+                match (node.fallback_slot).compare_exchange(confirm_ptr, NULL, Relaxed, Acquire) {
                     Ok(_) => unsafe { Arc::increment_strong_count(ptr_check) },
-                    Err(ptr) => {
-                        debug_assert!(ptr.is_null());
-                    }
-                };
-                ptr_check
+                    Err(ptr) => debug_assert!(ptr.is_null()),
+                }
             }
-            Err(ptr) => {
-                debug_assert_eq!(ptr.addr() & FALLBACK_STATE_MASK, 0);
-                ptr.cast()
-            }
-        };
+            Err(ptr) => ptr_confirmed = ptr.cast(),
+        }
         Guard {
             slot: None,
             arc: ManuallyDrop::new(unsafe { Arc::from_raw(ptr_confirmed) }),
@@ -223,6 +205,9 @@ impl<T, H: Hazard> AtomicArc<T, H> {
     pub fn swap(&self, arc: Arc<T>) -> Arc<T> {
         let new_ptr = Arc::into_raw(arc).cast_mut();
         let old_ptr = self.ptr.swap(new_ptr.cast(), SeqCst);
+        let old_arc = unsafe { Arc::from_raw(old_ptr) };
+        // increment the refcount before in case some slots are reset
+        let _guard = old_arc.clone();
         for node in H::global().nodes() {
             for slot in node.slots.iter() {
                 if slot.load(SeqCst) == old_ptr.cast()
@@ -231,33 +216,22 @@ impl<T, H: Hazard> AtomicArc<T, H> {
                     unsafe { Arc::increment_strong_count(old_ptr) }
                 }
             }
-            let mut fallback_ptr = node.fallback_slot.load(SeqCst);
-            while fallback_ptr.addr() & FALLBACK_STATE_MASK != 0 {
-                if fallback_ptr.addr() & FALLBACK_STATE_MASK == FALLBACK_TRY_LOAD {
-                    match node.fallback_slot.compare_exchange(
-                        fallback_ptr,
-                        new_ptr.cast(),
-                        Release,
-                        Relaxed,
-                    ) {
-                        Ok(_) => unsafe { Arc::increment_strong_count(new_ptr) },
-                        Err(ptr) => fallback_ptr = ptr,
-                    }
-                } else if fallback_ptr.addr() & FALLBACK_STATE_MASK == FALLBACK_CONFIRM_LOAD {
-                    if fallback_ptr.addr() & FALLBACK_PTR_MASK != new_ptr.addr() {
-                        break;
-                    }
-                    match node
-                        .fallback_slot
-                        .compare_exchange(fallback_ptr, NULL, Release, Relaxed)
-                    {
-                        Ok(_) => unsafe { Arc::increment_strong_count(new_ptr) },
-                        Err(ptr) => fallback_ptr = ptr,
-                    }
-                }
+            let fallback_ptr = node.fallback_slot.load(SeqCst);
+            let fallback_xchg = match fallback_ptr.addr() {
+                addr if addr == FALLBACK_FLAG => new_ptr.cast(),
+                addr if addr == new_ptr.addr() | FALLBACK_FLAG => NULL,
+                _ => continue,
+            };
+            // increment the refcount before in case fallback succeeds
+            unsafe { Arc::increment_strong_count(new_ptr) };
+            if (node.fallback_slot)
+                .compare_exchange(fallback_ptr, fallback_xchg, Release, Relaxed)
+                .is_err()
+            {
+                unsafe { Arc::decrement_strong_count(new_ptr) };
             }
         }
-        unsafe { Arc::from_raw(old_ptr) }
+        old_arc
     }
 
     pub fn store(&self, arc: Arc<T>) {
