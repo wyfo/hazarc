@@ -30,7 +30,7 @@ pub struct Node {
     slots: CachePadded<[AtomicPtr<()>; SLOTS]>,
     next_slot: Cell<usize>,
     fallback_slot: AtomicPtr<()>,
-    free: AtomicBool,
+    unused: AtomicBool,
     next: AtomicPtr<Node>,
 }
 
@@ -42,14 +42,13 @@ unsafe impl Sync for Node {}
 impl Node {
     fn try_acquire(&self) -> bool {
         // Acquire load for `next_slot` synchronization
-        self.free.load(Relaxed)
-            && (self.free.compare_exchange(true, false, Acquire, Relaxed)).is_ok()
+        self.unused.load(Relaxed)
+            && (self.unused.compare_exchange(true, false, Acquire, Relaxed)).is_ok()
     }
 
-    #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn release(&self) {
+    unsafe fn release(&self) {
         // Release store for `next_slot` synchronization
-        self.free.store(true, Release);
+        self.unused.store(true, Release);
     }
 }
 
@@ -79,7 +78,7 @@ impl List {
         })
     }
 
-    pub fn new_node(&self) -> &'static Node {
+    pub fn insert_node(&self) -> &'static Node {
         let mut node_ptr = &self.head;
         // Cannot use `Self::nodes` because the final node pointer is needed for chaining
         while let Some(node) = unsafe { node_ptr.load(Acquire).as_ref() } {
@@ -98,6 +97,12 @@ impl List {
             node_ptr = &node_ref.next;
         }
         new_node
+    }
+
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn remove_node(&self, node: &'static Node) {
+        // SAFETY: same contract
+        unsafe { node.release() };
     }
 }
 
@@ -311,14 +316,14 @@ unsafe impl Hazard for Global {
             impl Drop for NodeGuard {
                 fn drop(&mut self) {
                     if let Some(node) = LOCAL.take() {
-                        unsafe { node.release() };
+                        unsafe { Global::global().remove_node(node) };
                     }
                 }
             }
             std::thread_local! {
                 static GUARD: NodeGuard = const { NodeGuard };
             }
-            let node = Global::global().new_node();
+            let node = Global::global().insert_node();
             LOCAL.set(Some(node));
             GUARD.with(|_| ());
             node
