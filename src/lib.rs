@@ -162,20 +162,20 @@ impl List {
 }
 
 #[allow(clippy::missing_safety_doc)]
-pub unsafe trait Hazard {
-    fn global() -> &'static List;
-    fn local() -> NodeRef;
+pub unsafe trait HazardList {
+    fn list() -> &'static List;
+    fn local_node() -> NodeRef;
 }
 
-pub struct AtomicArc<T, H> {
+pub struct AtomicArc<T, L> {
     ptr: AtomicPtr<T>,
-    _phantom: PhantomData<H>,
+    _phantom: PhantomData<L>,
 }
 
-unsafe impl<T, H> Send for AtomicArc<T, H> {}
-unsafe impl<T, H> Sync for AtomicArc<T, H> {}
+unsafe impl<T, L> Send for AtomicArc<T, L> {}
+unsafe impl<T, L> Sync for AtomicArc<T, L> {}
 
-impl<T, H: Hazard> AtomicArc<T, H> {
+impl<T, L: HazardList> AtomicArc<T, L> {
     #[inline]
     pub fn new(arc: Arc<T>) -> Self {
         Self {
@@ -187,7 +187,7 @@ impl<T, H: Hazard> AtomicArc<T, H> {
     #[inline]
     pub fn load(&self) -> Guard<T> {
         let ptr = self.ptr.load(Relaxed);
-        let node = H::local();
+        let node = L::local_node();
         let slot_idx = node.next_slot.get();
         // `slots().get_unchecked` seems to ruin performance...
         let slot = unsafe { &*node.slots_ptr().add(slot_idx) };
@@ -257,7 +257,7 @@ impl<T, H: Hazard> AtomicArc<T, H> {
         let old_arc = unsafe { Arc::from_raw(old_ptr) };
         // increment the refcount before in case some slots are reset
         let _guard = old_arc.clone();
-        for node in H::global().nodes() {
+        for node in L::list().nodes() {
             for slot in node.slots().iter() {
                 if slot.load(SeqCst) == old_ptr.cast()
                     && (slot.compare_exchange(old_ptr.cast(), NULL, Release, Relaxed)).is_ok()
@@ -316,41 +316,46 @@ impl<T> Deref for Guard<T> {
     }
 }
 
-#[cfg(feature = "std")]
-pub struct Global;
+#[macro_export]
+macro_rules! hazard_list {
+    ($vis:vis $name:ident($slot_count:expr)) => {
+        $vis struct $name;
+        unsafe impl $crate::HazardList for $name {
+            #[inline(always)]
+            fn list() -> &'static $crate::List {
+                static LIST: $crate::List = $crate::List::new();
+                &LIST
+            }
+            #[inline(always)]
+            fn local_node() -> $crate::NodeRef {
+                extern crate std;
+                std::thread_local! {
+                    static LOCAL: Cell<Option<$crate::NodeRef>> = const { Cell::new(None) };
+                }
+                #[cold]
+                #[inline(never)]
+                fn new_node() -> $crate::NodeRef {
+                    struct NodeGuard;
+                    impl Drop for NodeGuard {
+                        fn drop(&mut self) {
+                            if let Some(node) = LOCAL.take() {
+                                unsafe { $name::list().remove_node(node) };
+                            }
+                        }
+                    }
+                    std::thread_local! {
+                        static GUARD: NodeGuard = const { NodeGuard };
+                    }
+                    let node = $name::list().insert_node($slot_count);
+                    LOCAL.set(Some(node));
+                    GUARD.with(|_| ());
+                    node
+                }
+                LOCAL.get().unwrap_or_else(new_node)
+            }
+        }
+    };
+}
 
 #[cfg(feature = "std")]
-unsafe impl Hazard for Global {
-    #[inline(always)]
-    fn global() -> &'static List {
-        static LIST: List = List::new();
-        &LIST
-    }
-    #[inline(always)]
-    fn local() -> NodeRef {
-        extern crate std;
-        std::thread_local! {
-            static LOCAL: Cell<Option<NodeRef>> = const { Cell::new(None) };
-        }
-        #[cold]
-        #[inline(never)]
-        fn new_node() -> NodeRef {
-            struct NodeGuard;
-            impl Drop for NodeGuard {
-                fn drop(&mut self) {
-                    if let Some(node) = LOCAL.take() {
-                        unsafe { Global::global().remove_node(node) };
-                    }
-                }
-            }
-            std::thread_local! {
-                static GUARD: NodeGuard = const { NodeGuard };
-            }
-            let node = Global::global().insert_node(8);
-            LOCAL.set(Some(node));
-            GUARD.with(|_| ());
-            node
-        }
-        LOCAL.get().unwrap_or_else(new_node)
-    }
-}
+hazard_list!(pub Global(8));
