@@ -209,13 +209,19 @@ impl<T, L: HazardList> AtomicArc<T, L> {
     ) -> Guard<T> {
         node.next_slot.set((slot_idx + 1) & node.slot_mask);
         slot.store(ptr.cast(), SeqCst);
-        let ptr_check = self.ptr.load(SeqCst);
-        if ptr != ptr_check {
-            return self.load_fallback(node);
+        let ptr_checked = self.ptr.load(SeqCst);
+        if ptr != ptr_checked {
+            return self.load_outdated(node, ptr, slot);
         }
-        Guard {
-            slot: Some(slot),
-            arc: ManuallyDrop::new(unsafe { Arc::from_raw(ptr_check) }),
+        Guard::new(ptr_checked, Some(slot))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn load_outdated(&self, node: NodeRef, ptr: *mut T, slot: &'static AtomicPtr<()>) -> Guard<T> {
+        match slot.compare_exchange(ptr.cast(), ptr::null_mut(), Release, Relaxed) {
+            Ok(_) => self.load_fallback(node),
+            Err(_) => Guard::new(ptr, None),
         }
     }
 
@@ -228,27 +234,22 @@ impl<T, L: HazardList> AtomicArc<T, L> {
         }
     }
 
-    #[cold]
-    #[inline(never)]
     fn load_fallback(&self, node: NodeRef) -> Guard<T> {
         let init_ptr = ptr::without_provenance_mut(FALLBACK_FLAG);
         node.fallback_slot.store(init_ptr, SeqCst);
-        let ptr_check = self.ptr.load(SeqCst);
-        let confirm_ptr = ptr_check.map_addr(|addr| addr | FALLBACK_FLAG).cast();
-        let mut ptr_confirmed = ptr_check;
+        let ptr_checked = self.ptr.load(SeqCst);
+        let confirm_ptr = ptr_checked.map_addr(|addr| addr | FALLBACK_FLAG).cast();
+        let mut ptr_confirmed = ptr_checked;
         match (node.fallback_slot).compare_exchange(init_ptr, confirm_ptr, Relaxed, Acquire) {
             Ok(_) => {
                 match (node.fallback_slot).compare_exchange(confirm_ptr, NULL, Relaxed, Acquire) {
-                    Ok(_) => unsafe { Arc::increment_strong_count(ptr_check) },
+                    Ok(_) => unsafe { Arc::increment_strong_count(ptr_checked) },
                     Err(ptr) => debug_assert!(ptr.is_null()),
                 }
             }
             Err(ptr) => ptr_confirmed = ptr.cast(),
         }
-        Guard {
-            slot: None,
-            arc: ManuallyDrop::new(unsafe { Arc::from_raw(ptr_confirmed) }),
-        }
+        Guard::new(ptr_confirmed, None)
     }
 
     pub fn swap(&self, arc: Arc<T>) -> Arc<T> {
@@ -291,6 +292,14 @@ impl<T, L: HazardList> AtomicArc<T, L> {
 pub struct Guard<T> {
     slot: Option<&'static AtomicPtr<()>>,
     arc: ManuallyDrop<Arc<T>>,
+}
+
+impl<T> Guard<T> {
+    #[inline(always)]
+    fn new(ptr: *mut T, slot: Option<&'static AtomicPtr<()>>) -> Self {
+        let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr) });
+        Self { slot, arc }
+    }
 }
 
 impl<T> Drop for Guard<T> {
