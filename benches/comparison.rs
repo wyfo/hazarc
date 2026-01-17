@@ -150,7 +150,6 @@ fn hazarc_write(b: Bencher, thread_count: usize) {
 fn hazarc_read(b: Bencher, write: bool) {
     let v: Arc<usize> = 0.into();
     let arc: Arc<AtomicArc<usize, Global>> = Arc::new(AtomicArc::new(v.clone()));
-    let _guard = arc.load();
     let stop = Arc::new(AtomicBool::new(false));
     let thread = {
         let v = v.clone();

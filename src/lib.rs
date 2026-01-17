@@ -1,14 +1,20 @@
 #![no_std]
 extern crate alloc;
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{
+    alloc::{alloc_zeroed, handle_alloc_error},
+    sync::Arc,
+};
 use core::{
+    alloc::Layout,
     cell::Cell,
     iter,
     marker::PhantomData,
     mem::ManuallyDrop,
     ops::Deref,
     ptr,
+    ptr::NonNull,
+    slice,
     sync::atomic::{
         AtomicBool, AtomicPtr,
         Ordering::{Acquire, Relaxed, Release, SeqCst},
@@ -19,33 +25,85 @@ use crossbeam_utils::CachePadded;
 
 const NULL: *mut () = ptr::null_mut();
 
-const SLOTS: usize = 8;
 const FALLBACK_FLAG: usize = 1;
 
-#[derive(Debug, Default)]
+#[repr(C)]
 pub struct Node {
-    slots: CachePadded<[AtomicPtr<()>; SLOTS]>,
-    next_slot: Cell<usize>,
-    fallback_slot: AtomicPtr<()>,
-    unused: AtomicBool,
+    _align: CachePadded<()>,
     next: AtomicPtr<Node>,
+    inserted: AtomicBool,
+    fallback_slot: AtomicPtr<()>,
+    slot_mask: usize,
+    next_slot: Cell<usize>,
+    __slots: [AtomicPtr<()>; 0],
 }
 
-// SAFETY: `next_slot` access is synchronized with `free`
+// SAFETY: `next_slot` access is synchronized with `inserted`
 unsafe impl Send for Node {}
-// SAFETY: `next_slot` access is synchronized with `free`
+// SAFETY: `next_slot` access is synchronized with `inserted`
 unsafe impl Sync for Node {}
 
 impl Node {
+    fn allocate(slot_count: usize) -> NodeRef {
+        let slot_count = slot_count.next_power_of_two();
+        let (layout, _) = Layout::new::<Node>()
+            .extend(Layout::array::<AtomicPtr<()>>(slot_count).unwrap())
+            .unwrap();
+        // SAFETY: layout has non-zero size
+        let ptr = unsafe { alloc_zeroed(layout) }.cast::<Node>();
+        let mut node = NodeRef(NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout)));
+        unsafe { node.0.as_mut() }.slot_mask = slot_count - 1;
+        *unsafe { node.0.as_mut() }.inserted.get_mut() = true;
+        node
+    }
+
     fn try_acquire(&self) -> bool {
         // Acquire load for `next_slot` synchronization
-        self.unused.load(Relaxed)
-            && (self.unused.compare_exchange(true, false, Acquire, Relaxed)).is_ok()
+        !self.inserted.load(Relaxed) && !self.inserted.swap(true, Acquire)
     }
 
     unsafe fn release(&self) {
         // Release store for `next_slot` synchronization
-        self.unused.store(true, Release);
+        self.inserted.store(false, Release);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct NodeRef(NonNull<Node>);
+// SAFETY: `NodeRef` is equivalent to `&'static Node`
+unsafe impl Send for NodeRef {}
+// SAFETY: `NodeRef` is equivalent to `&'static Node`
+unsafe impl Sync for NodeRef {}
+
+impl Deref for NodeRef {
+    type Target = Node;
+    #[inline(always)]
+    fn deref(&self) -> &Node {
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl NodeRef {
+    unsafe fn new(ptr: *const Node) -> Option<Self> {
+        NonNull::new(ptr.cast_mut()).map(Self)
+    }
+
+    fn as_ptr(&self) -> *mut Node {
+        self.0.as_ptr()
+    }
+
+    fn as_ref(&self) -> &'static Node {
+        unsafe { self.0.as_ref() }
+    }
+
+    #[inline(always)]
+    fn slots_ptr(self) -> *const AtomicPtr<()> {
+        unsafe { &raw const (*self.0.as_ptr()).__slots as *const AtomicPtr<()> }
+    }
+
+    #[inline(always)]
+    fn slots(self) -> &'static [AtomicPtr<()>] {
+        unsafe { slice::from_raw_parts(self.slots_ptr(), self.slot_mask + 1) }
     }
 }
 
@@ -66,27 +124,27 @@ impl List {
         }
     }
 
-    fn nodes(&self) -> impl Iterator<Item = &'static Node> {
+    fn nodes(&self) -> impl Iterator<Item = NodeRef> {
         let mut node_ptr = &self.head;
         iter::from_fn(move || {
-            let node = unsafe { node_ptr.load(Acquire).as_ref()? };
-            node_ptr = &node.next;
+            let node = unsafe { NodeRef::new(node_ptr.load(Acquire))? };
+            node_ptr = &node.as_ref().next;
             Some(node)
         })
     }
 
-    pub fn insert_node(&self) -> &'static Node {
+    pub fn insert_node(&self, slot_count: usize) -> NodeRef {
         let mut node_ptr = &self.head;
         // Cannot use `Self::nodes` because the final node pointer is needed for chaining
-        while let Some(node) = unsafe { node_ptr.load(Acquire).as_ref() } {
+        while let Some(node) = unsafe { NodeRef::new(node_ptr.load(Acquire)) } {
             if node.try_acquire() {
                 return node;
             }
-            node_ptr = &node.next;
+            node_ptr = &node.as_ref().next;
         }
-        let new_node = Box::leak(Default::default());
+        let new_node = Node::allocate(slot_count);
         while let Err(node_ref) = node_ptr
-            .compare_exchange(ptr::null_mut(), ptr::from_mut(new_node), Release, Relaxed)
+            .compare_exchange(ptr::null_mut(), new_node.as_ptr(), Release, Relaxed)
             .map_err(|err| unsafe { err.as_ref().unwrap_unchecked() })
         {
             // No need to check free, because it's highly improbable
@@ -97,7 +155,7 @@ impl List {
     }
 
     #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn remove_node(&self, node: &'static Node) {
+    pub unsafe fn remove_node(&self, node: NodeRef) {
         // SAFETY: same contract
         unsafe { node.release() };
     }
@@ -106,7 +164,7 @@ impl List {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe trait Hazard {
     fn global() -> &'static List;
-    fn local() -> &'static Node;
+    fn local() -> NodeRef;
 }
 
 pub struct AtomicArc<T, H> {
@@ -130,19 +188,10 @@ impl<T, H: Hazard> AtomicArc<T, H> {
     pub fn load(&self) -> Guard<T> {
         let ptr = self.ptr.load(Relaxed);
         let node = H::local();
-        let slot_idx = node.next_slot.get() % SLOTS;
-        let slot = &node.slots[slot_idx];
-        if slot.load(Relaxed).is_null() {
-            self.load_with_slot(ptr, node, slot, slot_idx)
-        } else {
-            self.load_find_slot(ptr, node)
-        }
-    }
-
-    #[inline(always)]
-    pub fn load_local(&self, ptr: *mut T, node: &'static Node) -> Guard<T> {
-        let slot_idx = node.next_slot.get() % SLOTS;
-        let slot = &node.slots[slot_idx];
+        let slot_idx = node.next_slot.get();
+        // `slots().get_unchecked` seems to ruin performance...
+        let slot = unsafe { &*node.slots_ptr().add(slot_idx) };
+        // let slot = unsafe { node.slots().get_unchecked(slot_idx) };
         if slot.load(Relaxed).is_null() {
             self.load_with_slot(ptr, node, slot, slot_idx)
         } else {
@@ -154,11 +203,11 @@ impl<T, H: Hazard> AtomicArc<T, H> {
     fn load_with_slot(
         &self,
         ptr: *mut T,
-        node: &Node,
+        node: NodeRef,
         slot: &'static AtomicPtr<()>,
         slot_idx: usize,
     ) -> Guard<T> {
-        node.next_slot.set(slot_idx + 1);
+        node.next_slot.set((slot_idx + 1) & node.slot_mask);
         slot.store(ptr.cast(), SeqCst);
         let ptr_check = self.ptr.load(SeqCst);
         if ptr != ptr_check {
@@ -172,8 +221,8 @@ impl<T, H: Hazard> AtomicArc<T, H> {
 
     #[cold]
     #[inline(never)]
-    fn load_find_slot(&self, ptr: *mut T, node: &'static Node) -> Guard<T> {
-        match (node.slots.iter().enumerate()).find(|(_, slot)| slot.load(Relaxed).is_null()) {
+    fn load_find_slot(&self, ptr: *mut T, node: NodeRef) -> Guard<T> {
+        match (node.slots().iter().enumerate()).find(|(_, slot)| slot.load(Relaxed).is_null()) {
             Some((slot_idx, slot)) => self.load_with_slot(ptr, node, slot, slot_idx),
             None => self.load_fallback(node),
         }
@@ -181,7 +230,7 @@ impl<T, H: Hazard> AtomicArc<T, H> {
 
     #[cold]
     #[inline(never)]
-    fn load_fallback(&self, node: &Node) -> Guard<T> {
+    fn load_fallback(&self, node: NodeRef) -> Guard<T> {
         let init_ptr = ptr::without_provenance_mut(FALLBACK_FLAG);
         node.fallback_slot.store(init_ptr, SeqCst);
         let ptr_check = self.ptr.load(SeqCst);
@@ -209,7 +258,7 @@ impl<T, H: Hazard> AtomicArc<T, H> {
         // increment the refcount before in case some slots are reset
         let _guard = old_arc.clone();
         for node in H::global().nodes() {
-            for slot in node.slots.iter() {
+            for slot in node.slots().iter() {
                 if slot.load(SeqCst) == old_ptr.cast()
                     && (slot.compare_exchange(old_ptr.cast(), NULL, Release, Relaxed)).is_ok()
                 {
@@ -278,14 +327,14 @@ unsafe impl Hazard for Global {
         &LIST
     }
     #[inline(always)]
-    fn local() -> &'static Node {
+    fn local() -> NodeRef {
         extern crate std;
         std::thread_local! {
-            static LOCAL: Cell<Option<&'static Node>> = const { Cell::new(None) };
+            static LOCAL: Cell<Option<NodeRef>> = const { Cell::new(None) };
         }
         #[cold]
         #[inline(never)]
-        fn new_node() -> &'static Node {
+        fn new_node() -> NodeRef {
             struct NodeGuard;
             impl Drop for NodeGuard {
                 fn drop(&mut self) {
@@ -297,7 +346,7 @@ unsafe impl Hazard for Global {
             std::thread_local! {
                 static GUARD: NodeGuard = const { NodeGuard };
             }
-            let node = Global::global().insert_node();
+            let node = Global::global().insert_node(8);
             LOCAL.set(Some(node));
             GUARD.with(|_| ());
             node
