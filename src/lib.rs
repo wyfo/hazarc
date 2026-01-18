@@ -1,272 +1,134 @@
 #![no_std]
 extern crate alloc;
 
-use alloc::{
-    alloc::{alloc_zeroed, handle_alloc_error},
-    sync::Arc,
-};
+use alloc::{borrow::ToOwned, sync::Arc};
 use core::{
-    alloc::Layout,
-    cell::Cell,
-    iter,
     marker::PhantomData,
     mem::ManuallyDrop,
     ops::Deref,
     ptr,
-    ptr::NonNull,
-    slice,
     sync::atomic::{
-        AtomicBool, AtomicPtr,
+        AtomicPtr,
         Ordering::{Acquire, Relaxed, Release, SeqCst},
     },
 };
 
-use crossbeam_utils::CachePadded;
+use borrow_list::StaticBorrowList;
+
+use crate::borrow_list::{Borrow, BorrowNodeRef, release_borrow};
+
+pub mod borrow_list;
 
 const NULL: *mut () = ptr::null_mut();
-
 const FALLBACK_FLAG: usize = 1;
 
-#[repr(C)]
-pub struct Node {
-    _align: CachePadded<()>,
-    next: AtomicPtr<Node>,
-    inserted: AtomicBool,
-    fallback_slot: AtomicPtr<()>,
-    slot_mask: usize,
-    next_slot: Cell<usize>,
-    __slots: [AtomicPtr<()>; 0],
-}
-
-// SAFETY: `next_slot` access is synchronized with `inserted`
-unsafe impl Send for Node {}
-// SAFETY: `next_slot` access is synchronized with `inserted`
-unsafe impl Sync for Node {}
-
-impl Node {
-    fn allocate(slot_count: usize) -> NodeRef {
-        let slot_count = slot_count.next_power_of_two();
-        let (layout, _) = Layout::new::<Node>()
-            .extend(Layout::array::<AtomicPtr<()>>(slot_count).unwrap())
-            .unwrap();
-        // SAFETY: layout has non-zero size
-        let ptr = unsafe { alloc_zeroed(layout) }.cast::<Node>();
-        let mut node = NodeRef(NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout)));
-        unsafe { node.0.as_mut() }.slot_mask = slot_count - 1;
-        *unsafe { node.0.as_mut() }.inserted.get_mut() = true;
-        node
-    }
-
-    fn try_acquire(&self) -> bool {
-        // Acquire load for `next_slot` synchronization
-        !self.inserted.load(Relaxed) && !self.inserted.swap(true, Acquire)
-    }
-
-    unsafe fn release(&self) {
-        // Release store for `next_slot` synchronization
-        self.inserted.store(false, Release);
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct NodeRef(NonNull<Node>);
-// SAFETY: `NodeRef` is equivalent to `&'static Node`
-unsafe impl Send for NodeRef {}
-// SAFETY: `NodeRef` is equivalent to `&'static Node`
-unsafe impl Sync for NodeRef {}
-
-impl Deref for NodeRef {
-    type Target = Node;
-    #[inline(always)]
-    fn deref(&self) -> &Node {
-        unsafe { self.0.as_ref() }
-    }
-}
-
-impl NodeRef {
-    unsafe fn new(ptr: *const Node) -> Option<Self> {
-        NonNull::new(ptr.cast_mut()).map(Self)
-    }
-
-    fn as_ptr(&self) -> *mut Node {
-        self.0.as_ptr()
-    }
-
-    fn as_ref(&self) -> &'static Node {
-        unsafe { self.0.as_ref() }
-    }
-
-    #[inline(always)]
-    fn slots_ptr(self) -> *const AtomicPtr<()> {
-        unsafe { &raw const (*self.0.as_ptr()).__slots as *const AtomicPtr<()> }
-    }
-
-    #[inline(always)]
-    fn slots(self) -> &'static [AtomicPtr<()>] {
-        unsafe { slice::from_raw_parts(self.slots_ptr(), self.slot_mask + 1) }
-    }
-}
-
-pub struct List {
-    head: AtomicPtr<Node>,
-}
-
-impl Default for List {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl List {
-    pub const fn new() -> Self {
-        Self {
-            head: AtomicPtr::new(ptr::null_mut()),
-        }
-    }
-
-    fn nodes(&self) -> impl Iterator<Item = NodeRef> {
-        let mut node_ptr = &self.head;
-        iter::from_fn(move || {
-            let node = unsafe { NodeRef::new(node_ptr.load(Acquire))? };
-            node_ptr = &node.as_ref().next;
-            Some(node)
-        })
-    }
-
-    pub fn insert_node(&self, slot_count: usize) -> NodeRef {
-        let mut node_ptr = &self.head;
-        // Cannot use `Self::nodes` because the final node pointer is needed for chaining
-        while let Some(node) = unsafe { NodeRef::new(node_ptr.load(Acquire)) } {
-            if node.try_acquire() {
-                return node;
-            }
-            node_ptr = &node.as_ref().next;
-        }
-        let new_node = Node::allocate(slot_count);
-        while let Err(node_ref) = node_ptr
-            .compare_exchange(ptr::null_mut(), new_node.as_ptr(), Release, Relaxed)
-            .map_err(|err| unsafe { err.as_ref().unwrap_unchecked() })
-        {
-            // No need to check free, because it's highly improbable
-            // that a node is freed just after being added
-            node_ptr = &node_ref.next;
-        }
-        new_node
-    }
-
-    #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn remove_node(&self, node: NodeRef) {
-        // SAFETY: same contract
-        unsafe { node.release() };
-    }
-}
-
-#[allow(clippy::missing_safety_doc)]
-pub unsafe trait HazardList {
-    fn list() -> &'static List;
-    fn local_node() -> NodeRef;
-}
-
 pub struct AtomicArc<T, L> {
-    ptr: AtomicPtr<T>,
-    _phantom: PhantomData<L>,
+    ptr: AtomicPtr<()>,
+    _ptr: PhantomData<T>,
+    _list: PhantomData<L>,
 }
 
 unsafe impl<T, L> Send for AtomicArc<T, L> {}
 unsafe impl<T, L> Sync for AtomicArc<T, L> {}
 
-impl<T, L: HazardList> AtomicArc<T, L> {
+impl<T, L: StaticBorrowList> AtomicArc<T, L> {
     #[inline]
     pub fn new(arc: Arc<T>) -> Self {
         Self {
             ptr: AtomicPtr::new(Arc::into_raw(arc).cast_mut().cast()),
-            _phantom: PhantomData,
+            _ptr: PhantomData,
+            _list: PhantomData,
         }
     }
 
     #[inline]
-    pub fn load(&self) -> Guard<T> {
+    pub fn load(&self) -> ArcBorrow<T> {
         let ptr = self.ptr.load(Relaxed);
-        let node = L::local_node();
-        let slot_idx = node.next_slot.get();
+        let node = L::thread_local_node();
+        let borrow_idx = node.next_borrow_idx.get();
         // `slots().get_unchecked` seems to ruin performance...
-        let slot = unsafe { &*node.slots_ptr().add(slot_idx) };
+        let slot = unsafe { &*node.borrow_ptr().add(borrow_idx) };
         // let slot = unsafe { node.slots().get_unchecked(slot_idx) };
         if slot.load(Relaxed).is_null() {
-            self.load_with_slot(ptr, node, slot, slot_idx)
+            self.load_with_slot(ptr, node, slot, borrow_idx)
         } else {
-            self.load_find_slot(ptr, node)
+            self.load_find_available_borrow(ptr, node)
         }
     }
 
     #[inline(always)]
     fn load_with_slot(
         &self,
-        ptr: *mut T,
-        node: NodeRef,
-        slot: &'static AtomicPtr<()>,
-        slot_idx: usize,
-    ) -> Guard<T> {
-        node.next_slot.set((slot_idx + 1) & node.slot_mask);
-        slot.store(ptr.cast(), SeqCst);
+        ptr: *mut (),
+        node: BorrowNodeRef,
+        borrow: &'static AtomicPtr<()>,
+        borrow_idx: usize,
+    ) -> ArcBorrow<T> {
+        node.next_borrow_idx
+            .set((borrow_idx + 1) & node.borrow_idx_mask);
+        borrow.store(ptr.cast(), SeqCst);
         let ptr_checked = self.ptr.load(SeqCst);
         if ptr != ptr_checked {
-            return self.load_outdated(node, ptr, slot);
+            return self.load_outdated(node, ptr, borrow);
         }
-        Guard::new(ptr_checked, Some(slot))
+        ArcBorrow::new(ptr_checked, Some(borrow))
     }
 
     #[cold]
     #[inline(never)]
-    fn load_outdated(&self, node: NodeRef, ptr: *mut T, slot: &'static AtomicPtr<()>) -> Guard<T> {
-        match slot.compare_exchange(ptr.cast(), ptr::null_mut(), Release, Relaxed) {
+    fn load_outdated(
+        &self,
+        node: BorrowNodeRef,
+        ptr: *mut (),
+        borrow: &'static AtomicPtr<()>,
+    ) -> ArcBorrow<T> {
+        match borrow.compare_exchange(ptr.cast(), ptr::null_mut(), Release, Relaxed) {
             Ok(_) => self.load_fallback(node),
-            Err(_) => Guard::new(ptr, None),
+            Err(_) => ArcBorrow::new(ptr, None),
         }
     }
 
     #[cold]
     #[inline(never)]
-    fn load_find_slot(&self, ptr: *mut T, node: NodeRef) -> Guard<T> {
-        match (node.slots().iter().enumerate()).find(|(_, slot)| slot.load(Relaxed).is_null()) {
+    fn load_find_available_borrow(&self, ptr: *mut (), node: BorrowNodeRef) -> ArcBorrow<T> {
+        match (node.borrows().iter().enumerate()).find(|(_, borrow)| borrow.load(Relaxed).is_null())
+        {
             Some((slot_idx, slot)) => self.load_with_slot(ptr, node, slot, slot_idx),
             None => self.load_fallback(node),
         }
     }
 
-    fn load_fallback(&self, node: NodeRef) -> Guard<T> {
+    fn load_fallback(&self, node: BorrowNodeRef) -> ArcBorrow<T> {
         let init_ptr = ptr::without_provenance_mut(FALLBACK_FLAG);
-        node.fallback_slot.store(init_ptr, SeqCst);
+        node.fallback.store(init_ptr, SeqCst);
         let ptr_checked = self.ptr.load(SeqCst);
         let confirm_ptr = ptr_checked.map_addr(|addr| addr | FALLBACK_FLAG).cast();
         let mut ptr_confirmed = ptr_checked;
-        match (node.fallback_slot).compare_exchange(init_ptr, confirm_ptr, Relaxed, Acquire) {
-            Ok(_) => {
-                match (node.fallback_slot).compare_exchange(confirm_ptr, NULL, Relaxed, Acquire) {
-                    Ok(_) => unsafe { Arc::increment_strong_count(ptr_checked) },
-                    Err(ptr) => debug_assert!(ptr.is_null()),
-                }
-            }
+        match (node.fallback).compare_exchange(init_ptr, confirm_ptr, Relaxed, Acquire) {
+            Ok(_) => match (node.fallback).compare_exchange(confirm_ptr, NULL, Relaxed, Acquire) {
+                Ok(_) => unsafe { Arc::increment_strong_count(ptr_checked) },
+                Err(ptr) => debug_assert!(ptr.is_null()),
+            },
             Err(ptr) => ptr_confirmed = ptr.cast(),
         }
-        Guard::new(ptr_confirmed, None)
+        ArcBorrow::new(ptr_confirmed, None)
     }
 
     pub fn swap(&self, arc: Arc<T>) -> Arc<T> {
         let new_ptr = Arc::into_raw(arc).cast_mut();
         let old_ptr = self.ptr.swap(new_ptr.cast(), SeqCst);
-        let old_arc = unsafe { Arc::from_raw(old_ptr) };
+        let old_arc = unsafe { Arc::from_raw(old_ptr.cast::<T>()) };
         // increment the refcount before in case some slots are reset
         let _guard = old_arc.clone();
-        for node in L::list().nodes() {
-            for slot in node.slots().iter() {
-                if slot.load(SeqCst) == old_ptr.cast()
-                    && (slot.compare_exchange(old_ptr.cast(), NULL, Release, Relaxed)).is_ok()
+        for node in L::static_list().nodes() {
+            for borrow in node.borrows().iter() {
+                if borrow.load(SeqCst) == old_ptr.cast()
+                    && (borrow.compare_exchange(old_ptr.cast(), NULL, Release, Relaxed)).is_ok()
                 {
                     unsafe { Arc::increment_strong_count(old_ptr) }
                 }
             }
-            let fallback_ptr = node.fallback_slot.load(SeqCst);
+            let fallback_ptr = node.fallback.load(SeqCst);
             let fallback_xchg = match fallback_ptr.addr() {
                 addr if addr == FALLBACK_FLAG => new_ptr.cast(),
                 addr if addr == new_ptr.addr() | FALLBACK_FLAG => NULL,
@@ -274,7 +136,7 @@ impl<T, L: HazardList> AtomicArc<T, L> {
             };
             // increment the refcount before in case fallback succeeds
             unsafe { Arc::increment_strong_count(new_ptr) };
-            if (node.fallback_slot)
+            if (node.fallback)
                 .compare_exchange(fallback_ptr, fallback_xchg, Release, Relaxed)
                 .is_err()
             {
@@ -289,36 +151,40 @@ impl<T, L: HazardList> AtomicArc<T, L> {
     }
 }
 
-pub struct Guard<T> {
-    slot: Option<&'static AtomicPtr<()>>,
+pub struct ArcBorrow<T> {
+    borrow: Option<&'static Borrow>,
     arc: ManuallyDrop<Arc<T>>,
 }
 
-impl<T> Guard<T> {
+impl<T> ArcBorrow<T> {
     #[inline(always)]
-    fn new(ptr: *mut T, slot: Option<&'static AtomicPtr<()>>) -> Self {
-        let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr) });
-        Self { slot, arc }
+    fn new(ptr: *mut (), borrow: Option<&'static Borrow>) -> Self {
+        let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr.cast()) });
+        Self { borrow, arc }
+    }
+
+    #[inline]
+    pub fn into_owned(self) -> Arc<T> {
+        if self.borrow.is_none() {
+            return unsafe { ManuallyDrop::take(&mut ManuallyDrop::new(self).arc) };
+        }
+        self.to_owned()
     }
 }
 
-impl<T> Drop for Guard<T> {
+impl<T> Drop for ArcBorrow<T> {
     #[inline]
     fn drop(&mut self) {
-        if let Some(slot) = self.slot
-            && let ptr = Arc::as_ptr(&self.arc).cast_mut().cast()
-            && slot.compare_exchange(ptr, NULL, Release, Relaxed).is_ok()
-        {
-            return;
+        if (self.borrow).is_none_or(|b| !release_borrow(b, Arc::as_ptr(&self.arc))) {
+            #[cold]
+            #[inline(never)]
+            fn drop_arc<T>(_: Arc<T>) {}
+            drop_arc(unsafe { ManuallyDrop::take(&mut self.arc) })
         }
-        #[cold]
-        #[inline(never)]
-        fn drop_arc<T>(_: Arc<T>) {}
-        drop_arc(unsafe { ManuallyDrop::take(&mut self.arc) })
     }
 }
 
-impl<T> Deref for Guard<T> {
+impl<T> Deref for ArcBorrow<T> {
     type Target = Arc<T>;
     fn deref(&self) -> &Self::Target {
         &self.arc
@@ -326,36 +192,36 @@ impl<T> Deref for Guard<T> {
 }
 
 #[macro_export]
-macro_rules! hazard_list {
-    ($vis:vis $name:ident($slot_count:expr)) => {
+macro_rules! borrow_list {
+    ($vis:vis $name:ident($borrow_count:expr)) => {
         $vis struct $name;
-        unsafe impl $crate::HazardList for $name {
+        unsafe impl $crate::borrow_list::StaticBorrowList for $name {
             #[inline(always)]
-            fn list() -> &'static $crate::List {
-                static LIST: $crate::List = $crate::List::new();
+            fn static_list() -> &'static $crate::borrow_list::BorrowList {
+                static LIST: $crate::borrow_list::BorrowList = $crate::borrow_list::BorrowList::new();
                 &LIST
             }
             #[inline(always)]
-            fn local_node() -> $crate::NodeRef {
+            fn thread_local_node() -> $crate::borrow_list::BorrowNodeRef {
                 extern crate std;
                 std::thread_local! {
-                    static LOCAL: Cell<Option<$crate::NodeRef>> = const { Cell::new(None) };
+                    static LOCAL: std::cell::Cell<std::option::Option<$crate::borrow_list::BorrowNodeRef>> = const { std::cell::Cell::new(None) };
                 }
                 #[cold]
                 #[inline(never)]
-                fn new_node() -> $crate::NodeRef {
+                fn new_node() -> $crate::borrow_list::BorrowNodeRef {
                     struct NodeGuard;
                     impl Drop for NodeGuard {
                         fn drop(&mut self) {
                             if let Some(node) = LOCAL.take() {
-                                unsafe { $name::list().remove_node(node) };
+                                unsafe { <$name as  $crate::borrow_list::StaticBorrowList>::static_list().remove_node(node) };
                             }
                         }
                     }
                     std::thread_local! {
                         static GUARD: NodeGuard = const { NodeGuard };
                     }
-                    let node = $name::list().insert_node($slot_count);
+                    let node = <$name as  $crate::borrow_list::StaticBorrowList>::static_list().insert_node($borrow_count);
                     LOCAL.set(Some(node));
                     GUARD.with(|_| ());
                     node
@@ -365,6 +231,3 @@ macro_rules! hazard_list {
         }
     };
 }
-
-#[cfg(feature = "std")]
-hazard_list!(pub Global(8));

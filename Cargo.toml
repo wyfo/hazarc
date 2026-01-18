@@ -3,10 +3,6 @@ name = "hazarc"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = ["std"]
-std = []
-
 [dependencies]
 crossbeam-utils = "0.8"
 
@@ -20,4 +16,3 @@ bench = false
 [[bench]]
 name = "comparison"
 harness = false
-required-features = ["std"]
