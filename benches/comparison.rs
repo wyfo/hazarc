@@ -7,9 +7,9 @@ use std::{
     time::Duration,
 };
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use divan::Bencher;
-use hazarc::{AtomicArc, borrow_list};
+use hazarc::{AtomicArc, AtomicOptionArc, borrow_list};
 
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
 fn arcswap_write(b: Bencher, thread_count: usize) {
@@ -62,6 +62,13 @@ fn arcswap_read(b: Bencher, write: bool) {
         .bench_values(|()| drop(arc.load()));
     stop.store(true, Relaxed);
     thread.join().unwrap();
+}
+
+#[divan::bench]
+fn arcswap_read_none(b: Bencher) {
+    let atomic_arc = ArcSwapOption::<usize>::empty();
+    b.with_inputs(|| drop(atomic_arc.load()))
+        .bench_values(|()| drop(atomic_arc.load()));
 }
 
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
@@ -173,6 +180,13 @@ fn hazarc_read(b: Bencher, write: bool) {
         .bench_values(|()| drop(arc.load()));
     stop.store(true, Relaxed);
     thread.join().unwrap();
+}
+
+#[divan::bench]
+fn hazarc_read_none(b: Bencher) {
+    let atomic_arc = AtomicOptionArc::<usize, BorrowList>::null();
+    b.with_inputs(|| drop(atomic_arc.load()))
+        .bench_values(|()| drop(atomic_arc.load()));
 }
 
 fn main() {

@@ -78,12 +78,6 @@ impl BorrowList {
 
 pub(crate) type Borrow = AtomicPtr<()>;
 
-pub(crate) fn release_borrow<T>(borrow: &Borrow, ptr: *const T) -> bool {
-    borrow
-        .compare_exchange(ptr.cast_mut().cast(), NULL, Relaxed, Relaxed)
-        .is_ok()
-}
-
 #[doc(hidden)]
 #[repr(C)]
 pub struct BorrowNode {
