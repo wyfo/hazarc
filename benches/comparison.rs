@@ -127,6 +127,34 @@ fn rwlock_read(b: Bencher, write: bool) {
     thread.join().unwrap();
 }
 
+#[divan::bench(threads = [1, 2, 4, 8, 16], args = [false, true])]
+fn rwlock_read_no_clone(b: Bencher, write: bool) {
+    let v: Arc<usize> = 0.into();
+    let lock = Arc::new(RwLock::new(v.clone()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread = {
+        let v = v.clone();
+        let lock = lock.clone();
+        let stop = stop.clone();
+        thread::spawn(move || {
+            while !stop.load(Relaxed) {
+                if write {
+                    *lock.write().unwrap() = v.clone();
+                }
+                for _ in 0..256 {
+                    std::hint::spin_loop();
+                }
+            }
+        })
+    };
+    thread::sleep(Duration::from_secs(1));
+    b.bench(|| {
+        let _lock = lock.read().unwrap();
+    });
+    stop.store(true, Relaxed);
+    thread.join().unwrap();
+}
+
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
 fn hazarc_write(b: Bencher, thread_count: usize) {
     let v: Arc<usize> = 0.into();
