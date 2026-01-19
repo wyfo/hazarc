@@ -21,6 +21,7 @@ pub unsafe trait NonNullPtr {}
 
 #[allow(clippy::missing_safety_doc)]
 pub unsafe trait ArcPtr: Clone {
+    const NULLABLE: bool = false;
     unsafe fn from_ptr(ptr: *mut ()) -> Self;
     #[allow(clippy::wrong_self_convention)]
     fn into_ptr(arc: Self) -> *mut ();
@@ -37,6 +38,7 @@ pub unsafe trait ArcPtr: Clone {
 }
 
 unsafe impl<A: ArcPtr + NonNullPtr> ArcPtr for Option<A> {
+    const NULLABLE: bool = true;
     #[inline(always)]
     unsafe fn from_ptr(ptr: *mut ()) -> Self {
         // SAFETY: same function contract
@@ -106,22 +108,31 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         }
     }
 
-    #[inline]
-    pub fn load_impl(&self, ptr: *mut ()) -> ArcPtrBorrow<A> {
+    #[inline(always)]
+    fn load_impl(&self) -> ArcPtrBorrow<A> {
+        self.load_with_ptr(self.ptr.load(Relaxed))
+    }
+
+    #[inline(always)]
+    fn load_with_ptr(&self, ptr: *mut ()) -> ArcPtrBorrow<A> {
+        if A::NULLABLE && ptr.is_null() {
+            return ArcPtrBorrow::new(ptr, None);
+        }
+        debug_assert!(!ptr.is_null());
         let node = L::thread_local_node();
         let borrow_idx = node.next_borrow_idx.get();
         // `slots().get_unchecked` seems to ruin performance...
         let slot = unsafe { &*node.borrow_ptr().add(borrow_idx) };
         // let slot = unsafe { node.slots().get_unchecked(slot_idx) };
         if slot.load(Relaxed).is_null() {
-            self.load_with_slot(ptr, node, slot, borrow_idx)
+            self.load_with_borrow(ptr, node, slot, borrow_idx)
         } else {
             self.load_find_available_borrow(ptr, node)
         }
     }
 
     #[inline(always)]
-    fn load_with_slot(
+    fn load_with_borrow(
         &self,
         ptr: *mut (),
         node: BorrowNodeRef,
@@ -157,7 +168,7 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
     fn load_find_available_borrow(&self, ptr: *mut (), node: BorrowNodeRef) -> ArcPtrBorrow<A> {
         match (node.borrows().iter().enumerate()).find(|(_, borrow)| borrow.load(Relaxed).is_null())
         {
-            Some((slot_idx, slot)) => self.load_with_slot(ptr, node, slot, slot_idx),
+            Some((slot_idx, slot)) => self.load_with_borrow(ptr, node, slot, slot_idx),
             None => self.load_fallback(node),
         }
     }
@@ -178,6 +189,21 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         ArcPtrBorrow::new(ptr_confirmed, None)
     }
 
+    #[inline]
+    pub fn load_owned(&self) -> A {
+        self.load_impl().into_owned()
+    }
+
+    #[inline]
+    pub fn load_if_outdated_impl<'a>(&self, arc: &'a A) -> Result<&'a A, ArcPtrBorrow<A>> {
+        let ptr = self.ptr.load(Relaxed);
+        if ptr == A::as_ptr(arc) {
+            Ok(arc)
+        } else {
+            Err(self.load_with_ptr(ptr))
+        }
+    }
+
     pub fn swap(&self, arc: A) -> A {
         let new_ptr = A::into_ptr(arc);
         let old_ptr = self.ptr.swap(new_ptr, SeqCst);
@@ -189,7 +215,7 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         // increment the refcount before in case some slots are reset
         let _guard = old_arc.clone();
         for node in L::static_list().nodes() {
-            if !old_ptr.is_null() {
+            if !A::NULLABLE || !old_ptr.is_null() {
                 for borrow in node.borrows().iter() {
                     if borrow.load(SeqCst) == old_ptr.cast()
                         && (borrow.compare_exchange(old_ptr.cast(), NULL, Release, Relaxed)).is_ok()
@@ -225,7 +251,22 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
 impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
     #[inline]
     pub fn load(&self) -> ArcPtrBorrow<A> {
-        self.load_impl(self.ptr.load(Relaxed))
+        self.load_impl()
+    }
+
+    #[inline]
+    pub fn load_if_outdated<'a>(&self, arc: &'a A) -> Result<&'a A, ArcPtrBorrow<A>> {
+        self.load_if_outdated_impl(arc)
+    }
+
+    #[inline]
+    pub fn load_cached<'a>(&self, cached: &'a mut A) -> &'a A {
+        // using `load_if_outdated` doesn't give the exact same code
+        let ptr = self.ptr.load(Relaxed);
+        if ptr != A::as_ptr(cached) {
+            *cached = self.load_with_ptr(ptr).into_owned();
+        }
+        cached
     }
 }
 
@@ -241,11 +282,26 @@ impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> AtomicArcPtr<Option<A>, L> {
 
     #[inline]
     pub fn load(&self) -> Option<ArcPtrBorrow<A>> {
+        self.load_impl().into_opt()
+    }
+
+    #[inline]
+    pub fn load_if_outdated<'a>(
+        &self,
+        arc: &'a Option<A>,
+    ) -> Result<&'a Option<A>, Option<ArcPtrBorrow<A>>> {
+        self.load_if_outdated_impl(arc)
+            .map_err(ArcPtrBorrow::into_opt)
+    }
+
+    #[inline]
+    pub fn load_cached<'a>(&self, cached: &'a mut Option<A>) -> Option<&'a A> {
+        // using `load_if_outdated` doesn't give the exact same code
         let ptr = self.ptr.load(Relaxed);
-        if ptr.is_null() {
-            return None;
+        if ptr != Option::as_ptr(cached) {
+            *cached = self.load_with_ptr(ptr).into_owned();
         }
-        self.load_impl(ptr).into_opt()
+        cached.as_ref()
     }
 }
 

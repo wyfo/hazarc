@@ -4,6 +4,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 pub mod borrow_list;
+pub mod cache;
 pub mod generic;
 
 pub type AtomicArc<T, L> = generic::AtomicArcPtr<Arc<T>, L>;
