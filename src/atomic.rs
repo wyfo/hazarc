@@ -201,12 +201,17 @@ impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
 
 impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> AtomicArcPtr<Option<A>, L> {
     #[inline]
-    pub const fn null() -> Self {
+    pub const fn none() -> Self {
         Self {
             ptr: AtomicPtr::new(NULL),
             _arc: PhantomData,
             _list: PhantomData,
         }
+    }
+
+    #[inline]
+    pub fn is_none(&self) -> bool {
+        self.ptr.load(Relaxed).is_null()
     }
 
     #[inline]

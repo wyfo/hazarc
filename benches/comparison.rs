@@ -210,7 +210,7 @@ fn hazarc_read(b: Bencher, write: bool) {
 
 #[divan::bench]
 fn hazarc_read_none(b: Bencher) {
-    let atomic_arc = AtomicOptionArc::<usize>::null();
+    let atomic_arc = AtomicOptionArc::<usize>::none();
     b.with_inputs(|| drop(atomic_arc.load()))
         .bench_values(|()| drop(atomic_arc.load()));
 }
