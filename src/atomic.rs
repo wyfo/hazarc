@@ -66,13 +66,13 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         borrow: &'static AtomicPtr<()>,
         borrow_idx: usize,
     ) -> ArcPtrBorrow<A> {
-        node.next_borrow_idx()
-            .set((borrow_idx + 1) & node.borrow_idx_mask());
         borrow.store(ptr, SeqCst);
         let ptr_checked = self.ptr.load(SeqCst);
         if ptr != ptr_checked {
             return self.load_outdated(node, ptr, borrow);
         }
+        node.next_borrow_idx()
+            .set((borrow_idx + 1) & node.borrow_idx_mask());
         ArcPtrBorrow::new(ptr_checked, Some(borrow))
     }
 
