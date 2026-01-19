@@ -3,6 +3,10 @@ name = "hazarc"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["default-borrow-list"]
+default-borrow-list = []
+
 [dependencies]
 crossbeam-utils = "0.8"
 

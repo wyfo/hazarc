@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![no_std]
 extern crate alloc;
 
@@ -7,7 +8,16 @@ pub mod borrow_list;
 pub mod cache;
 pub mod generic;
 
+#[cfg(feature = "default-borrow-list")]
+borrow_list!(pub DefaultBorrowList(8));
+
+#[cfg(feature = "default-borrow-list")]
+pub type AtomicArc<T, L = DefaultBorrowList> = generic::AtomicArcPtr<Arc<T>, L>;
+#[cfg(not(feature = "default-borrow-list"))]
 pub type AtomicArc<T, L> = generic::AtomicArcPtr<Arc<T>, L>;
+#[cfg(feature = "default-borrow-list")]
+pub type AtomicOptionArc<T, L = DefaultBorrowList> = generic::AtomicArcPtr<Option<Arc<T>>, L>;
+#[cfg(not(feature = "default-borrow-list"))]
 pub type AtomicOptionArc<T, L> = generic::AtomicArcPtr<Option<Arc<T>>, L>;
 pub type ArcBorrow<T> = generic::ArcPtrBorrow<Arc<T>>;
 
