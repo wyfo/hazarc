@@ -3,7 +3,6 @@ use core::{
     alloc::Layout,
     cell::Cell,
     iter,
-    ops::Deref,
     ptr::NonNull,
     slice,
     sync::atomic::{
@@ -43,7 +42,7 @@ impl BorrowList {
         let mut node_ptr = &self.head;
         iter::from_fn(move || {
             let node = unsafe { BorrowNodeRef::new(node_ptr.load(Acquire))? };
-            node_ptr = &node.as_ref().next;
+            node_ptr = node.next();
             Some(node)
         })
     }
@@ -55,16 +54,16 @@ impl BorrowList {
             if node.try_acquire() {
                 return node;
             }
-            node_ptr = &node.as_ref().next;
+            node_ptr = node.next();
         }
-        let new_node = BorrowNode::allocate(slot_count);
-        while let Err(node_ref) = node_ptr
+        let new_node = BorrowNodeRef::allocate(slot_count);
+        while let Err(next) = node_ptr
             .compare_exchange(NULL.cast(), new_node.as_ptr(), Release, Relaxed)
-            .map_err(|err| unsafe { err.as_ref().unwrap_unchecked() })
+            .map_err(|err| unsafe { &(*err).next })
         {
             // No need to check free, because it's highly improbable
             // that a node is freed just after being added
-            node_ptr = &node_ref.next;
+            node_ptr = next;
         }
         new_node
     }
@@ -82,11 +81,11 @@ pub(crate) type Borrow = AtomicPtr<()>;
 #[repr(C)]
 pub struct BorrowNode {
     _align: CachePadded<()>,
-    pub(crate) next: AtomicPtr<BorrowNode>,
-    pub(crate) inserted: AtomicBool,
-    pub(crate) fallback: AtomicPtr<()>,
-    pub(crate) next_borrow_idx: Cell<usize>,
-    pub(crate) borrow_idx_mask: usize,
+    next: AtomicPtr<BorrowNode>,
+    inserted: AtomicBool,
+    fallback: AtomicPtr<()>,
+    next_borrow_idx: Cell<usize>,
+    borrow_idx_mask: usize,
     borrows: [Borrow; 0],
 }
 
@@ -96,7 +95,31 @@ unsafe impl Send for BorrowNode {}
 // SAFETY: `next_slot` access is synchronized with `inserted`
 unsafe impl Sync for BorrowNode {}
 
-impl BorrowNode {
+impl BorrowNode {}
+
+#[derive(Clone, Copy)]
+pub struct BorrowNodeRef(NonNull<BorrowNode>);
+
+// SAFETY: `NodeRef` is equivalent to `&'static Node`
+unsafe impl Send for BorrowNodeRef {}
+
+// SAFETY: `NodeRef` is equivalent to `&'static Node`
+unsafe impl Sync for BorrowNodeRef {}
+
+macro_rules! ref_field {
+    ($field:ident: $ty:ty) => {
+        #[inline(always)]
+        pub(crate) fn $field(self) -> &'static $ty {
+            unsafe { &(*self.as_ptr()).$field }
+        }
+    };
+}
+
+impl BorrowNodeRef {
+    unsafe fn new(ptr: *const BorrowNode) -> Option<Self> {
+        NonNull::new(ptr.cast_mut()).map(Self)
+    }
+
     fn allocate(borrows: usize) -> BorrowNodeRef {
         let borrows = borrows.next_power_of_two();
         let (layout, _) = Layout::new::<BorrowNode>()
@@ -113,45 +136,23 @@ impl BorrowNode {
 
     fn try_acquire(&self) -> bool {
         // Acquire load for `next_slot` synchronization
-        !self.inserted.load(Relaxed) && !self.inserted.swap(true, Acquire)
+        !self.inserted().load(Relaxed) && !self.inserted().swap(true, Acquire)
     }
 
     unsafe fn release(&self) {
         // Release store for `next_slot` synchronization
-        self.inserted.store(false, Release);
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct BorrowNodeRef(NonNull<BorrowNode>);
-
-// SAFETY: `NodeRef` is equivalent to `&'static Node`
-unsafe impl Send for BorrowNodeRef {}
-
-// SAFETY: `NodeRef` is equivalent to `&'static Node`
-unsafe impl Sync for BorrowNodeRef {}
-
-#[doc(hidden)]
-impl Deref for BorrowNodeRef {
-    type Target = BorrowNode;
-    #[inline(always)]
-    fn deref(&self) -> &BorrowNode {
-        unsafe { self.0.as_ref() }
-    }
-}
-
-impl BorrowNodeRef {
-    unsafe fn new(ptr: *const BorrowNode) -> Option<Self> {
-        NonNull::new(ptr.cast_mut()).map(Self)
+        self.inserted().store(false, Release);
     }
 
     fn as_ptr(&self) -> *mut BorrowNode {
         self.0.as_ptr()
     }
 
-    fn as_ref(&self) -> &'static BorrowNode {
-        unsafe { self.0.as_ref() }
-    }
+    ref_field!(next: AtomicPtr<BorrowNode>);
+    ref_field!(inserted: AtomicBool);
+    ref_field!(fallback: AtomicPtr<()>);
+    ref_field!(next_borrow_idx: Cell<usize>);
+    ref_field!(borrow_idx_mask: usize);
 
     #[inline(always)]
     pub(crate) fn borrow_ptr(self) -> *const Borrow {
@@ -160,7 +161,7 @@ impl BorrowNodeRef {
 
     #[inline(always)]
     pub(crate) fn borrows(self) -> &'static [Borrow] {
-        unsafe { slice::from_raw_parts(self.borrow_ptr(), self.borrow_idx_mask + 1) }
+        unsafe { slice::from_raw_parts(self.borrow_ptr(), self.borrow_idx_mask() + 1) }
     }
 }
 
@@ -203,4 +204,25 @@ macro_rules! borrow_list {
             }
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use crate::borrow_list::StaticBorrowList;
+
+    borrow_list!(TestList(1));
+    #[test]
+    fn node_reuse() {
+        let thread = std::thread::spawn(|| {
+            let node = TestList::thread_local_node();
+            node.next_borrow_idx().set(1);
+            node
+        });
+        let node1 = thread.join().unwrap();
+        let node2 = TestList::thread_local_node();
+        assert_eq!(node1.as_ptr(), node2.as_ptr());
+        assert_eq!(node2.next_borrow_idx().get(), 1);
+    }
 }

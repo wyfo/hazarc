@@ -47,7 +47,7 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         }
         debug_assert!(!ptr.is_null());
         let node = L::thread_local_node();
-        let borrow_idx = node.next_borrow_idx.get();
+        let borrow_idx = node.next_borrow_idx().get();
         // `slots().get_unchecked` seems to ruin performance...
         let slot = unsafe { &*node.borrow_ptr().add(borrow_idx) };
         // let slot = unsafe { node.slots().get_unchecked(slot_idx) };
@@ -66,8 +66,8 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         borrow: &'static AtomicPtr<()>,
         borrow_idx: usize,
     ) -> ArcPtrBorrow<A> {
-        node.next_borrow_idx
-            .set((borrow_idx + 1) & node.borrow_idx_mask);
+        node.next_borrow_idx()
+            .set((borrow_idx + 1) & node.borrow_idx_mask());
         borrow.store(ptr, SeqCst);
         let ptr_checked = self.ptr.load(SeqCst);
         if ptr != ptr_checked {
@@ -101,13 +101,14 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
     }
 
     fn load_fallback(&self, node: BorrowNodeRef) -> ArcPtrBorrow<A> {
+        let fallback = node.fallback();
         let try_load_ptr = (&self.ptr as *const _ as *mut ()).map_addr(|addr| addr | TRY_LOAD_FLAG);
-        node.fallback.store(try_load_ptr, SeqCst);
+        fallback.store(try_load_ptr, SeqCst);
         let ptr_checked = self.ptr.load(SeqCst);
         let confirm_ptr = ptr_checked.map_addr(|addr| addr | CONFIRM_FLAG).cast();
         let mut ptr_confirmed = ptr_checked;
-        match (node.fallback).compare_exchange(try_load_ptr, confirm_ptr, Relaxed, Acquire) {
-            Ok(_) => match (node.fallback).compare_exchange(confirm_ptr, NULL, Relaxed, Acquire) {
+        match (fallback).compare_exchange(try_load_ptr, confirm_ptr, Relaxed, Acquire) {
+            Ok(_) => match (fallback).compare_exchange(confirm_ptr, NULL, Relaxed, Acquire) {
                 Ok(_) => unsafe { A::incr_rc(ptr_checked) },
                 Err(ptr) => debug_assert!(ptr.is_null()),
             },
@@ -151,7 +152,8 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
                     }
                 }
             }
-            let fallback_ptr = node.fallback.load(SeqCst);
+            let fallback = node.fallback();
+            let fallback_ptr = fallback.load(SeqCst);
             let fallback_xchg = match fallback_ptr.addr() {
                 addr if addr & (TRY_LOAD_FLAG | CONFIRM_FLAG) == 0 => continue,
                 addr if addr == ptr::from_ref(&self.ptr).addr() | TRY_LOAD_FLAG => new_ptr.cast(),
@@ -160,7 +162,7 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
             };
             // increment the refcount before in case fallback succeeds
             unsafe { A::incr_rc(new_ptr) };
-            if (node.fallback)
+            if (fallback)
                 .compare_exchange(fallback_ptr, fallback_xchg, Release, Relaxed)
                 .is_err()
             {
