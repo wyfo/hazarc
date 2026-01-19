@@ -9,7 +9,7 @@ use std::{
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use divan::Bencher;
-use hazarc::{AtomicArc, AtomicOptionArc, borrow_list};
+use hazarc::{AtomicArc, AtomicOptionArc};
 
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
 fn arcswap_write(b: Bencher, thread_count: usize) {
@@ -127,12 +127,10 @@ fn rwlock_read(b: Bencher, write: bool) {
     thread.join().unwrap();
 }
 
-borrow_list!(BorrowList(8));
-
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
 fn hazarc_write(b: Bencher, thread_count: usize) {
     let v: Arc<usize> = 0.into();
-    let arc: Arc<AtomicArc<usize, BorrowList>> = Arc::new(AtomicArc::new(v.clone()));
+    let arc: Arc<AtomicArc<usize>> = Arc::new(AtomicArc::new(v.clone()));
     let stop = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
     for _ in 0..thread_count {
@@ -158,7 +156,7 @@ fn hazarc_write(b: Bencher, thread_count: usize) {
 #[divan::bench(threads = [1, 2, 4, 8, 16], args = [false, true])]
 fn hazarc_read(b: Bencher, write: bool) {
     let v: Arc<usize> = 0.into();
-    let arc: Arc<AtomicArc<usize, BorrowList>> = Arc::new(AtomicArc::new(v.clone()));
+    let arc: Arc<AtomicArc<usize>> = Arc::new(AtomicArc::new(v.clone()));
     let stop = Arc::new(AtomicBool::new(false));
     let thread = {
         let v = v.clone();
@@ -184,7 +182,7 @@ fn hazarc_read(b: Bencher, write: bool) {
 
 #[divan::bench]
 fn hazarc_read_none(b: Bencher) {
-    let atomic_arc = AtomicOptionArc::<usize, BorrowList>::null();
+    let atomic_arc = AtomicOptionArc::<usize>::null();
     b.with_inputs(|| drop(atomic_arc.load()))
         .bench_values(|()| drop(atomic_arc.load()));
 }

@@ -163,3 +163,44 @@ impl BorrowNodeRef {
         unsafe { slice::from_raw_parts(self.borrow_ptr(), self.borrow_idx_mask + 1) }
     }
 }
+
+#[macro_export]
+macro_rules! borrow_list {
+    ($vis:vis $name:ident($borrow_count:expr)) => {
+        $vis struct $name;
+        unsafe impl $crate::borrow_list::StaticBorrowList for $name {
+            #[inline(always)]
+            fn static_list() -> &'static $crate::borrow_list::BorrowList {
+                static LIST: $crate::borrow_list::BorrowList = $crate::borrow_list::BorrowList::new();
+                &LIST
+            }
+            #[inline(always)]
+            fn thread_local_node() -> $crate::borrow_list::BorrowNodeRef {
+                extern crate std;
+                std::thread_local! {
+                    static LOCAL: std::cell::Cell<std::option::Option<$crate::borrow_list::BorrowNodeRef>> = const { std::cell::Cell::new(None) };
+                }
+                #[cold]
+                #[inline(never)]
+                fn new_node() -> $crate::borrow_list::BorrowNodeRef {
+                    struct NodeGuard;
+                    impl Drop for NodeGuard {
+                        fn drop(&mut self) {
+                            if let Some(node) = LOCAL.take() {
+                                unsafe { <$name as  $crate::borrow_list::StaticBorrowList>::static_list().remove_node(node) };
+                            }
+                        }
+                    }
+                    std::thread_local! {
+                        static GUARD: NodeGuard = const { NodeGuard };
+                    }
+                    let node = <$name as  $crate::borrow_list::StaticBorrowList>::static_list().insert_node($borrow_count);
+                    LOCAL.set(Some(node));
+                    GUARD.with(|_| ());
+                    node
+                }
+                LOCAL.get().unwrap_or_else(new_node)
+            }
+        }
+    };
+}

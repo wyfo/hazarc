@@ -1,8 +1,9 @@
 use core::ops::Deref;
 
 use crate::{
+    arc::{ArcPtr, NonNullPtr},
+    atomic::AtomicArcPtr,
     borrow_list::StaticBorrowList,
-    generic::{ArcPtr, AtomicArcPtr, NonNullPtr},
 };
 
 pub trait AtomicArcRef {

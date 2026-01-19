@@ -20,3 +20,4 @@ bench = false
 [[bench]]
 name = "comparison"
 harness = false
+required-features = ["default-borrow-list"]
