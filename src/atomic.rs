@@ -48,9 +48,7 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         debug_assert!(!ptr.is_null());
         let node = L::thread_local_node();
         let borrow_idx = node.next_borrow_idx().get();
-        // `slots().get_unchecked` seems to ruin performance...
-        let borrow = unsafe { &*node.borrow_ptr().add(borrow_idx) };
-        // let slot = unsafe { node.slots().get_unchecked(slot_idx) };
+        let borrow = unsafe { node.borrows().get_unchecked(borrow_idx) };
         if borrow.load(Relaxed).is_null() {
             self.load_with_borrow(ptr, node, borrow, borrow_idx)
         } else {
@@ -63,7 +61,7 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         &self,
         ptr: *mut (),
         node: BorrowNodeRef,
-        borrow: &'static AtomicPtr<()>,
+        borrow: &'static Borrow,
         borrow_idx: usize,
     ) -> ArcPtrBorrow<A> {
         borrow.store(ptr, SeqCst);
@@ -82,7 +80,7 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         &self,
         node: BorrowNodeRef,
         ptr: *mut (),
-        borrow: &'static AtomicPtr<()>,
+        borrow: &'static Borrow,
     ) -> ArcPtrBorrow<A> {
         match borrow.compare_exchange(ptr, NULL, Relaxed, Relaxed) {
             Ok(_) => self.load_fallback(node),
@@ -279,15 +277,15 @@ impl<T, L: StaticBorrowList> From<T> for AtomicArcPtr<Option<Arc<T>>, L> {
 }
 
 pub struct ArcPtrBorrow<A: ArcPtr> {
-    borrow: Option<&'static Borrow>,
     arc: ManuallyDrop<A>,
+    borrow: Option<&'static Borrow>,
 }
 
 impl<A: ArcPtr> ArcPtrBorrow<A> {
     #[inline(always)]
     fn new(ptr: *mut (), borrow: Option<&'static Borrow>) -> Self {
         let arc = ManuallyDrop::new(unsafe { A::from_ptr(ptr) });
-        Self { borrow, arc }
+        Self { arc, borrow }
     }
 
     #[inline]

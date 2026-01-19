@@ -91,18 +91,14 @@ pub struct BorrowNode {
 
 // SAFETY: `next_slot` access is synchronized with `inserted`
 unsafe impl Send for BorrowNode {}
-
 // SAFETY: `next_slot` access is synchronized with `inserted`
 unsafe impl Sync for BorrowNode {}
-
-impl BorrowNode {}
 
 #[derive(Clone, Copy)]
 pub struct BorrowNodeRef(NonNull<BorrowNode>);
 
 // SAFETY: `NodeRef` is equivalent to `&'static Node`
 unsafe impl Send for BorrowNodeRef {}
-
 // SAFETY: `NodeRef` is equivalent to `&'static Node`
 unsafe impl Sync for BorrowNodeRef {}
 
@@ -155,13 +151,9 @@ impl BorrowNodeRef {
     ref_field!(borrow_idx_mask: usize);
 
     #[inline(always)]
-    pub(crate) fn borrow_ptr(self) -> *const Borrow {
-        unsafe { &raw const (*self.0.as_ptr()).borrows as *const Borrow }
-    }
-
-    #[inline(always)]
     pub(crate) fn borrows(self) -> &'static [Borrow] {
-        unsafe { slice::from_raw_parts(self.borrow_ptr(), self.borrow_idx_mask() + 1) }
+        let len = self.borrow_idx_mask() + 1;
+        unsafe { slice::from_raw_parts(&raw const (*self.as_ptr()).borrows as _, len) }
     }
 }
 
