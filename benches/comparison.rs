@@ -1,4 +1,5 @@
 use std::{
+    hint::black_box,
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering::Relaxed},
@@ -62,6 +63,19 @@ fn arcswap_read(b: Bencher, write: bool) {
         .bench_values(|()| drop(arc.load()));
     stop.store(true, Relaxed);
     thread.join().unwrap();
+}
+
+#[divan::bench(threads = [1, 2, 4, 8, 16])]
+fn arcswap_read_spin(b: Bencher) {
+    let v: Arc<usize> = 0.into();
+    let arc: Arc<ArcSwap<usize>> = Arc::new(ArcSwap::new(v.clone()));
+    b.with_inputs(|| drop(arc.load())).bench_values(|()| {
+        let borrow = arc.load();
+        for _ in 0..4 {
+            let _ = black_box(0) + black_box(0);
+        }
+        drop(borrow);
+    });
 }
 
 #[divan::bench]
@@ -206,6 +220,19 @@ fn hazarc_read(b: Bencher, write: bool) {
         .bench_values(|()| drop(arc.load()));
     stop.store(true, Relaxed);
     thread.join().unwrap();
+}
+
+#[divan::bench(threads = [1, 2, 4, 8, 16])]
+fn hazarc_read_spin(b: Bencher) {
+    let v: Arc<usize> = 0.into();
+    let arc: Arc<AtomicArc<usize>> = Arc::new(AtomicArc::new(v.clone()));
+    b.with_inputs(|| drop(arc.load())).bench_values(|()| {
+        let borrow = arc.load();
+        for _ in 0..4 {
+            let _ = black_box(0) + black_box(0);
+        }
+        drop(borrow);
+    });
 }
 
 #[divan::bench]
