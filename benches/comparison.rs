@@ -98,8 +98,8 @@ fn rwlock_write(b: Bencher, thread_count: usize) {
     }
 }
 
-#[divan::bench(threads = [1, 2, 4, 8, 16], args = [false, false, true])]
-fn rwlock_read(b: Bencher, write: bool) {
+#[divan::bench(threads = [1, 2, 4, 8, 16], args = [false, true])]
+fn rwlock_read_clone(b: Bencher, write: bool) {
     let v: Arc<usize> = 0.into();
     let lock = Arc::new(RwLock::new(v.clone()));
     let stop = Arc::new(AtomicBool::new(false));
@@ -128,7 +128,7 @@ fn rwlock_read(b: Bencher, write: bool) {
 }
 
 #[divan::bench(threads = [1, 2, 4, 8, 16], args = [false, true])]
-fn rwlock_read_no_clone(b: Bencher, write: bool) {
+fn rwlock_read(b: Bencher, write: bool) {
     let v: Arc<usize> = 0.into();
     let lock = Arc::new(RwLock::new(v.clone()));
     let stop = Arc::new(AtomicBool::new(false));
