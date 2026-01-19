@@ -1,7 +1,6 @@
 use alloc::sync::Arc;
 use core::{
     marker::PhantomData,
-    mem,
     mem::ManuallyDrop,
     ops::Deref,
     pin::Pin,
@@ -29,7 +28,11 @@ pub unsafe trait ArcPtr: Clone {
     fn as_ptr(arc: &Self) -> *mut ();
     #[inline(always)]
     unsafe fn incr_rc(ptr: *mut ()) {
-        unsafe { mem::forget(Self::from_ptr(ptr).clone()) }
+        let _ = unsafe { ManuallyDrop::new(Self::from_ptr(ptr)).clone() };
+    }
+    #[inline(always)]
+    unsafe fn decr_rc(ptr: *mut ()) {
+        unsafe { drop(Self::from_ptr(ptr)) }
     }
 }
 
@@ -206,7 +209,7 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
                 .compare_exchange(fallback_ptr, fallback_xchg, Release, Relaxed)
                 .is_err()
             {
-                unsafe { A::incr_rc(new_ptr) };
+                unsafe { A::decr_rc(new_ptr) };
             }
         }
         old_arc
