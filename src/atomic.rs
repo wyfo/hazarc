@@ -49,10 +49,10 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         let node = L::thread_local_node();
         let borrow_idx = node.next_borrow_idx().get();
         // `slots().get_unchecked` seems to ruin performance...
-        let slot = unsafe { &*node.borrow_ptr().add(borrow_idx) };
+        let borrow = unsafe { &*node.borrow_ptr().add(borrow_idx) };
         // let slot = unsafe { node.slots().get_unchecked(slot_idx) };
-        if slot.load(Relaxed).is_null() {
-            self.load_with_borrow(ptr, node, slot, borrow_idx)
+        if borrow.load(Relaxed).is_null() {
+            self.load_with_borrow(ptr, node, borrow, borrow_idx)
         } else {
             self.load_find_available_borrow(ptr, node)
         }
