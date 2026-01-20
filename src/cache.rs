@@ -20,6 +20,7 @@ impl<A: ArcPtr, L: StaticBorrowList, T: Deref<Target = AtomicArcPtr<A, L>>> Atom
     }
 }
 
+// Arc parameter is necessary for `load` method disambiguation.
 #[derive(Debug, Clone)]
 pub struct ArcCache<A: AtomicArcRef, Arc = <A as AtomicArcRef>::Arc> {
     inner: A,
