@@ -121,7 +121,7 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
     }
 
     #[inline]
-    pub fn load_if_outdated_impl<'a>(&self, arc: &'a A) -> Result<&'a A, ArcPtrBorrow<A>> {
+    fn load_if_outdated_impl<'a>(&self, arc: &'a A) -> Result<&'a A, ArcPtrBorrow<A>> {
         let ptr = self.ptr.load(Relaxed);
         if ptr == A::as_ptr(arc) {
             Ok(arc)
