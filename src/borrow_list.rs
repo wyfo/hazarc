@@ -7,7 +7,7 @@ use core::{
     slice,
     sync::atomic::{
         AtomicBool, AtomicPtr,
-        Ordering::{Acquire, Relaxed, Release},
+        Ordering::{Acquire, Relaxed, Release, SeqCst},
     },
 };
 
@@ -41,7 +41,7 @@ impl BorrowList {
     pub(crate) fn nodes(&self) -> impl Iterator<Item = BorrowNodeRef> {
         let mut node_ptr = &self.head;
         iter::from_fn(move || {
-            let node = unsafe { BorrowNodeRef::new(node_ptr.load(Acquire))? };
+            let node = unsafe { BorrowNodeRef::new(node_ptr.load(SeqCst))? };
             node_ptr = node.next();
             Some(node)
         })
@@ -58,7 +58,7 @@ impl BorrowList {
         }
         let new_node = BorrowNodeRef::allocate(slot_count);
         while let Err(next) = node_ptr
-            .compare_exchange(NULL.cast(), new_node.as_ptr(), Release, Relaxed)
+            .compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Relaxed)
             .map_err(|err| unsafe { &(*err).next })
         {
             // No need to check free, because it's highly improbable

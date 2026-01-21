@@ -6,7 +6,7 @@ use core::{
     ptr,
     sync::atomic::{
         AtomicPtr,
-        Ordering::{Acquire, Relaxed, Release, SeqCst},
+        Ordering::{Acquire, Relaxed, SeqCst},
     },
 };
 
@@ -16,8 +16,8 @@ use crate::{
     borrow_list::{Borrow, BorrowNodeRef, StaticBorrowList},
 };
 
-const TRY_LOAD_FLAG: usize = 0b01;
-const CONFIRM_FLAG: usize = 0b10;
+const PREPARE_LOAD_FLAG: usize = 0b01;
+const CONFIRM_LOAD_FLAG: usize = 0b10;
 
 pub struct AtomicArcPtr<A: ArcPtr, L: StaticBorrowList> {
     ptr: AtomicPtr<()>,
@@ -67,7 +67,7 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         borrow.store(ptr, SeqCst);
         let ptr_checked = self.ptr.load(SeqCst);
         if ptr != ptr_checked {
-            return self.load_outdated(node, ptr, borrow);
+            return self.load_outdated(node, ptr, ptr_checked, borrow);
         }
         node.next_borrow_idx()
             .set((borrow_idx + 1) & node.borrow_idx_mask());
@@ -80,9 +80,16 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         &self,
         node: BorrowNodeRef,
         ptr: *mut (),
+        ptr_checked: *mut (),
         borrow: &'static Borrow,
     ) -> ArcPtrBorrow<A> {
-        match borrow.compare_exchange(ptr, NULL, Relaxed, Relaxed) {
+        if A::NULLABLE && ptr_checked.is_null() {
+            if (borrow.compare_exchange(ptr, NULL, SeqCst, Relaxed)).is_err() {
+                unsafe { A::decr_rc(ptr) };
+            }
+            return ArcPtrBorrow::new(ptr_checked, None);
+        }
+        match borrow.compare_exchange(ptr, NULL, SeqCst, Relaxed) {
             Ok(_) => self.load_fallback(node),
             Err(_) => ArcPtrBorrow::new(ptr, None),
         }
@@ -100,19 +107,27 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
 
     fn load_fallback(&self, node: BorrowNodeRef) -> ArcPtrBorrow<A> {
         let fallback = node.fallback();
-        let try_load_ptr = (&self.ptr as *const _ as *mut ()).map_addr(|addr| addr | TRY_LOAD_FLAG);
-        fallback.store(try_load_ptr, SeqCst);
+        let prepare_ptr = ptr::from_ref(&self.ptr)
+            .map_addr(|addr| addr | PREPARE_LOAD_FLAG)
+            .cast_mut()
+            .cast();
+        fallback.store(prepare_ptr, SeqCst);
         let ptr_checked = self.ptr.load(SeqCst);
-        let confirm_ptr = ptr_checked.map_addr(|addr| addr | CONFIRM_FLAG).cast();
-        let mut ptr_confirmed = ptr_checked;
-        match (fallback).compare_exchange(try_load_ptr, confirm_ptr, Relaxed, Acquire) {
-            Ok(_) => match (fallback).compare_exchange(confirm_ptr, NULL, Relaxed, Acquire) {
-                Ok(_) => unsafe { A::incr_rc(ptr_checked) },
-                Err(ptr) => debug_assert!(ptr.is_null()),
-            },
-            Err(ptr) => ptr_confirmed = ptr.cast(),
+        if A::NULLABLE && ptr_checked.is_null() {
+            let ptr = fallback.swap(NULL, Acquire);
+            return ArcPtrBorrow::new(if ptr != prepare_ptr { ptr } else { ptr_checked }, None);
         }
-        ArcPtrBorrow::new(ptr_confirmed, None)
+        let confirm_ptr = ptr_checked.map_addr(|addr| addr | CONFIRM_LOAD_FLAG);
+        if let Err(ptr) = fallback.compare_exchange(prepare_ptr, confirm_ptr, SeqCst, Acquire) {
+            fallback.store(NULL, SeqCst);
+            return ArcPtrBorrow::new(ptr, None);
+        }
+        unsafe { A::incr_rc(ptr_checked) };
+        if let Err(ptr) = fallback.compare_exchange(confirm_ptr, NULL, SeqCst, Acquire) {
+            debug_assert!(ptr.is_null());
+            unsafe { A::decr_rc(ptr_checked) };
+        }
+        ArcPtrBorrow::new(ptr_checked, None)
     }
 
     #[inline]
@@ -131,41 +146,46 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
     }
 
     pub fn swap(&self, arc: A) -> A {
-        let new_ptr = A::into_ptr(arc);
-        let old_ptr = self.ptr.swap(new_ptr, SeqCst);
-        self.swap_impl(new_ptr, old_ptr)
-    }
-
-    fn swap_impl(&self, new_ptr: *mut (), old_ptr: *mut ()) -> A {
+        let new_ptr = A::as_ptr(&arc);
+        // store a clone in order to keep an owned arc, in case its ownership must be cloned
+        let old_ptr = self.ptr.swap(A::into_ptr(arc.clone()), SeqCst);
         let old_arc = unsafe { A::from_ptr(old_ptr) };
-        // increment the refcount before in case some slots are reset
-        let _guard = old_arc.clone();
+        // // store a clone in order to keep an owned arc, in case its ownership must be cloned
+        let _old_clone = old_arc.clone();
         for node in L::static_list().nodes() {
             if !A::NULLABLE || !old_ptr.is_null() {
                 for borrow in node.borrows().iter() {
-                    if borrow.load(SeqCst) == old_ptr.cast()
-                        && (borrow.compare_exchange(old_ptr.cast(), NULL, Release, Relaxed)).is_ok()
+                    if borrow.load(SeqCst) == old_ptr
+                        && (borrow.compare_exchange(old_ptr, NULL, SeqCst, Relaxed)).is_ok()
                     {
                         unsafe { A::incr_rc(old_ptr) }
                     }
                 }
             }
             let fallback = node.fallback();
-            let fallback_ptr = fallback.load(SeqCst);
-            let fallback_xchg = match fallback_ptr.addr() {
-                addr if addr & (TRY_LOAD_FLAG | CONFIRM_FLAG) == 0 => continue,
-                addr if addr == ptr::from_ref(&self.ptr).addr() | TRY_LOAD_FLAG => new_ptr.cast(),
-                addr if addr == new_ptr.addr() | CONFIRM_FLAG => NULL,
+            let ptr = fallback.load(SeqCst);
+            match ptr.addr() {
+                addr if addr & (PREPARE_LOAD_FLAG | CONFIRM_LOAD_FLAG) == 0 => continue,
+                addr if addr == ptr::from_ref(&self.ptr).addr() | PREPARE_LOAD_FLAG => {
+                    match fallback.compare_exchange(ptr, new_ptr, SeqCst, Relaxed) {
+                        Ok(_) => unsafe { A::incr_rc(new_ptr) },
+                        Err(ptr)
+                            if ptr.addr() == old_ptr.addr() | CONFIRM_LOAD_FLAG
+                                && fallback
+                                    .compare_exchange(ptr, NULL, SeqCst, Relaxed)
+                                    .is_ok() =>
+                        unsafe { A::incr_rc(old_ptr) },
+                        Err(_) => {}
+                    }
+                }
+                addr if addr == old_ptr.addr() | CONFIRM_LOAD_FLAG
+                    && (fallback.compare_exchange(ptr, NULL, SeqCst, Relaxed)).is_ok() =>
+                unsafe { A::incr_rc(old_ptr) },
+                addr if addr == new_ptr.addr() | CONFIRM_LOAD_FLAG
+                    && (fallback.compare_exchange(ptr, NULL, SeqCst, Relaxed)).is_ok() =>
+                unsafe { A::incr_rc(new_ptr) },
                 _ => continue,
             };
-            // increment the refcount before in case fallback succeeds
-            unsafe { A::incr_rc(new_ptr) };
-            if (fallback)
-                .compare_exchange(fallback_ptr, fallback_xchg, Release, Relaxed)
-                .is_err()
-            {
-                unsafe { A::decr_rc(new_ptr) };
-            }
         }
         old_arc
     }
@@ -240,8 +260,18 @@ impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> AtomicArcPtr<Option<A>, L> {
 impl<A: ArcPtr, L: StaticBorrowList> Drop for AtomicArcPtr<A, L> {
     fn drop(&mut self) {
         let ptr = *self.ptr.get_mut();
-        if !ptr.is_null() {
-            self.swap_impl(NULL, ptr);
+        if A::NULLABLE && ptr.is_null() {
+            return;
+        }
+        let _arc = unsafe { A::from_ptr(ptr) };
+        for node in L::static_list().nodes() {
+            for borrow in node.borrows().iter() {
+                if borrow.load(SeqCst) == ptr
+                    && (borrow.compare_exchange(ptr, NULL, SeqCst, Relaxed)).is_ok()
+                {
+                    unsafe { A::incr_rc(ptr) }
+                }
+            }
         }
     }
 }
@@ -276,9 +306,16 @@ impl<T, L: StaticBorrowList> From<T> for AtomicArcPtr<Option<Arc<T>>, L> {
     }
 }
 
+impl<T, L: StaticBorrowList> From<Option<T>> for AtomicArcPtr<Option<Arc<T>>, L> {
+    fn from(value: Option<T>) -> Self {
+        value.map(Arc::new).into()
+    }
+}
+
+#[derive(Debug)]
 pub struct ArcPtrBorrow<A: ArcPtr> {
     arc: ManuallyDrop<A>,
-    borrow: Option<&'static Borrow>,
+    pub borrow: Option<&'static Borrow>,
 }
 
 impl<A: ArcPtr> ArcPtrBorrow<A> {
@@ -312,7 +349,7 @@ impl<A: ArcPtr> Drop for ArcPtrBorrow<A> {
     #[inline]
     fn drop(&mut self) {
         let ptr = A::as_ptr(&self.arc);
-        if (self.borrow).is_none_or(|b| b.compare_exchange(ptr, NULL, Relaxed, Relaxed).is_err()) {
+        if (self.borrow).is_none_or(|b| b.compare_exchange(ptr, NULL, SeqCst, Relaxed).is_err()) {
             #[cold]
             #[inline(never)]
             fn drop_arc<A>(_: A) {}

@@ -20,10 +20,6 @@ jobs:
         run: cargo clippy ${{ matrix.features }} --all-targets -- -D warnings
       - name: test
         run: cargo test ${{ matrix.features }}
-      - name: install miri
-        run: rustup install nightly && rustup +nightly component add miri
-      - name: miri
-        run: cargo +nightly miri test ${{ matrix.features }}
       #      - name: Install cargo-llvm-cov
       #        uses: taiki-e/install-action@cargo-llvm-cov
       #      - name: code coverage
@@ -32,6 +28,17 @@ jobs:
         run: cargo doc
         env:
           RUSTDOCFLAGS: "-Dwarnings"
+  miri:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@6
+      - name: install miri
+        run: rustup install nightly && rustup +nightly component add miri
+      - name: miri
+        run: cargo +nightly miri test
+        env:
+          MIRIFLAGS: -Zmiri-many-seeds=..1024
   benchmark:
     needs: test
     strategy:
@@ -39,6 +46,6 @@ jobs:
         os: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: benchmark
         run: cargo bench -- --min-time 1
