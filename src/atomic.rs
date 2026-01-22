@@ -171,33 +171,25 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
             }
             let fallback = node.fallback();
             let ptr = fallback.load(SeqCst);
-            match ptr.addr() {
-                addr if addr & (PREPARE_LOAD_FLAG | CONFIRM_LOAD_FLAG) == 0 => continue,
-                addr if addr == ptr::from_ref(&self.ptr).addr() | PREPARE_LOAD_FLAG => {
-                    transfer_ownership::<A>(new_ptr, || {
-                        match fallback.compare_exchange(ptr, new_ptr, SeqCst, Relaxed) {
-                            Err(ptr) if ptr.addr() == old_ptr.addr() | CONFIRM_LOAD_FLAG => {
-                                transfer_ownership::<A>(old_ptr, || {
-                                    fallback.compare_exchange(ptr, NULL, SeqCst, Relaxed)
-                                });
-                                Err(ptr)
-                            }
-                            res => res,
+            if ptr.addr() & (PREPARE_LOAD_FLAG | CONFIRM_LOAD_FLAG) == 0 {
+                continue;
+            } else if ptr.addr() == ptr::from_ref(&self.ptr).addr() | PREPARE_LOAD_FLAG {
+                transfer_ownership::<A>(new_ptr, || {
+                    match fallback.compare_exchange(ptr, new_ptr, SeqCst, Relaxed) {
+                        Err(ptr) if ptr.addr() == old_ptr.addr() | CONFIRM_LOAD_FLAG => {
+                            transfer_ownership::<A>(old_ptr, || {
+                                fallback.compare_exchange(ptr, NULL, SeqCst, Relaxed)
+                            });
+                            Err(ptr)
                         }
-                    });
-                }
-                addr if addr == old_ptr.addr() | CONFIRM_LOAD_FLAG => {
-                    transfer_ownership::<A>(old_ptr, || {
-                        fallback.compare_exchange(ptr, NULL, SeqCst, Relaxed)
-                    })
-                }
-                addr if addr == new_ptr.addr() | CONFIRM_LOAD_FLAG => {
-                    transfer_ownership::<A>(new_ptr, || {
-                        fallback.compare_exchange(ptr, NULL, SeqCst, Relaxed)
-                    })
-                }
-                _ => continue,
-            };
+                        res => res,
+                    }
+                });
+            } else if ptr.addr() == old_ptr.addr() | CONFIRM_LOAD_FLAG {
+                transfer_ownership::<A>(old_ptr, || {
+                    fallback.compare_exchange(ptr, NULL, SeqCst, Relaxed)
+                })
+            }
         }
         old_arc
     }
