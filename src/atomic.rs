@@ -1,5 +1,6 @@
 use alloc::sync::Arc;
 use core::{
+    fmt,
     marker::PhantomData,
     mem::ManuallyDrop,
     ops::Deref,
@@ -289,6 +290,14 @@ impl<A: ArcPtr + Default, L: StaticBorrowList> Default for AtomicArcPtr<A, L> {
     }
 }
 
+impl<A: ArcPtr + fmt::Debug, L: StaticBorrowList> fmt::Debug for AtomicArcPtr<A, L> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("AtomicArcPtr")
+            .field(&self.load_impl())
+            .finish()
+    }
+}
+
 impl<A: ArcPtr, L: StaticBorrowList> From<A> for AtomicArcPtr<A, L> {
     fn from(value: A) -> Self {
         Self::new(value)
@@ -322,7 +331,7 @@ impl<T, L: StaticBorrowList> From<Option<T>> for AtomicArcPtr<Option<Arc<T>>, L>
 #[derive(Debug)]
 pub struct ArcPtrBorrow<A: ArcPtr> {
     arc: ManuallyDrop<A>,
-    pub borrow: Option<&'static Borrow>,
+    borrow: Option<&'static Borrow>,
 }
 
 impl<A: ArcPtr> ArcPtrBorrow<A> {

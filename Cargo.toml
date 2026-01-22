@@ -21,3 +21,6 @@ bench = false
 name = "comparison"
 harness = false
 required-features = ["default-borrow-list"]
+
+[lints.rust]
+missing_debug_implementations = "forbid"

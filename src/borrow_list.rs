@@ -1,8 +1,11 @@
-use alloc::alloc::{alloc_zeroed, handle_alloc_error};
+use alloc::{
+    alloc::{alloc_zeroed, handle_alloc_error},
+    vec::Vec,
+};
 use core::{
     alloc::Layout,
     cell::Cell,
-    iter,
+    fmt, iter,
     ptr::NonNull,
     slice,
     sync::atomic::{
@@ -75,14 +78,21 @@ impl BorrowList {
     }
 }
 
+impl fmt::Debug for BorrowList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BorrowList")
+            .field("nodes", &self.nodes().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 pub(crate) type Borrow = AtomicPtr<()>;
 
-#[doc(hidden)]
 #[repr(C)]
-pub struct BorrowNode {
+pub(crate) struct BorrowNode {
     _align: CachePadded<()>,
     next: AtomicPtr<BorrowNode>,
-    inserted: AtomicBool,
+    in_use: AtomicBool,
     fallback: AtomicPtr<()>,
     next_borrow_idx: Cell<usize>,
     borrow_idx_mask: usize,
@@ -126,18 +136,18 @@ impl BorrowNodeRef {
         let mut node =
             BorrowNodeRef(NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout)));
         unsafe { node.0.as_mut() }.borrow_idx_mask = borrows - 1;
-        *unsafe { node.0.as_mut() }.inserted.get_mut() = true;
+        *unsafe { node.0.as_mut() }.in_use.get_mut() = true;
         node
     }
 
     fn try_acquire(&self) -> bool {
         // Acquire load for `next_slot` synchronization
-        !self.inserted().load(Relaxed) && !self.inserted().swap(true, Acquire)
+        !self.in_use().load(Relaxed) && !self.in_use().swap(true, Acquire)
     }
 
     unsafe fn release(&self) {
         // Release store for `next_slot` synchronization
-        self.inserted().store(false, Release);
+        self.in_use().store(false, Release);
     }
 
     fn as_ptr(&self) -> *mut BorrowNode {
@@ -145,7 +155,7 @@ impl BorrowNodeRef {
     }
 
     ref_field!(next: AtomicPtr<BorrowNode>);
-    ref_field!(inserted: AtomicBool);
+    ref_field!(in_use: AtomicBool);
     ref_field!(fallback: AtomicPtr<()>);
     ref_field!(next_borrow_idx: Cell<usize>);
     ref_field!(borrow_idx_mask: usize);
@@ -157,10 +167,26 @@ impl BorrowNodeRef {
     }
 }
 
+impl fmt::Debug for BorrowNodeRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BorrowNodeRef")
+            .field("in_use", self.in_use())
+            .field("borrows", &self.borrows())
+            .field("fallback", self.fallback())
+            .finish_non_exhaustive()
+    }
+}
+
 #[macro_export]
 macro_rules! borrow_list {
     ($vis:vis $name:ident($borrow_count:expr)) => {
         $vis struct $name;
+        impl ::core::fmt::Debug for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                let list = <$name as $crate::borrow_list::StaticBorrowList>::static_list();
+                f.debug_tuple(::core::stringify!($name)).field(list).finish()
+            }
+        }
         unsafe impl $crate::borrow_list::StaticBorrowList for $name {
             #[inline(always)]
             fn static_list() -> &'static $crate::borrow_list::BorrowList {
