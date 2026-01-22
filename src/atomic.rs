@@ -146,19 +146,26 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
     }
 
     pub fn swap(&self, arc: A) -> A {
+        fn transfer_ownership<A: ArcPtr>(
+            ptr: *mut (),
+            op: impl FnOnce() -> Result<*mut (), *mut ()>,
+        ) {
+            unsafe { A::incr_rc(ptr) };
+            if op().is_err() {
+                unsafe { A::decr_rc(ptr) };
+            }
+        }
         let new_ptr = A::as_ptr(&arc);
         // store a clone in order to keep an owned arc, in case its ownership must be cloned
         let old_ptr = self.ptr.swap(A::into_ptr(arc.clone()), SeqCst);
         let old_arc = unsafe { A::from_ptr(old_ptr) };
-        // // store a clone in order to keep an owned arc, in case its ownership must be cloned
-        let _old_clone = old_arc.clone();
         for node in L::static_list().nodes() {
             if !A::NULLABLE || !old_ptr.is_null() {
                 for borrow in node.borrows().iter() {
-                    if borrow.load(SeqCst) == old_ptr
-                        && (borrow.compare_exchange(old_ptr, NULL, SeqCst, Relaxed)).is_ok()
-                    {
-                        unsafe { A::incr_rc(old_ptr) }
+                    if borrow.load(SeqCst) == old_ptr {
+                        transfer_ownership::<A>(old_ptr, || {
+                            borrow.compare_exchange(old_ptr, NULL, SeqCst, Relaxed)
+                        });
                     }
                 }
             }
@@ -167,23 +174,28 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
             match ptr.addr() {
                 addr if addr & (PREPARE_LOAD_FLAG | CONFIRM_LOAD_FLAG) == 0 => continue,
                 addr if addr == ptr::from_ref(&self.ptr).addr() | PREPARE_LOAD_FLAG => {
-                    match fallback.compare_exchange(ptr, new_ptr, SeqCst, Relaxed) {
-                        Ok(_) => unsafe { A::incr_rc(new_ptr) },
-                        Err(ptr)
-                            if ptr.addr() == old_ptr.addr() | CONFIRM_LOAD_FLAG
-                                && fallback
-                                    .compare_exchange(ptr, NULL, SeqCst, Relaxed)
-                                    .is_ok() =>
-                        unsafe { A::incr_rc(old_ptr) },
-                        Err(_) => {}
-                    }
+                    transfer_ownership::<A>(new_ptr, || {
+                        match fallback.compare_exchange(ptr, new_ptr, SeqCst, Relaxed) {
+                            Err(ptr) if ptr.addr() == old_ptr.addr() | CONFIRM_LOAD_FLAG => {
+                                transfer_ownership::<A>(old_ptr, || {
+                                    fallback.compare_exchange(ptr, NULL, SeqCst, Relaxed)
+                                });
+                                Err(ptr)
+                            }
+                            res => res,
+                        }
+                    });
                 }
-                addr if addr == old_ptr.addr() | CONFIRM_LOAD_FLAG
-                    && (fallback.compare_exchange(ptr, NULL, SeqCst, Relaxed)).is_ok() =>
-                unsafe { A::incr_rc(old_ptr) },
-                addr if addr == new_ptr.addr() | CONFIRM_LOAD_FLAG
-                    && (fallback.compare_exchange(ptr, NULL, SeqCst, Relaxed)).is_ok() =>
-                unsafe { A::incr_rc(new_ptr) },
+                addr if addr == old_ptr.addr() | CONFIRM_LOAD_FLAG => {
+                    transfer_ownership::<A>(old_ptr, || {
+                        fallback.compare_exchange(ptr, NULL, SeqCst, Relaxed)
+                    })
+                }
+                addr if addr == new_ptr.addr() | CONFIRM_LOAD_FLAG => {
+                    transfer_ownership::<A>(new_ptr, || {
+                        fallback.compare_exchange(ptr, NULL, SeqCst, Relaxed)
+                    })
+                }
                 _ => continue,
             };
         }
