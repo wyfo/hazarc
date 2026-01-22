@@ -118,11 +118,12 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         fallback.store(prepare_ptr, SeqCst);
         let ptr_checked = self.ptr.load(SeqCst);
         if A::NULLABLE && ptr_checked.is_null() {
-            let ptr = fallback.swap(NULL, Acquire);
+            let ptr = fallback.swap(NULL, SeqCst);
             return ArcPtrBorrow::new(if ptr != prepare_ptr { ptr } else { ptr_checked }, None);
         }
         let confirm_ptr = ptr_checked.map_addr(|addr| addr | CONFIRM_LOAD_FLAG);
-        if let Err(ptr) = fallback.compare_exchange(prepare_ptr, confirm_ptr, SeqCst, Acquire) {
+        // Failure ordering must be SeqCst for load to have a full SeqCst semantic
+        if let Err(ptr) = fallback.compare_exchange(prepare_ptr, confirm_ptr, SeqCst, SeqCst) {
             fallback.store(NULL, SeqCst);
             return ArcPtrBorrow::new(ptr, None);
         }
