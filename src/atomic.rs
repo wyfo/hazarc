@@ -41,9 +41,12 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
     }
 
     #[inline(always)]
-    fn load_with_ptr(&self, ptr: *mut ()) -> ArcPtrBorrow<A> {
+    fn load_with_ptr(&self, mut ptr: *mut ()) -> ArcPtrBorrow<A> {
         if A::NULLABLE && ptr.is_null() {
-            return ArcPtrBorrow::new(ptr, None);
+            ptr = self.ptr.load(SeqCst);
+            if ptr.is_null() {
+                return ArcPtrBorrow::new(ptr, None);
+            }
         }
         debug_assert!(!ptr.is_null());
         let node = L::thread_local_node();
