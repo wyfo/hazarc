@@ -86,17 +86,17 @@ impl fmt::Debug for BorrowList {
     }
 }
 
-pub(crate) type Borrow = AtomicPtr<()>;
+pub(crate) type BorrowSlot = AtomicPtr<()>;
 
 #[repr(C)]
 pub(crate) struct BorrowNode {
     _align: CachePadded<()>,
     next: AtomicPtr<BorrowNode>,
     in_use: AtomicBool,
-    fallback: AtomicPtr<()>,
-    next_borrow_idx: Cell<usize>,
-    borrow_idx_mask: usize,
-    borrows: [Borrow; 0],
+    clone_slot: AtomicPtr<()>,
+    next_borrow_slot_idx: Cell<usize>,
+    borrow_slot_idx_mask: usize,
+    borrow_slots: [BorrowSlot; 0],
 }
 
 // SAFETY: `next_slot` access is synchronized with `inserted`
@@ -135,7 +135,7 @@ impl BorrowNodeRef {
         let ptr = unsafe { alloc_zeroed(layout) }.cast::<BorrowNode>();
         let mut node =
             BorrowNodeRef(NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout)));
-        unsafe { node.0.as_mut() }.borrow_idx_mask = borrows - 1;
+        unsafe { node.0.as_mut() }.borrow_slot_idx_mask = borrows - 1;
         *unsafe { node.0.as_mut() }.in_use.get_mut() = true;
         node
     }
@@ -156,14 +156,14 @@ impl BorrowNodeRef {
 
     ref_field!(next: AtomicPtr<BorrowNode>);
     ref_field!(in_use: AtomicBool);
-    ref_field!(fallback: AtomicPtr<()>);
-    ref_field!(next_borrow_idx: Cell<usize>);
-    ref_field!(borrow_idx_mask: usize);
+    ref_field!(clone_slot: AtomicPtr<()>);
+    ref_field!(next_borrow_slot_idx: Cell<usize>);
+    ref_field!(borrow_slot_idx_mask: usize);
 
     #[inline(always)]
-    pub(crate) fn borrows(self) -> &'static [Borrow] {
-        let len = self.borrow_idx_mask() + 1;
-        unsafe { slice::from_raw_parts(&raw const (*self.as_ptr()).borrows as _, len) }
+    pub(crate) fn borrow_slots(self) -> &'static [BorrowSlot] {
+        let len = self.borrow_slot_idx_mask() + 1;
+        unsafe { slice::from_raw_parts(&raw const (*self.as_ptr()).borrow_slots as _, len) }
     }
 }
 
@@ -171,8 +171,8 @@ impl fmt::Debug for BorrowNodeRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BorrowNodeRef")
             .field("in_use", self.in_use())
-            .field("borrows", &self.borrows())
-            .field("fallback", self.fallback())
+            .field("borrow_slots", &self.borrow_slots())
+            .field("clone_slot", self.clone_slot())
             .finish_non_exhaustive()
     }
 }
@@ -235,12 +235,12 @@ mod tests {
     fn node_reuse() {
         let thread = std::thread::spawn(|| {
             let node = TestList::thread_local_node();
-            node.next_borrow_idx().set(1);
+            node.next_borrow_slot_idx().set(1);
             node
         });
         let node1 = thread.join().unwrap();
         let node2 = TestList::thread_local_node();
         assert_eq!(node1.as_ptr(), node2.as_ptr());
-        assert_eq!(node2.next_borrow_idx().get(), 1);
+        assert_eq!(node2.next_borrow_slot_idx().get(), 1);
     }
 }

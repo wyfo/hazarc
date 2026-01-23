@@ -26,7 +26,7 @@ trait LoadBench: Default + Send + Sync {
             b.bench_local(|| drop(x.load()));
         }
     }
-    fn bench_load_fallback(b: Bencher) {
+    fn bench_load_no_slot(b: Bencher) {
         let x = black_box(Self::default());
         let _guards = array::from_fn::<_, 8, _>(|_| x.load());
         b.bench_local(|| drop(x.load()));
@@ -189,12 +189,12 @@ fn arcswap_load_spin(b: Bencher) {
     LoadSpin::<ArcSwap<_>>::bench_load(b, false)
 }
 #[divan::bench]
-fn arcswap_load_fallback(b: Bencher) {
-    ArcSwap::bench_load_fallback(b)
+fn arcswap_load_no_slot(b: Bencher) {
+    ArcSwap::bench_load_no_slot(b)
 }
 #[divan::bench]
-fn arcswap_load_fallback_spin(b: Bencher) {
-    LoadSpin::<ArcSwap<_>>::bench_load_fallback(b)
+fn arcswap_load_no_slot_spin(b: Bencher) {
+    LoadSpin::<ArcSwap<_>>::bench_load_no_slot(b)
 }
 #[divan::bench]
 fn arcswap_load_none(b: Bencher) {
@@ -222,12 +222,12 @@ fn hazarc_load_spin(b: Bencher) {
     LoadSpin::<AtomicArc<_>>::bench_load(b, false)
 }
 #[divan::bench]
-fn hazarc_load_fallback(b: Bencher) {
-    AtomicArc::bench_load_fallback(b)
+fn hazarc_load_no_slot(b: Bencher) {
+    AtomicArc::bench_load_no_slot(b)
 }
 #[divan::bench]
-fn hazarc_load_fallback_spin(b: Bencher) {
-    LoadSpin::<AtomicArc<_>>::bench_load_fallback(b)
+fn hazarc_load_no_slot_spin(b: Bencher) {
+    LoadSpin::<AtomicArc<_>>::bench_load_no_slot(b)
 }
 #[divan::bench]
 fn hazarc_load_none(b: Bencher) {

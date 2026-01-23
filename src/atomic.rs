@@ -15,11 +15,11 @@ use core::{
 use crate::{
     NULL,
     arc::{ArcPtr, ArcRef, NonNullPtr},
-    borrow_list::{Borrow, BorrowNodeRef, StaticBorrowList},
+    borrow_list::{BorrowNodeRef, BorrowSlot, StaticBorrowList},
 };
 
-const PREPARE_LOAD_FLAG: usize = 0b01;
-const CONFIRM_LOAD_FLAG: usize = 0b10;
+const PREPARE_CLONE_FLAG: usize = 0b01;
+const CONFIRM_CLONE_FLAG: usize = 0b10;
 
 pub struct AtomicArcPtr<A: ArcPtr, L: StaticBorrowList> {
     ptr: AtomicPtr<()>,
@@ -52,31 +52,31 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         }
         debug_assert!(!ptr.is_null());
         let node = L::thread_local_node();
-        let borrow_idx = node.next_borrow_idx().get();
-        let borrow = unsafe { node.borrows().get_unchecked(borrow_idx) };
-        if borrow.load(Relaxed).is_null() {
-            self.load_with_borrow(ptr, node, borrow, borrow_idx)
+        let slot_idx = node.next_borrow_slot_idx().get();
+        let slot = unsafe { node.borrow_slots().get_unchecked(slot_idx) };
+        if slot.load(Relaxed).is_null() {
+            self.load_with_slot(ptr, node, slot, slot_idx)
         } else {
-            self.load_find_available_borrow(ptr, node)
+            self.load_find_available_slot(ptr, node)
         }
     }
 
     #[inline(always)]
-    fn load_with_borrow(
+    fn load_with_slot(
         &self,
         ptr: *mut (),
         node: BorrowNodeRef,
-        borrow: &'static Borrow,
-        borrow_idx: usize,
+        slot: &'static BorrowSlot,
+        slot_idx: usize,
     ) -> ArcPtrBorrow<A> {
-        borrow.store(ptr, SeqCst);
+        slot.store(ptr, SeqCst);
         let ptr_checked = self.ptr.load(SeqCst);
         if ptr != ptr_checked {
-            return self.load_outdated(node, ptr, ptr_checked, borrow);
+            return self.load_outdated(node, ptr, ptr_checked, slot);
         }
-        node.next_borrow_idx()
-            .set((borrow_idx + 1) & node.borrow_idx_mask());
-        ArcPtrBorrow::new(ptr_checked, Some(borrow))
+        node.next_borrow_slot_idx()
+            .set((slot_idx + 1) & node.borrow_slot_idx_mask());
+        ArcPtrBorrow::new(ptr_checked, Some(slot))
     }
 
     #[cold]
@@ -86,7 +86,7 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         node: BorrowNodeRef,
         ptr: *mut (),
         ptr_checked: *mut (),
-        borrow: &'static Borrow,
+        borrow: &'static BorrowSlot,
     ) -> ArcPtrBorrow<A> {
         if A::NULLABLE && ptr_checked.is_null() {
             if (borrow.compare_exchange(ptr, NULL, SeqCst, Relaxed)).is_err() {
@@ -95,41 +95,42 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
             return ArcPtrBorrow::new(ptr_checked, None);
         }
         match borrow.compare_exchange(ptr, NULL, SeqCst, Relaxed) {
-            Ok(_) => self.load_fallback(node),
+            Ok(_) => self.load_clone(node),
             Err(_) => ArcPtrBorrow::new(ptr, None),
         }
     }
 
     #[cold]
     #[inline(never)]
-    fn load_find_available_borrow(&self, ptr: *mut (), node: BorrowNodeRef) -> ArcPtrBorrow<A> {
-        match (node.borrows().iter().enumerate()).find(|(_, borrow)| borrow.load(Relaxed).is_null())
+    fn load_find_available_slot(&self, ptr: *mut (), node: BorrowNodeRef) -> ArcPtrBorrow<A> {
+        match (node.borrow_slots().iter().enumerate())
+            .find(|(_, borrow)| borrow.load(Relaxed).is_null())
         {
-            Some((slot_idx, slot)) => self.load_with_borrow(ptr, node, slot, slot_idx),
-            None => self.load_fallback(node),
+            Some((slot_idx, slot)) => self.load_with_slot(ptr, node, slot, slot_idx),
+            None => self.load_clone(node),
         }
     }
 
-    fn load_fallback(&self, node: BorrowNodeRef) -> ArcPtrBorrow<A> {
-        let fallback = node.fallback();
+    fn load_clone(&self, node: BorrowNodeRef) -> ArcPtrBorrow<A> {
+        let clone_slot = node.clone_slot();
         let prepare_ptr = ptr::from_ref(&self.ptr)
-            .map_addr(|addr| addr | PREPARE_LOAD_FLAG)
+            .map_addr(|addr| addr | PREPARE_CLONE_FLAG)
             .cast_mut()
             .cast();
-        fallback.store(prepare_ptr, SeqCst);
+        clone_slot.store(prepare_ptr, SeqCst);
         let ptr_checked = self.ptr.load(SeqCst);
         if A::NULLABLE && ptr_checked.is_null() {
-            let ptr = fallback.swap(NULL, SeqCst);
+            let ptr = clone_slot.swap(NULL, SeqCst);
             return ArcPtrBorrow::new(if ptr != prepare_ptr { ptr } else { ptr_checked }, None);
         }
-        let confirm_ptr = ptr_checked.map_addr(|addr| addr | CONFIRM_LOAD_FLAG);
+        let confirm_ptr = ptr_checked.map_addr(|addr| addr | CONFIRM_CLONE_FLAG);
         // Failure ordering must be SeqCst for load to have a full SeqCst semantic
-        if let Err(ptr) = fallback.compare_exchange(prepare_ptr, confirm_ptr, SeqCst, SeqCst) {
-            fallback.store(NULL, SeqCst);
+        if let Err(ptr) = clone_slot.compare_exchange(prepare_ptr, confirm_ptr, SeqCst, SeqCst) {
+            clone_slot.store(NULL, SeqCst);
             return ArcPtrBorrow::new(ptr, None);
         }
         unsafe { A::incr_rc(ptr_checked) };
-        if let Err(ptr) = fallback.compare_exchange(confirm_ptr, NULL, SeqCst, Acquire) {
+        if let Err(ptr) = clone_slot.compare_exchange(confirm_ptr, NULL, SeqCst, Acquire) {
             debug_assert!(ptr.is_null());
             unsafe { A::decr_rc(ptr_checked) };
         }
@@ -181,10 +182,10 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         let old_arc = unsafe { A::from_ptr(old_ptr) };
         for node in L::static_list().nodes() {
             if !A::NULLABLE || !old_ptr.is_null() {
-                for borrow in node.borrows().iter() {
-                    if borrow.load(SeqCst) == old_ptr {
+                for slot in node.borrow_slots().iter() {
+                    if slot.load(SeqCst) == old_ptr {
                         transfer_ownership::<A>(old_ptr, || {
-                            borrow.compare_exchange(old_ptr, NULL, SeqCst, Relaxed)
+                            slot.compare_exchange(old_ptr, NULL, SeqCst, Relaxed)
                         });
                     }
                 }
@@ -192,25 +193,25 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
             let Some(new_ptr) = new_ptr else {
                 continue;
             };
-            let fallback = node.fallback();
-            let ptr = fallback.load(SeqCst);
-            if ptr.addr() & (PREPARE_LOAD_FLAG | CONFIRM_LOAD_FLAG) == 0 {
+            let clone_slot = node.clone_slot();
+            let ptr = clone_slot.load(SeqCst);
+            if ptr.addr() & (PREPARE_CLONE_FLAG | CONFIRM_CLONE_FLAG) == 0 {
                 continue;
-            } else if ptr.addr() == ptr::from_ref(&self.ptr).addr() | PREPARE_LOAD_FLAG {
+            } else if ptr.addr() == ptr::from_ref(&self.ptr).addr() | PREPARE_CLONE_FLAG {
                 transfer_ownership::<A>(new_ptr, || {
-                    match fallback.compare_exchange(ptr, new_ptr, SeqCst, Relaxed) {
-                        Err(ptr) if ptr.addr() == old_ptr.addr() | CONFIRM_LOAD_FLAG => {
+                    match clone_slot.compare_exchange(ptr, new_ptr, SeqCst, Relaxed) {
+                        Err(ptr) if ptr.addr() == old_ptr.addr() | CONFIRM_CLONE_FLAG => {
                             transfer_ownership::<A>(old_ptr, || {
-                                fallback.compare_exchange(ptr, NULL, SeqCst, Relaxed)
+                                clone_slot.compare_exchange(ptr, NULL, SeqCst, Relaxed)
                             });
                             Err(ptr)
                         }
                         res => res,
                     }
                 });
-            } else if ptr.addr() == old_ptr.addr() | CONFIRM_LOAD_FLAG {
+            } else if ptr.addr() == old_ptr.addr() | CONFIRM_CLONE_FLAG {
                 transfer_ownership::<A>(old_ptr, || {
-                    fallback.compare_exchange(ptr, NULL, SeqCst, Relaxed)
+                    clone_slot.compare_exchange(ptr, NULL, SeqCst, Relaxed)
                 })
             }
         }
@@ -321,12 +322,12 @@ impl<T, L: StaticBorrowList> From<Option<T>> for AtomicArcPtr<Option<Arc<T>>, L>
 #[derive(Debug)]
 pub struct ArcPtrBorrow<A: ArcPtr> {
     arc: ManuallyDrop<A>,
-    borrow: Option<&'static Borrow>,
+    borrow: Option<&'static BorrowSlot>,
 }
 
 impl<A: ArcPtr> ArcPtrBorrow<A> {
     #[inline(always)]
-    fn new(ptr: *mut (), borrow: Option<&'static Borrow>) -> Self {
+    fn new(ptr: *mut (), borrow: Option<&'static BorrowSlot>) -> Self {
         let arc = ManuallyDrop::new(unsafe { A::from_ptr(ptr) });
         Self { arc, borrow }
     }
