@@ -1,247 +1,256 @@
 use std::{
+    array, hint,
     hint::black_box,
     sync::{
-        Arc, RwLock,
-        atomic::{AtomicBool, Ordering::Relaxed},
+        Arc, RwLock, RwLockReadGuard,
+        atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
     },
     thread,
-    time::Duration,
 };
 
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::{ArcSwap, ArcSwapOption, Guard};
 use divan::Bencher;
-use hazarc::{AtomicArc, AtomicOptionArc};
+use hazarc::{ArcBorrow, AtomicArc, AtomicOptionArc};
 
-#[divan::bench(args = [0, 1, 2, 4, 8, 16])]
-fn arcswap_write(b: Bencher, thread_count: usize) {
-    let v: Arc<usize> = 0.into();
-    let arc: Arc<ArcSwap<usize>> = Arc::new(ArcSwap::new(v.clone()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut threads = Vec::new();
-    for _ in 0..thread_count {
-        let arc = arc.clone();
-        let stop = stop.clone();
-        threads.push(thread::spawn(move || {
-            while !stop.load(Relaxed) {
-                arc.load();
-                for _ in 0..32 {
-                    std::hint::spin_loop();
-                }
-            }
-        }));
-    }
-    thread::sleep(Duration::from_secs(1));
-    b.bench(|| arc.swap(v.clone()));
-    stop.store(true, Relaxed);
-    for thread in threads {
-        thread.join().unwrap();
-    }
-}
-
-#[divan::bench(threads = [1, 2, 4, 8, 16], args = [false, true])]
-fn arcswap_read(b: Bencher, write: bool) {
-    let v: Arc<usize> = 0.into();
-    let arc: Arc<ArcSwap<usize>> = Arc::new(ArcSwap::new(v.clone()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let thread = {
-        let v = v.clone();
-        let arc = arc.clone();
-        let stop = stop.clone();
-        thread::spawn(move || {
-            while !stop.load(Relaxed) {
-                if write {
-                    arc.store(v.clone());
-                }
-                for _ in 0..256 {
-                    std::hint::spin_loop();
-                }
-            }
-        })
-    };
-    thread::sleep(Duration::from_secs(1));
-    b.with_inputs(|| drop(arc.load()))
-        .bench_values(|()| drop(arc.load()));
-    stop.store(true, Relaxed);
-    thread.join().unwrap();
-}
-
-#[divan::bench(threads = [1, 2, 4, 8, 16])]
-fn arcswap_read_spin(b: Bencher) {
-    let v: Arc<usize> = 0.into();
-    let arc: Arc<ArcSwap<usize>> = Arc::new(ArcSwap::new(v.clone()));
-    b.with_inputs(|| drop(arc.load())).bench_values(|()| {
-        let borrow = arc.load();
-        for _ in 0..4 {
-            let _ = black_box(0) + black_box(0);
+trait LoadBench: Default + Send + Sync {
+    type Guard<'a>
+    where
+        Self: 'a;
+    fn load(&self) -> Self::Guard<'_>;
+    fn bench_load(b: Bencher, threads: bool) {
+        let x = black_box(Self::default());
+        drop(x.load());
+        if threads {
+            b.bench(|| drop(x.load()));
+        } else {
+            b.bench_local(|| drop(x.load()));
         }
-        drop(borrow);
-    });
+    }
+    fn bench_load_fallback(b: Bencher) {
+        let x = black_box(Self::default());
+        let _guards = array::from_fn::<_, 8, _>(|_| x.load());
+        b.bench_local(|| drop(x.load()));
+    }
+}
+trait StoreBench: LoadBench + From<Arc<usize>> {
+    fn store(&self, arc: Arc<usize>);
+    fn bench_load_contended(b: Bencher, threads: bool) {
+        let arc = Arc::new(0);
+        let x = black_box(Self::from(arc.clone()));
+        drop(x.load());
+        let started = AtomicBool::new(false);
+        let stop = AtomicBool::new(false);
+        thread::scope(|s| {
+            s.spawn(|| {
+                started.store(true, Relaxed);
+                while !stop.load(Relaxed) {
+                    x.store(arc.clone());
+                    for _ in 0..8 {
+                        hint::spin_loop();
+                    }
+                }
+            });
+            while !started.load(Relaxed) {
+                hint::spin_loop();
+            }
+            if threads {
+                b.bench(|| drop(x.load()));
+            } else {
+                b.bench_local(|| drop(x.load()));
+            }
+            stop.store(true, Relaxed);
+        });
+    }
+
+    fn bench_store(b: Bencher, threads: usize) {
+        let arc = Arc::new(0);
+        let x = black_box(Self::from(arc.clone()));
+        thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| drop(x.load()));
+            }
+        });
+        b.bench_local(|| x.store(arc.clone()));
+    }
+
+    fn bench_store_contended(b: Bencher, threads: usize) {
+        let arc = Arc::new(0);
+        let atomic_arc = black_box(Self::from(arc.clone()));
+        let started = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    started.fetch_add(1, Relaxed);
+                    while !stop.load(Relaxed) {
+                        let _guard = atomic_arc.load();
+                        for _ in 0..8 {
+                            hint::spin_loop();
+                        }
+                    }
+                });
+            }
+            while started.load(Relaxed) != threads {
+                hint::spin_loop();
+            }
+            b.bench_local(|| atomic_arc.store(arc.clone()));
+            stop.store(true, Relaxed);
+        });
+    }
+}
+
+impl LoadBench for ArcSwap<usize> {
+    type Guard<'a> = Guard<Arc<usize>>;
+    fn load(&self) -> Self::Guard<'_> {
+        self.load()
+    }
+}
+impl StoreBench for ArcSwap<usize> {
+    fn store(&self, arc: Arc<usize>) {
+        self.store(arc);
+    }
+}
+impl LoadBench for ArcSwapOption<usize> {
+    type Guard<'a> = Guard<Option<Arc<usize>>>;
+    fn load(&self) -> Self::Guard<'_> {
+        self.load()
+    }
+}
+
+impl LoadBench for AtomicArc<usize> {
+    type Guard<'a> = ArcBorrow<usize>;
+    fn load(&self) -> Self::Guard<'_> {
+        self.load()
+    }
+}
+impl StoreBench for AtomicArc<usize> {
+    fn store(&self, arc: Arc<usize>) {
+        self.store(arc);
+    }
+}
+impl LoadBench for AtomicOptionArc<usize> {
+    type Guard<'a> = Option<ArcBorrow<usize>>;
+    fn load(&self) -> Self::Guard<'_> {
+        self.load()
+    }
+}
+
+impl LoadBench for RwLock<Arc<usize>> {
+    type Guard<'a> = RwLockReadGuard<'a, Arc<usize>>;
+    fn load(&self) -> Self::Guard<'_> {
+        self.read().unwrap()
+    }
+}
+impl StoreBench for RwLock<Arc<usize>> {
+    fn store(&self, arc: Arc<usize>) {
+        *self.write().unwrap() = arc;
+    }
+}
+
+#[derive(Default)]
+struct RwLockClone<T>(RwLock<T>);
+impl LoadBench for RwLockClone<Arc<usize>> {
+    type Guard<'a> = Arc<usize>;
+    fn load(&self) -> Self::Guard<'_> {
+        self.0.read().unwrap().clone()
+    }
+}
+impl From<Arc<usize>> for RwLockClone<Arc<usize>> {
+    fn from(arc: Arc<usize>) -> Self {
+        Self(RwLock::new(arc))
+    }
+}
+impl StoreBench for RwLockClone<Arc<usize>> {
+    fn store(&self, arc: Arc<usize>) {
+        *self.0.write().unwrap() = arc;
+    }
 }
 
 #[divan::bench]
-fn arcswap_read_none(b: Bencher) {
-    let atomic_arc = ArcSwapOption::<usize>::empty();
-    b.with_inputs(|| drop(atomic_arc.load()))
-        .bench_values(|()| drop(atomic_arc.load()));
+fn arcswap_load(b: Bencher) {
+    ArcSwap::bench_load(b, false)
 }
-
+#[divan::bench]
+fn arcswap_load_fallback(b: Bencher) {
+    ArcSwap::bench_load_fallback(b)
+}
+#[divan::bench]
+fn arcswap_load_none(b: Bencher) {
+    ArcSwapOption::bench_load(b, false)
+}
+#[divan::bench]
+fn arcswap_load_contended(b: Bencher) {
+    ArcSwap::bench_load_contended(b, false)
+}
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
-fn rwlock_write(b: Bencher, thread_count: usize) {
-    let v = Arc::new(0);
-    let lock = Arc::new(RwLock::new(v.clone()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut threads = Vec::new();
-    for _ in 0..thread_count {
-        let lock = lock.clone();
-        let stop = stop.clone();
-        threads.push(thread::spawn(move || {
-            while !stop.load(Relaxed) {
-                let clone = lock.read().unwrap().clone();
-                drop(clone);
-                for _ in 0..32 {
-                    std::hint::spin_loop();
-                }
-            }
-        }));
-    }
-    thread::sleep(Duration::from_secs(1));
-    b.bench(|| *lock.write().unwrap() = v.clone());
-    stop.store(true, Relaxed);
-    for thread in threads {
-        thread.join().unwrap();
-    }
+fn arcswap_store(b: Bencher, threads: usize) {
+    ArcSwap::bench_store(b, threads)
 }
-
-#[divan::bench(threads = [1, 2, 4, 8, 16], args = [false, true])]
-fn rwlock_read_clone(b: Bencher, write: bool) {
-    let v: Arc<usize> = 0.into();
-    let lock = Arc::new(RwLock::new(v.clone()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let thread = {
-        let v = v.clone();
-        let lock = lock.clone();
-        let stop = stop.clone();
-        thread::spawn(move || {
-            while !stop.load(Relaxed) {
-                if write {
-                    *lock.write().unwrap() = v.clone();
-                }
-                for _ in 0..256 {
-                    std::hint::spin_loop();
-                }
-            }
-        })
-    };
-    thread::sleep(Duration::from_secs(1));
-    b.bench(|| {
-        let clone = lock.read().unwrap().clone();
-        drop(clone);
-    });
-    stop.store(true, Relaxed);
-    thread.join().unwrap();
-}
-
-#[divan::bench(threads = [1, 2, 4, 8, 16], args = [false, true])]
-fn rwlock_read(b: Bencher, write: bool) {
-    let v: Arc<usize> = 0.into();
-    let lock = Arc::new(RwLock::new(v.clone()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let thread = {
-        let v = v.clone();
-        let lock = lock.clone();
-        let stop = stop.clone();
-        thread::spawn(move || {
-            while !stop.load(Relaxed) {
-                if write {
-                    *lock.write().unwrap() = v.clone();
-                }
-                for _ in 0..256 {
-                    std::hint::spin_loop();
-                }
-            }
-        })
-    };
-    thread::sleep(Duration::from_secs(1));
-    b.bench(|| {
-        let _lock = lock.read().unwrap();
-    });
-    stop.store(true, Relaxed);
-    thread.join().unwrap();
-}
-
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
-fn hazarc_write(b: Bencher, thread_count: usize) {
-    let v: Arc<usize> = 0.into();
-    let arc: Arc<AtomicArc<usize>> = Arc::new(AtomicArc::new(v.clone()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut threads = Vec::new();
-    for _ in 0..thread_count {
-        let arc = arc.clone();
-        let stop = stop.clone();
-        threads.push(thread::spawn(move || {
-            while !stop.load(Relaxed) {
-                arc.load();
-                for _ in 0..32 {
-                    std::hint::spin_loop();
-                }
-            }
-        }));
-    }
-    thread::sleep(Duration::from_secs(1));
-    b.bench(|| arc.swap(v.clone()));
-    stop.store(true, Relaxed);
-    for thread in threads {
-        thread.join().unwrap();
-    }
-}
-
-#[divan::bench(threads = [1, 2, 4, 8, 16], args = [false, true])]
-fn hazarc_read(b: Bencher, write: bool) {
-    let v: Arc<usize> = 0.into();
-    let arc: Arc<AtomicArc<usize>> = Arc::new(AtomicArc::new(v.clone()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let thread = {
-        let v = v.clone();
-        let arc = arc.clone();
-        let stop = stop.clone();
-        thread::spawn(move || {
-            while !stop.load(Relaxed) {
-                if write {
-                    arc.store(v.clone());
-                }
-                for _ in 0..256 {
-                    std::hint::spin_loop();
-                }
-            }
-        })
-    };
-    thread::sleep(Duration::from_secs(1));
-    b.with_inputs(|| drop(arc.load()))
-        .bench_values(|()| drop(arc.load()));
-    stop.store(true, Relaxed);
-    thread.join().unwrap();
-}
-
-#[divan::bench(threads = [1, 2, 4, 8, 16])]
-fn hazarc_read_spin(b: Bencher) {
-    let v: Arc<usize> = 0.into();
-    let arc: Arc<AtomicArc<usize>> = Arc::new(AtomicArc::new(v.clone()));
-    b.with_inputs(|| drop(arc.load())).bench_values(|()| {
-        let borrow = arc.load();
-        for _ in 0..4 {
-            let _ = black_box(0) + black_box(0);
-        }
-        drop(borrow);
-    });
+fn arcswap_store_contended(b: Bencher, threads: usize) {
+    ArcSwap::bench_store_contended(b, threads)
 }
 
 #[divan::bench]
-fn hazarc_read_none(b: Bencher) {
-    let atomic_arc = AtomicOptionArc::<usize>::none();
-    b.with_inputs(|| drop(atomic_arc.load()))
-        .bench_values(|()| drop(atomic_arc.load()));
+fn hazarc_load(b: Bencher) {
+    AtomicArc::bench_load(b, false)
+}
+#[divan::bench]
+fn hazarc_load_fallback(b: Bencher) {
+    AtomicArc::bench_load_fallback(b)
+}
+#[divan::bench]
+fn hazarc_load_none(b: Bencher) {
+    AtomicOptionArc::bench_load(b, false)
+}
+#[divan::bench]
+fn hazarc_load_none_relaxed(b: Bencher) {
+    let x = black_box(AtomicOptionArc::<usize>::default());
+    drop(x.load());
+    b.bench_local(|| drop(x.load_relaxed()));
+}
+#[divan::bench]
+fn hazarc_load_contended(b: Bencher) {
+    AtomicArc::bench_load_contended(b, false)
+}
+#[divan::bench(args = [0, 1, 2, 4, 8, 16])]
+fn hazarc_store(b: Bencher, threads: usize) {
+    AtomicArc::bench_store(b, threads)
+}
+#[divan::bench(args = [0, 1, 2, 4, 8, 16])]
+fn hazarc_store_contended(b: Bencher, threads: usize) {
+    AtomicArc::bench_store_contended(b, threads)
+}
+
+#[divan::bench(threads = [0, 1, 2, 4, 8, 16])]
+fn rwlock_read(b: Bencher) {
+    RwLock::bench_load(b, true)
+}
+#[divan::bench(threads = [0, 1, 2, 4, 8, 16])]
+fn arcswap_read_clone(b: Bencher) {
+    RwLockClone::bench_load(b, true)
+}
+#[divan::bench(threads = [0, 1, 2, 4, 8, 16])]
+fn rwlock_read_contended(b: Bencher) {
+    RwLock::bench_load_contended(b, true)
+}
+#[divan::bench(threads = [0, 1, 2, 4, 8, 16])]
+fn rwlock_read_contended_clone(b: Bencher) {
+    RwLockClone::bench_load_contended(b, true)
+}
+#[divan::bench(args = [0, 1, 2, 4, 8, 16])]
+fn rwlock_write(b: Bencher, threads: usize) {
+    RwLock::bench_store(b, threads)
+}
+#[divan::bench(args = [0, 1, 2, 4, 8, 16])]
+fn rwlock_write_contended(b: Bencher, threads: usize) {
+    RwLock::bench_store_contended(b, threads)
+}
+#[divan::bench(args = [0, 1, 2, 4, 8, 16])]
+fn rwlock_write_contended_clone(b: Bencher, threads: usize) {
+    RwLockClone::bench_store_contended(b, threads)
 }
 
 fn main() {
-    divan::main()
+    divan::main();
 }
