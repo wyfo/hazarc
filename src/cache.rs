@@ -68,6 +68,13 @@ impl<A: AtomicArcRef> ArcCache<A> {
     pub fn load(&mut self) -> &A::Arc {
         self.atomic_arc.atomic_arc().load_cached(&mut self.cached)
     }
+
+    #[inline]
+    pub fn load_relaxed(&mut self) -> &A::Arc {
+        self.atomic_arc
+            .atomic_arc()
+            .load_cached_relaxed(&mut self.cached)
+    }
 }
 
 // Arc parameter is necessary for `load` method disambiguation.
@@ -91,6 +98,11 @@ impl<A: AtomicArcRef<Arc = Option<Arc>>, Arc> OptionArcCache<A> {
     #[inline]
     pub fn load(&mut self) -> Option<&Arc> {
         self.0.load().as_ref()
+    }
+
+    #[inline]
+    pub fn load_relaxed(&mut self) -> Option<&Arc> {
+        self.0.load_relaxed().as_ref()
     }
 }
 

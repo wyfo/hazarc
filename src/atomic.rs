@@ -7,7 +7,7 @@ use core::{
     ops::Deref,
     ptr,
     sync::atomic::{
-        AtomicPtr,
+        AtomicPtr, Ordering,
         Ordering::{Acquire, Relaxed, SeqCst},
     },
 };
@@ -153,13 +153,23 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
     }
 
     #[inline]
-    pub fn load_cached<'a>(&self, cached: &'a mut A) -> &'a A {
+    pub fn load_cached_impl<'a>(&self, cached: &'a mut A, ordering: Ordering) -> &'a A {
         // using `load_if_outdated` doesn't give the exact same code
-        let ptr = self.ptr.load(Relaxed);
+        let ptr = self.ptr.load(ordering);
         if ptr != A::as_ptr(cached) {
             *cached = self.load_impl(ptr).into_owned();
         }
         cached
+    }
+
+    #[inline]
+    pub fn load_cached<'a>(&self, cached: &'a mut A) -> &'a A {
+        self.load_cached_impl(cached, SeqCst)
+    }
+
+    #[inline]
+    pub fn load_cached_relaxed<'a>(&self, cached: &'a mut A) -> &'a A {
+        self.load_cached_impl(cached, Relaxed)
     }
 
     pub fn swap(&self, arc: A) -> A {
@@ -457,6 +467,11 @@ impl<A: ArcPtr + NonNullPtr, D: Domain> AtomicOptionArcPtr<A, D> {
     #[inline]
     pub fn load_cached<'a>(&self, cached: &'a mut Option<A>) -> Option<&'a A> {
         self.0.load_cached(cached).as_ref()
+    }
+
+    #[inline]
+    pub fn load_cached_relaxed<'a>(&self, cached: &'a mut Option<A>) -> Option<&'a A> {
+        self.0.load_cached_relaxed(cached).as_ref()
     }
 
     pub fn swap(&self, new: Option<A>) -> Option<A> {
