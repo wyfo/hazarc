@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use core::{mem::ManuallyDrop, ops::Deref, pin::Pin, ptr};
 
-use crate::NULL;
+use crate::{NULL, atomic::ArcPtrBorrow};
 
 #[allow(clippy::missing_safety_doc)]
 pub unsafe trait NonNullPtr {}
@@ -75,5 +75,34 @@ unsafe impl<T> ArcPtr for Arc<T> {
     #[inline(always)]
     fn as_ptr(arc: &Self) -> *mut () {
         Arc::as_ptr(arc).cast_mut().cast()
+    }
+}
+
+pub trait ArcRef<A: ArcPtr> {
+    #[allow(clippy::wrong_self_convention)]
+    fn as_ptr(this: Self) -> *mut ();
+}
+
+impl<A: ArcPtr> ArcRef<A> for &A {
+    fn as_ptr(this: Self) -> *mut () {
+        <A as ArcPtr>::as_ptr(this)
+    }
+}
+
+impl<A: ArcPtr + NonNullPtr> ArcRef<Option<A>> for Option<&A> {
+    fn as_ptr(this: Self) -> *mut () {
+        this.map_or(NULL, ArcRef::as_ptr)
+    }
+}
+
+impl<A: ArcPtr> ArcRef<A> for &ArcPtrBorrow<A> {
+    fn as_ptr(this: Self) -> *mut () {
+        ArcRef::as_ptr(&**this)
+    }
+}
+
+impl<A: ArcPtr + NonNullPtr> ArcRef<Option<A>> for Option<&ArcPtrBorrow<A>> {
+    fn as_ptr(this: Self) -> *mut () {
+        ArcRef::as_ptr(this.map(AsRef::as_ref))
     }
 }

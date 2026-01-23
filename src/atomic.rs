@@ -2,6 +2,7 @@ use alloc::sync::Arc;
 use core::{
     fmt,
     marker::PhantomData,
+    mem,
     mem::ManuallyDrop,
     ops::Deref,
     ptr,
@@ -13,7 +14,7 @@ use core::{
 
 use crate::{
     NULL,
-    arc::{ArcPtr, NonNullPtr},
+    arc::{ArcPtr, ArcRef, NonNullPtr},
     borrow_list::{Borrow, BorrowNodeRef, StaticBorrowList},
 };
 
@@ -36,13 +37,13 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         }
     }
 
-    #[inline(always)]
-    fn load_impl(&self) -> ArcPtrBorrow<A> {
-        self.load_with_ptr(self.ptr.load(Relaxed))
+    #[inline]
+    pub fn load(&self) -> ArcPtrBorrow<A> {
+        self.load_impl(self.ptr.load(Relaxed))
     }
 
     #[inline(always)]
-    fn load_with_ptr(&self, mut ptr: *mut ()) -> ArcPtrBorrow<A> {
+    fn load_impl(&self, mut ptr: *mut ()) -> ArcPtrBorrow<A> {
         if A::NULLABLE && ptr.is_null() {
             ptr = self.ptr.load(SeqCst);
             if ptr.is_null() {
@@ -137,25 +138,25 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
 
     #[inline]
     pub fn load_owned(&self) -> A {
-        self.load_impl().into_owned()
+        self.load().into_owned()
     }
 
-    #[inline(always)]
-    fn load_if_outdated_impl<'a>(&self, arc: &'a A) -> Result<&'a A, ArcPtrBorrow<A>> {
+    #[inline]
+    pub fn load_if_outdated<'a>(&self, arc: &'a A) -> Result<&'a A, ArcPtrBorrow<A>> {
         let ptr = self.ptr.load(Relaxed);
         if ptr == A::as_ptr(arc) {
             Ok(arc)
         } else {
-            Err(self.load_with_ptr(ptr))
+            Err(self.load_impl(ptr))
         }
     }
 
-    #[inline(always)]
-    fn load_cached_impl<'a>(&self, cached: &'a mut A) -> &'a A {
+    #[inline]
+    pub fn load_cached<'a>(&self, cached: &'a mut A) -> &'a A {
         // using `load_if_outdated` doesn't give the exact same code
         let ptr = self.ptr.load(Relaxed);
         if ptr != A::as_ptr(cached) {
-            *cached = self.load_with_ptr(ptr).into_owned();
+            *cached = self.load_impl(ptr).into_owned();
         }
         cached
     }
@@ -220,48 +221,24 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         drop(self.swap(arc));
     }
 
-    fn compare_exchange_impl(&self, current: *mut (), new: A) -> Result<A, ArcPtrBorrow<A>> {
+    pub fn compare_exchange<C: ArcRef<A>>(&self, current: C, new: A) -> Result<A, ArcPtrBorrow<A>> {
         // store a clone in order to keep an owned arc, in case its ownership must be transferred
-        match (self.ptr).compare_exchange(current, A::into_ptr(new.clone()), SeqCst, Relaxed) {
+        let new_clone = A::into_ptr(new.clone());
+        match (self.ptr).compare_exchange(C::as_ptr(current), new_clone, SeqCst, Relaxed) {
             Ok(old_ptr) => Ok(self.swap_impl(old_ptr, Some(new))),
-            Err(old_ptr) => Err(self.load_with_ptr(old_ptr)),
+            Err(old_ptr) => Err(self.load_impl(old_ptr)),
         }
     }
 
-    fn fetch_update_impl<F: FnMut(&A) -> Option<A>>(&self, mut f: F) -> Result<A, ArcPtrBorrow<A>> {
-        let mut current = self.load_impl();
+    pub fn fetch_update<F: FnMut(&A) -> Option<A>>(&self, mut f: F) -> Result<A, ArcPtrBorrow<A>> {
+        let mut current = self.load();
         while let Some(new) = f(&current) {
-            match self.compare_exchange_impl(A::as_ptr(&current), new) {
+            match self.compare_exchange(&*current, new) {
                 Ok(old_arc) => return Ok(old_arc),
                 Err(old_arc) => current = old_arc,
             }
         }
         Err(current)
-    }
-}
-
-impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
-    #[inline]
-    pub fn load(&self) -> ArcPtrBorrow<A> {
-        self.load_impl()
-    }
-
-    #[inline]
-    pub fn load_if_outdated<'a>(&self, arc: &'a A) -> Result<&'a A, ArcPtrBorrow<A>> {
-        self.load_if_outdated_impl(arc)
-    }
-
-    #[inline]
-    pub fn load_cached<'a>(&self, cached: &'a mut A) -> &'a A {
-        self.load_cached_impl(cached)
-    }
-
-    pub fn compare_exchange(&self, current: &A, new: A) -> Result<A, ArcPtrBorrow<A>> {
-        self.compare_exchange_impl(A::as_ptr(current), new)
-    }
-
-    pub fn fetch_update<F: FnMut(&A) -> Option<A>>(&self, f: F) -> Result<A, ArcPtrBorrow<A>> {
-        self.fetch_update_impl(f)
     }
 }
 
@@ -281,48 +258,12 @@ impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> AtomicArcPtr<Option<A>, L> {
     }
 
     #[inline]
-    pub fn load(&self) -> Option<ArcPtrBorrow<A>> {
-        self.load_impl().into_opt()
-    }
-
-    #[inline]
-    pub fn load_relaxed(&self) -> Option<ArcPtrBorrow<A>> {
+    pub fn load_relaxed(&self) -> ArcPtrBorrow<Option<A>> {
         let ptr = self.ptr.load(Relaxed);
         if ptr.is_null() {
-            return None;
+            return None::<A>.into();
         }
-        self.load_with_ptr(ptr).into_opt()
-    }
-
-    #[inline]
-    pub fn load_if_outdated<'a>(
-        &self,
-        arc: &'a Option<A>,
-    ) -> Result<&'a Option<A>, Option<ArcPtrBorrow<A>>> {
-        self.load_if_outdated_impl(arc)
-            .map_err(ArcPtrBorrow::into_opt)
-    }
-
-    #[inline]
-    pub fn load_cached<'a>(&self, cached: &'a mut Option<A>) -> Option<&'a A> {
-        self.load_cached_impl(cached).as_ref()
-    }
-
-    pub fn compare_exchange(
-        &self,
-        current: Option<&A>,
-        new: Option<A>,
-    ) -> Result<Option<A>, Option<ArcPtrBorrow<A>>> {
-        self.compare_exchange_impl(current.map_or(NULL, A::as_ptr), new)
-            .map_err(ArcPtrBorrow::into_opt)
-    }
-
-    pub fn fetch_update<F: FnMut(Option<&A>) -> Option<Option<A>>>(
-        &self,
-        mut f: F,
-    ) -> Result<Option<A>, Option<ArcPtrBorrow<A>>> {
-        self.fetch_update_impl(|arc| f(arc.as_ref()))
-            .map_err(ArcPtrBorrow::into_opt)
+        self.load_impl(ptr)
     }
 }
 
@@ -343,9 +284,7 @@ impl<A: ArcPtr + Default, L: StaticBorrowList> Default for AtomicArcPtr<A, L> {
 
 impl<A: ArcPtr + fmt::Debug, L: StaticBorrowList> fmt::Debug for AtomicArcPtr<A, L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("AtomicArcPtr")
-            .field(&self.load_impl())
-            .finish()
+        f.debug_tuple("AtomicArcPtr").field(&self.load()).finish()
     }
 }
 
@@ -403,12 +342,12 @@ impl<A: ArcPtr> ArcPtrBorrow<A> {
 
 impl<A: ArcPtr + NonNullPtr> ArcPtrBorrow<Option<A>> {
     #[inline(always)]
-    fn into_opt(self) -> Option<ArcPtrBorrow<A>> {
-        let mut this = ManuallyDrop::new(self);
-        Some(ArcPtrBorrow {
-            borrow: this.borrow,
-            arc: ManuallyDrop::new(unsafe { ManuallyDrop::take(&mut this.arc)? }),
-        })
+    pub fn transpose(self) -> Option<ArcPtrBorrow<A>> {
+        let this = ManuallyDrop::new(self);
+        Some(ArcPtrBorrow::new(
+            A::as_ptr(this.arc.as_ref()?),
+            this.borrow,
+        ))
     }
 }
 
@@ -433,11 +372,148 @@ impl<A: ArcPtr> Deref for ArcPtrBorrow<A> {
     }
 }
 
+impl<A: ArcPtr> AsRef<A> for ArcPtrBorrow<A> {
+    #[inline]
+    fn as_ref(&self) -> &A {
+        self
+    }
+}
+
 impl<A: ArcPtr> From<A> for ArcPtrBorrow<A> {
+    #[inline]
     fn from(value: A) -> Self {
         Self {
             arc: ManuallyDrop::new(value),
             borrow: None,
         }
+    }
+}
+
+impl<A: ArcPtr + NonNullPtr> From<Option<ArcPtrBorrow<A>>> for ArcPtrBorrow<Option<A>> {
+    #[inline]
+    fn from(value: Option<ArcPtrBorrow<A>>) -> Self {
+        match value.map(ManuallyDrop::new) {
+            Some(a) => Self::new(A::as_ptr(&a.arc), a.borrow),
+            None => Self::new(NULL, None),
+        }
+    }
+}
+
+#[repr(transparent)]
+pub struct AtomicOptionArcPtr<A: ArcPtr + NonNullPtr, L: StaticBorrowList>(
+    AtomicArcPtr<Option<A>, L>,
+);
+
+impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> AtomicOptionArcPtr<A, L> {
+    #[inline]
+    pub fn new(arc: Option<A>) -> Self {
+        Self(AtomicArcPtr::new(arc))
+    }
+
+    #[inline]
+    pub fn inner(&self) -> &AtomicArcPtr<Option<A>, L> {
+        &self.0
+    }
+
+    #[inline]
+    pub fn into_inner(self) -> AtomicArcPtr<Option<A>, L> {
+        self.0
+    }
+
+    #[inline]
+    pub const fn none() -> Self {
+        Self(AtomicArcPtr::none())
+    }
+
+    #[inline]
+    pub fn is_none(&self) -> bool {
+        self.0.is_none()
+    }
+
+    #[inline]
+    pub fn load_relaxed(&self) -> Option<ArcPtrBorrow<A>> {
+        self.0.load_relaxed().transpose()
+    }
+
+    #[inline]
+    pub fn load(&self) -> Option<ArcPtrBorrow<A>> {
+        self.0.load().transpose()
+    }
+
+    #[inline]
+    pub fn load_owned(&self) -> Option<A> {
+        self.0.load_owned()
+    }
+
+    #[inline]
+    pub fn load_if_outdated<'a>(
+        &self,
+        arc: &'a Option<A>,
+    ) -> Result<&'a Option<A>, Option<ArcPtrBorrow<A>>> {
+        self.0
+            .load_if_outdated(arc)
+            .map_err(ArcPtrBorrow::transpose)
+    }
+
+    #[inline]
+    pub fn load_cached<'a>(&self, cached: &'a mut Option<A>) -> Option<&'a A> {
+        self.0.load_cached(cached).as_ref()
+    }
+
+    pub fn swap(&self, new: Option<A>) -> Option<A> {
+        self.0.swap(new)
+    }
+
+    pub fn store(&self, new: Option<A>) {
+        self.0.store(new);
+    }
+
+    pub fn compare_exchange<C: ArcRef<Option<A>>>(
+        &self,
+        current: C,
+        new: Option<A>,
+    ) -> Result<Option<A>, Option<ArcPtrBorrow<A>>> {
+        self.0
+            .compare_exchange(current, new)
+            .map_err(ArcPtrBorrow::transpose)
+    }
+
+    pub fn fetch_update<F: FnMut(Option<&A>) -> Option<Option<A>>>(
+        &self,
+        mut f: F,
+    ) -> Result<Option<A>, Option<ArcPtrBorrow<A>>> {
+        self.0
+            .fetch_update(|arc| f(arc.as_ref()))
+            .map_err(ArcPtrBorrow::transpose)
+    }
+}
+impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> Default for AtomicOptionArcPtr<A, L> {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+impl<A: ArcPtr + NonNullPtr + fmt::Debug, L: StaticBorrowList> fmt::Debug
+    for AtomicOptionArcPtr<A, L>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("AtomicOptionArcPtr").field(&self.0).finish()
+    }
+}
+
+impl<T, A: ArcPtr + NonNullPtr, L: StaticBorrowList> From<T> for AtomicOptionArcPtr<A, L>
+where
+    AtomicArcPtr<Option<A>, L>: From<T>,
+{
+    fn from(value: T) -> Self {
+        Self(value.into())
+    }
+}
+
+impl<'a, A: ArcPtr + NonNullPtr, L: StaticBorrowList> From<&'a AtomicArcPtr<Option<A>, L>>
+    for &'a AtomicOptionArcPtr<A, L>
+{
+    fn from(value: &'a AtomicArcPtr<Option<A>, L>) -> Self {
+        unsafe { mem::transmute::<&'a AtomicArcPtr<Option<A>, L>, Self>(value) }
     }
 }

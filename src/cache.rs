@@ -1,8 +1,8 @@
-use core::ops::Deref;
+use core::{fmt, ops::Deref};
 
 use crate::{
     arc::{ArcPtr, NonNullPtr},
-    atomic::AtomicArcPtr,
+    atomic::{AtomicArcPtr, AtomicOptionArcPtr},
     borrow_list::StaticBorrowList,
 };
 
@@ -12,44 +12,90 @@ pub trait AtomicArcRef {
     fn atomic_arc(&self) -> &AtomicArcPtr<Self::Arc, Self::BorrowList>;
 }
 
-impl<A: ArcPtr, L: StaticBorrowList, T: Deref<Target = AtomicArcPtr<A, L>>> AtomicArcRef for T {
+impl<A: ArcPtr, L: StaticBorrowList> AtomicArcRef for AtomicArcPtr<A, L> {
     type Arc = A;
     type BorrowList = L;
+    #[inline]
     fn atomic_arc(&self) -> &AtomicArcPtr<Self::Arc, Self::BorrowList> {
         self
     }
 }
 
+impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> AtomicArcRef for AtomicOptionArcPtr<A, L> {
+    type Arc = Option<A>;
+    type BorrowList = L;
+    #[inline]
+    fn atomic_arc(&self) -> &AtomicArcPtr<Self::Arc, Self::BorrowList> {
+        self.inner()
+    }
+}
+
+impl<T: Deref> AtomicArcRef for T
+where
+    T::Target: AtomicArcRef,
+{
+    type Arc = <T::Target as AtomicArcRef>::Arc;
+    type BorrowList = <T::Target as AtomicArcRef>::BorrowList;
+    #[inline]
+    fn atomic_arc(&self) -> &AtomicArcPtr<Self::Arc, Self::BorrowList> {
+        (**self).atomic_arc()
+    }
+}
+
 // Arc parameter is necessary for `load` method disambiguation.
 #[derive(Debug, Clone)]
-pub struct ArcCache<A: AtomicArcRef, Arc = <A as AtomicArcRef>::Arc> {
-    inner: A,
-    cached: Arc,
+pub struct ArcCache<A: AtomicArcRef> {
+    atomic_arc: A,
+    cached: A::Arc,
 }
 
 impl<A: AtomicArcRef> ArcCache<A> {
-    pub fn new(inner: A) -> Self {
-        let cached = inner.atomic_arc().load_owned();
-        Self { inner, cached }
+    #[inline]
+    pub fn new(atomic_arc: A) -> Self {
+        let cached = atomic_arc.atomic_arc().load_owned();
+        Self { atomic_arc, cached }
     }
 
-    pub fn inner(&self) -> &A {
-        &self.inner
+    pub fn atomic_arc(&self) -> &A {
+        &self.atomic_arc
     }
 
-    pub fn into_inner(self) -> A {
-        self.inner
+    pub fn into_atomic_arc(self) -> A {
+        self.atomic_arc
     }
-}
 
-impl<A: AtomicArcRef<Arc = Arc>, Arc: ArcPtr + NonNullPtr> ArcCache<A, Arc> {
+    #[inline]
     pub fn load(&mut self) -> &A::Arc {
-        self.inner.atomic_arc().load_cached(&mut self.cached)
+        self.atomic_arc.atomic_arc().load_cached(&mut self.cached)
     }
 }
 
-impl<A: AtomicArcRef<Arc = Option<Arc>>, Arc: ArcPtr + NonNullPtr> ArcCache<A, Option<Arc>> {
+// Arc parameter is necessary for `load` method disambiguation.
+#[derive(Clone)]
+pub struct OptionArcCache<A: AtomicArcRef>(ArcCache<A>);
+
+impl<A: AtomicArcRef<Arc = Option<Arc>>, Arc> OptionArcCache<A> {
+    #[inline]
+    pub fn new(inner: A) -> Self {
+        Self(ArcCache::new(inner))
+    }
+
+    pub fn inner(&self) -> &ArcCache<A> {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> ArcCache<A> {
+        self.0
+    }
+
+    #[inline]
     pub fn load(&mut self) -> Option<&Arc> {
-        self.inner.atomic_arc().load_cached(&mut self.cached)
+        self.0.load().as_ref()
+    }
+}
+
+impl<A: AtomicArcRef<Arc: fmt::Debug> + fmt::Debug> fmt::Debug for OptionArcCache<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("OptionArcCache").field(&self.0).finish()
     }
 }

@@ -17,9 +17,9 @@ pub type AtomicArc<T, L = DefaultBorrowList> = atomic::AtomicArcPtr<Arc<T>, L>;
 #[cfg(not(feature = "default-borrow-list"))]
 pub type AtomicArc<T, L> = atomic::AtomicArcPtr<Arc<T>, L>;
 #[cfg(feature = "default-borrow-list")]
-pub type AtomicOptionArc<T, L = DefaultBorrowList> = atomic::AtomicArcPtr<Option<Arc<T>>, L>;
+pub type AtomicOptionArc<T, L = DefaultBorrowList> = atomic::AtomicOptionArcPtr<Arc<T>, L>;
 #[cfg(not(feature = "default-borrow-list"))]
-pub type AtomicOptionArc<T, L> = atomic::AtomicArcPtr<Option<Arc<T>>, L>;
+pub type AtomicOptionArc<T, L> = atomic::AtomicOptionArcPtr<Arc<T>, L>;
 pub type ArcBorrow<T> = atomic::ArcPtrBorrow<Arc<T>>;
 
 const NULL: *mut () = core::ptr::null_mut();
