@@ -3,7 +3,7 @@ use std::{
     thread,
 };
 
-use hazarc::{ArcBorrow, AtomicArc, AtomicOptionArc, borrow_list};
+use hazarc::{ArcBorrow, AtomicArc, AtomicOptionArc, domain};
 
 struct SpinBarrier(AtomicUsize);
 
@@ -27,7 +27,7 @@ impl SpinBarrier {
 
 #[test]
 fn concurrent_writes() {
-    borrow_list!(TestList(1));
+    domain!(TestList(1));
     let check_borrow = |b: &ArcBorrow<_>| assert!([0, 1, 2].contains(b));
     let barrier = SpinBarrier::new(3);
     let atomic_arc = AtomicArc::<_, TestList>::from(0);
@@ -50,7 +50,7 @@ fn concurrent_writes() {
 
 #[test]
 fn concurrent_writes_option() {
-    borrow_list!(TestList(1));
+    domain!(TestList(1));
     let check_borrow = |b: &Option<ArcBorrow<_>>| {
         assert!([Some(0), Some(1), None].contains(&b.as_ref().map(|b| ***b)))
     };
@@ -75,7 +75,7 @@ fn concurrent_writes_option() {
 
 #[test]
 fn drop_atomic_arc_with_active_borrow() {
-    borrow_list!(TestList(1));
+    domain!(TestList(1));
     let atomic_arc = AtomicArc::<usize, TestList>::from(0);
     let borrow = atomic_arc.load();
     drop(atomic_arc);
@@ -84,7 +84,7 @@ fn drop_atomic_arc_with_active_borrow() {
 
 #[test]
 fn drop_borrow_in_another_thread() {
-    borrow_list!(TestList(1));
+    domain!(TestList(1));
     let barrier = SpinBarrier::new(2);
     let atomic_arc = AtomicOptionArc::<usize, TestList>::from(0);
     thread::scope(|s| {

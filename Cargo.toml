@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["default-borrow-list"]
-default-borrow-list = []
+default = ["default-domain"]
+default-domain = []
 
 [dependencies]
 crossbeam-utils = "0.8"
@@ -20,7 +20,7 @@ bench = false
 [[bench]]
 name = "comparison"
 harness = false
-required-features = ["default-borrow-list"]
+required-features = ["default-domain"]
 
 [lints.rust]
 missing_debug_implementations = "forbid"

@@ -3,16 +3,16 @@ use core::{fmt, ops::Deref};
 use crate::{
     arc::{ArcPtr, NonNullPtr},
     atomic::{AtomicArcPtr, AtomicOptionArcPtr},
-    borrow_list::StaticBorrowList,
+    domain::Domain,
 };
 
 pub trait AtomicArcRef {
     type Arc: ArcPtr;
-    type BorrowList: StaticBorrowList;
+    type BorrowList: Domain;
     fn atomic_arc(&self) -> &AtomicArcPtr<Self::Arc, Self::BorrowList>;
 }
 
-impl<A: ArcPtr, L: StaticBorrowList> AtomicArcRef for AtomicArcPtr<A, L> {
+impl<A: ArcPtr, L: Domain> AtomicArcRef for AtomicArcPtr<A, L> {
     type Arc = A;
     type BorrowList = L;
     #[inline]
@@ -21,7 +21,7 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcRef for AtomicArcPtr<A, L> {
     }
 }
 
-impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> AtomicArcRef for AtomicOptionArcPtr<A, L> {
+impl<A: ArcPtr + NonNullPtr, L: Domain> AtomicArcRef for AtomicOptionArcPtr<A, L> {
     type Arc = Option<A>;
     type BorrowList = L;
     #[inline]

@@ -19,7 +19,7 @@ use crossbeam_utils::CachePadded;
 use crate::NULL;
 
 #[allow(clippy::missing_safety_doc)]
-pub unsafe trait StaticBorrowList {
+pub unsafe trait Domain {
     fn static_list() -> &'static BorrowList;
     fn thread_local_node() -> BorrowNodeRef;
 }
@@ -178,42 +178,42 @@ impl fmt::Debug for BorrowNodeRef {
 }
 
 #[macro_export]
-macro_rules! borrow_list {
+macro_rules! domain {
     ($vis:vis $name:ident($borrow_count:expr)) => {
         $vis struct $name;
         impl ::core::fmt::Debug for $name {
             fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-                let list = <$name as $crate::borrow_list::StaticBorrowList>::static_list();
+                let list = <$name as $crate::domain::Domain>::static_list();
                 f.debug_tuple(::core::stringify!($name)).field(list).finish()
             }
         }
-        unsafe impl $crate::borrow_list::StaticBorrowList for $name {
+        unsafe impl $crate::domain::Domain for $name {
             #[inline(always)]
-            fn static_list() -> &'static $crate::borrow_list::BorrowList {
-                static LIST: $crate::borrow_list::BorrowList = $crate::borrow_list::BorrowList::new();
+            fn static_list() -> &'static $crate::domain::BorrowList {
+                static LIST: $crate::domain::BorrowList = $crate::domain::BorrowList::new();
                 &LIST
             }
             #[inline(always)]
-            fn thread_local_node() -> $crate::borrow_list::BorrowNodeRef {
+            fn thread_local_node() -> $crate::domain::BorrowNodeRef {
                 extern crate std;
                 std::thread_local! {
-                    static LOCAL: std::cell::Cell<std::option::Option<$crate::borrow_list::BorrowNodeRef>> = const { std::cell::Cell::new(None) };
+                    static LOCAL: std::cell::Cell<std::option::Option<$crate::domain::BorrowNodeRef>> = const { std::cell::Cell::new(None) };
                 }
                 #[cold]
                 #[inline(never)]
-                fn new_node() -> $crate::borrow_list::BorrowNodeRef {
+                fn new_node() -> $crate::domain::BorrowNodeRef {
                     struct NodeGuard;
                     impl Drop for NodeGuard {
                         fn drop(&mut self) {
                             if let Some(node) = LOCAL.take() {
-                                unsafe { <$name as  $crate::borrow_list::StaticBorrowList>::static_list().remove_node(node) };
+                                unsafe { <$name as  $crate::domain::Domain>::static_list().remove_node(node) };
                             }
                         }
                     }
                     std::thread_local! {
                         static GUARD: NodeGuard = const { NodeGuard };
                     }
-                    let node = <$name as  $crate::borrow_list::StaticBorrowList>::static_list().insert_node($borrow_count);
+                    let node = <$name as  $crate::domain::Domain>::static_list().insert_node($borrow_count);
                     LOCAL.set(Some(node));
                     GUARD.with(|_| ());
                     node
@@ -228,9 +228,9 @@ macro_rules! borrow_list {
 mod tests {
     extern crate std;
 
-    use crate::borrow_list::StaticBorrowList;
+    use crate::domain::Domain;
 
-    borrow_list!(TestList(1));
+    domain!(TestList(1));
     #[test]
     fn node_reuse() {
         let thread = std::thread::spawn(|| {

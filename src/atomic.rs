@@ -15,19 +15,19 @@ use core::{
 use crate::{
     NULL,
     arc::{ArcPtr, ArcRef, NonNullPtr},
-    borrow_list::{BorrowNodeRef, BorrowSlot, StaticBorrowList},
+    domain::{BorrowNodeRef, BorrowSlot, Domain},
 };
 
 const PREPARE_CLONE_FLAG: usize = 0b01;
 const CONFIRM_CLONE_FLAG: usize = 0b10;
 
-pub struct AtomicArcPtr<A: ArcPtr, L: StaticBorrowList> {
+pub struct AtomicArcPtr<A: ArcPtr, D: Domain> {
     ptr: AtomicPtr<()>,
     _arc: PhantomData<A>,
-    _list: PhantomData<L>,
+    _list: PhantomData<D>,
 }
 
-impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
+impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
     #[inline]
     pub fn new(arc: A) -> Self {
         Self {
@@ -51,7 +51,7 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
             }
         }
         debug_assert!(!ptr.is_null());
-        let node = L::thread_local_node();
+        let node = D::thread_local_node();
         let slot_idx = node.next_borrow_slot_idx().get();
         let slot = unsafe { node.borrow_slots().get_unchecked(slot_idx) };
         if slot.load(Relaxed).is_null() {
@@ -180,7 +180,7 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
         }
         let new_ptr = new.as_ref().map(A::as_ptr);
         let old_arc = unsafe { A::from_ptr(old_ptr) };
-        for node in L::static_list().nodes() {
+        for node in D::static_list().nodes() {
             if !A::NULLABLE || !old_ptr.is_null() {
                 for slot in node.borrow_slots().iter() {
                     if slot.load(SeqCst) == old_ptr {
@@ -243,7 +243,7 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
     }
 }
 
-impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> AtomicArcPtr<Option<A>, L> {
+impl<A: ArcPtr + NonNullPtr, D: Domain> AtomicArcPtr<Option<A>, D> {
     #[inline]
     pub const fn none() -> Self {
         Self {
@@ -268,7 +268,7 @@ impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> AtomicArcPtr<Option<A>, L> {
     }
 }
 
-impl<A: ArcPtr, L: StaticBorrowList> Drop for AtomicArcPtr<A, L> {
+impl<A: ArcPtr, D: Domain> Drop for AtomicArcPtr<A, D> {
     fn drop(&mut self) {
         let ptr = *self.ptr.get_mut();
         if !A::NULLABLE || !ptr.is_null() {
@@ -277,43 +277,43 @@ impl<A: ArcPtr, L: StaticBorrowList> Drop for AtomicArcPtr<A, L> {
     }
 }
 
-impl<A: ArcPtr + Default, L: StaticBorrowList> Default for AtomicArcPtr<A, L> {
+impl<A: ArcPtr + Default, D: Domain> Default for AtomicArcPtr<A, D> {
     fn default() -> Self {
         Self::new(A::default())
     }
 }
 
-impl<A: ArcPtr + fmt::Debug, L: StaticBorrowList> fmt::Debug for AtomicArcPtr<A, L> {
+impl<A: ArcPtr + fmt::Debug, D: Domain> fmt::Debug for AtomicArcPtr<A, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AtomicArcPtr").field(&self.load()).finish()
     }
 }
 
-impl<A: ArcPtr, L: StaticBorrowList> From<A> for AtomicArcPtr<A, L> {
+impl<A: ArcPtr, D: Domain> From<A> for AtomicArcPtr<A, D> {
     fn from(value: A) -> Self {
         Self::new(value)
     }
 }
 
-impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> From<A> for AtomicArcPtr<Option<A>, L> {
+impl<A: ArcPtr + NonNullPtr, D: Domain> From<A> for AtomicArcPtr<Option<A>, D> {
     fn from(value: A) -> Self {
         Some(value).into()
     }
 }
 
-impl<T, L: StaticBorrowList> From<T> for AtomicArcPtr<Arc<T>, L> {
+impl<T, D: Domain> From<T> for AtomicArcPtr<Arc<T>, D> {
     fn from(value: T) -> Self {
         Arc::new(value).into()
     }
 }
 
-impl<T, L: StaticBorrowList> From<T> for AtomicArcPtr<Option<Arc<T>>, L> {
+impl<T, D: Domain> From<T> for AtomicArcPtr<Option<Arc<T>>, D> {
     fn from(value: T) -> Self {
         Some(Arc::new(value)).into()
     }
 }
 
-impl<T, L: StaticBorrowList> From<Option<T>> for AtomicArcPtr<Option<Arc<T>>, L> {
+impl<T, D: Domain> From<Option<T>> for AtomicArcPtr<Option<Arc<T>>, D> {
     fn from(value: Option<T>) -> Self {
         value.map(Arc::new).into()
     }
@@ -401,23 +401,21 @@ impl<A: ArcPtr + NonNullPtr> From<Option<ArcPtrBorrow<A>>> for ArcPtrBorrow<Opti
 }
 
 #[repr(transparent)]
-pub struct AtomicOptionArcPtr<A: ArcPtr + NonNullPtr, L: StaticBorrowList>(
-    AtomicArcPtr<Option<A>, L>,
-);
+pub struct AtomicOptionArcPtr<A: ArcPtr + NonNullPtr, D: Domain>(AtomicArcPtr<Option<A>, D>);
 
-impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> AtomicOptionArcPtr<A, L> {
+impl<A: ArcPtr + NonNullPtr, D: Domain> AtomicOptionArcPtr<A, D> {
     #[inline]
     pub fn new(arc: Option<A>) -> Self {
         Self(AtomicArcPtr::new(arc))
     }
 
     #[inline]
-    pub fn inner(&self) -> &AtomicArcPtr<Option<A>, L> {
+    pub fn inner(&self) -> &AtomicArcPtr<Option<A>, D> {
         &self.0
     }
 
     #[inline]
-    pub fn into_inner(self) -> AtomicArcPtr<Option<A>, L> {
+    pub fn into_inner(self) -> AtomicArcPtr<Option<A>, D> {
         self.0
     }
 
@@ -488,33 +486,31 @@ impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> AtomicOptionArcPtr<A, L> {
             .map_err(ArcPtrBorrow::transpose)
     }
 }
-impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> Default for AtomicOptionArcPtr<A, L> {
+impl<A: ArcPtr + NonNullPtr, D: Domain> Default for AtomicOptionArcPtr<A, D> {
     fn default() -> Self {
         Self::none()
     }
 }
 
-impl<A: ArcPtr + NonNullPtr + fmt::Debug, L: StaticBorrowList> fmt::Debug
-    for AtomicOptionArcPtr<A, L>
-{
+impl<A: ArcPtr + NonNullPtr + fmt::Debug, D: Domain> fmt::Debug for AtomicOptionArcPtr<A, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AtomicOptionArcPtr").field(&self.0).finish()
     }
 }
 
-impl<T, A: ArcPtr + NonNullPtr, L: StaticBorrowList> From<T> for AtomicOptionArcPtr<A, L>
+impl<T, A: ArcPtr + NonNullPtr, D: Domain> From<T> for AtomicOptionArcPtr<A, D>
 where
-    AtomicArcPtr<Option<A>, L>: From<T>,
+    AtomicArcPtr<Option<A>, D>: From<T>,
 {
     fn from(value: T) -> Self {
         Self(value.into())
     }
 }
 
-impl<'a, A: ArcPtr + NonNullPtr, L: StaticBorrowList> From<&'a AtomicArcPtr<Option<A>, L>>
-    for &'a AtomicOptionArcPtr<A, L>
+impl<'a, A: ArcPtr + NonNullPtr, D: Domain> From<&'a AtomicArcPtr<Option<A>, D>>
+    for &'a AtomicOptionArcPtr<A, D>
 {
-    fn from(value: &'a AtomicArcPtr<Option<A>, L>) -> Self {
-        unsafe { mem::transmute::<&'a AtomicArcPtr<Option<A>, L>, Self>(value) }
+    fn from(value: &'a AtomicArcPtr<Option<A>, D>) -> Self {
+        unsafe { mem::transmute::<&'a AtomicArcPtr<Option<A>, D>, Self>(value) }
     }
 }
