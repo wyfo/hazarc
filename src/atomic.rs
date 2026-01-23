@@ -247,6 +247,15 @@ impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> AtomicArcPtr<Option<A>, L> {
     }
 
     #[inline]
+    pub fn load_relaxed(&self) -> Option<ArcPtrBorrow<A>> {
+        let ptr = self.ptr.load(Relaxed);
+        if ptr.is_null() {
+            return None;
+        }
+        self.load_with_ptr(ptr).into_opt()
+    }
+
+    #[inline]
     pub fn load_if_outdated<'a>(
         &self,
         arc: &'a Option<A>,
