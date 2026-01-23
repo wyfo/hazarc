@@ -179,7 +179,7 @@ impl fmt::Debug for BorrowNodeRef {
 
 #[macro_export]
 macro_rules! domain {
-    ($vis:vis $name:ident($borrow_count:expr)) => {
+    ($vis:vis $name:ident($borrow_slots:expr)) => {
         $vis struct $name;
         impl ::core::fmt::Debug for $name {
             fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
@@ -213,7 +213,7 @@ macro_rules! domain {
                     std::thread_local! {
                         static GUARD: NodeGuard = const { NodeGuard };
                     }
-                    let node = <$name as  $crate::domain::Domain>::static_list().insert_node($borrow_count);
+                    let node = <$name as  $crate::domain::Domain>::static_list().insert_node($borrow_slots);
                     LOCAL.set(Some(node));
                     GUARD.with(|_| ());
                     node
