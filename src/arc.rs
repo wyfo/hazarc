@@ -70,6 +70,10 @@ unsafe impl<T> ArcPtr for Arc<T> {
     }
     #[inline(always)]
     fn into_ptr(arc: Self) -> *mut () {
+        #[cfg(target_pointer_width = "16")]
+        const {
+            assert!(align_of::<T>() >= 4);
+        }
         Arc::into_raw(arc).cast_mut().cast()
     }
     #[inline(always)]
