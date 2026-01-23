@@ -53,10 +53,11 @@ trait StoreBench: LoadBench + From<Arc<usize>> {
             while !started.load(Relaxed) {
                 hint::spin_loop();
             }
+            let load = || drop(x.load());
             if threads {
-                b.bench(|| drop(x.load()));
+                b.bench(load);
             } else {
-                b.bench_local(|| drop(x.load()));
+                b.bench_local(load);
             }
             stop.store(true, Relaxed);
         });
@@ -165,14 +166,35 @@ impl StoreBench for RwLockClone<Arc<usize>> {
         *self.0.write().unwrap() = arc;
     }
 }
+#[derive(Default)]
+struct LoadSpin<T>(T);
+impl<T: LoadBench> LoadBench for LoadSpin<T> {
+    type Guard<'a>
+        = T::Guard<'a>
+    where
+        Self: 'a;
+    fn load(&self) -> Self::Guard<'_> {
+        let guard = self.0.load();
+        hint::spin_loop();
+        guard
+    }
+}
 
 #[divan::bench]
 fn arcswap_load(b: Bencher) {
     ArcSwap::bench_load(b, false)
 }
 #[divan::bench]
+fn arcswap_load_spin(b: Bencher) {
+    LoadSpin::<ArcSwap<_>>::bench_load(b, false)
+}
+#[divan::bench]
 fn arcswap_load_fallback(b: Bencher) {
     ArcSwap::bench_load_fallback(b)
+}
+#[divan::bench]
+fn arcswap_load_fallback_spin(b: Bencher) {
+    LoadSpin::<ArcSwap<_>>::bench_load_fallback(b)
 }
 #[divan::bench]
 fn arcswap_load_none(b: Bencher) {
@@ -196,8 +218,16 @@ fn hazarc_load(b: Bencher) {
     AtomicArc::bench_load(b, false)
 }
 #[divan::bench]
+fn hazarc_load_spin(b: Bencher) {
+    LoadSpin::<AtomicArc<_>>::bench_load(b, false)
+}
+#[divan::bench]
 fn hazarc_load_fallback(b: Bencher) {
     AtomicArc::bench_load_fallback(b)
+}
+#[divan::bench]
+fn hazarc_load_fallback_spin(b: Bencher) {
+    LoadSpin::<AtomicArc<_>>::bench_load_fallback(b)
 }
 #[divan::bench]
 fn hazarc_load_none(b: Bencher) {
@@ -227,8 +257,16 @@ fn rwlock_read(b: Bencher) {
     RwLock::bench_load(b, true)
 }
 #[divan::bench(threads = [0, 1, 2, 4, 8, 16])]
-fn arcswap_read_clone(b: Bencher) {
+fn rwlock_read_spin(b: Bencher) {
+    LoadSpin::<RwLock<_>>::bench_load(b, true)
+}
+#[divan::bench(threads = [0, 1, 2, 4, 8, 16])]
+fn rwlock_read_clone(b: Bencher) {
     RwLockClone::bench_load(b, true)
+}
+#[divan::bench(threads = [0, 1, 2, 4, 8, 16])]
+fn rwlock_read_clone_spin(b: Bencher) {
+    LoadSpin::<RwLockClone<_>>::bench_load(b, true)
 }
 #[divan::bench(threads = [0, 1, 2, 4, 8, 16])]
 fn rwlock_read_contended(b: Bencher) {
