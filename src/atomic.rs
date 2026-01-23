@@ -151,6 +151,13 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
     }
 
     pub fn swap(&self, arc: A) -> A {
+        let new_ptr = A::as_ptr(&arc);
+        // store a clone in order to keep an owned arc, in case its ownership must be transferred
+        let old_ptr = self.ptr.swap(A::into_ptr(arc.clone()), SeqCst);
+        self.swap_impl(old_ptr, Some(new_ptr))
+    }
+
+    fn swap_impl(&self, old_ptr: *mut (), new_ptr: Option<*mut ()>) -> A {
         fn transfer_ownership<A: ArcPtr>(
             ptr: *mut (),
             op: impl FnOnce() -> Result<*mut (), *mut ()>,
@@ -160,9 +167,6 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
                 unsafe { A::decr_rc(ptr) };
             }
         }
-        let new_ptr = A::as_ptr(&arc);
-        // store a clone in order to keep an owned arc, in case its ownership must be cloned
-        let old_ptr = self.ptr.swap(A::into_ptr(arc.clone()), SeqCst);
         let old_arc = unsafe { A::from_ptr(old_ptr) };
         for node in L::static_list().nodes() {
             if !A::NULLABLE || !old_ptr.is_null() {
@@ -174,6 +178,9 @@ impl<A: ArcPtr, L: StaticBorrowList> AtomicArcPtr<A, L> {
                     }
                 }
             }
+            let Some(new_ptr) = new_ptr else {
+                continue;
+            };
             let fallback = node.fallback();
             let ptr = fallback.load(SeqCst);
             if ptr.addr() & (PREPARE_LOAD_FLAG | CONFIRM_LOAD_FLAG) == 0 {
@@ -278,18 +285,8 @@ impl<A: ArcPtr + NonNullPtr, L: StaticBorrowList> AtomicArcPtr<Option<A>, L> {
 impl<A: ArcPtr, L: StaticBorrowList> Drop for AtomicArcPtr<A, L> {
     fn drop(&mut self) {
         let ptr = *self.ptr.get_mut();
-        if A::NULLABLE && ptr.is_null() {
-            return;
-        }
-        let _arc = unsafe { A::from_ptr(ptr) };
-        for node in L::static_list().nodes() {
-            for borrow in node.borrows().iter() {
-                if borrow.load(SeqCst) == ptr
-                    && (borrow.compare_exchange(ptr, NULL, SeqCst, Relaxed)).is_ok()
-                {
-                    unsafe { A::incr_rc(ptr) }
-                }
-            }
+        if !A::NULLABLE || !ptr.is_null() {
+            self.swap_impl(ptr, None);
         }
     }
 }
