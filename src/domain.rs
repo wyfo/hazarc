@@ -230,16 +230,16 @@ mod tests {
 
     use crate::domain::Domain;
 
-    domain!(TestList(1));
     #[test]
     fn node_reuse() {
+        domain!(TestDomain(1));
         let thread = std::thread::spawn(|| {
-            let node = TestList::thread_local_node();
+            let node = TestDomain::thread_local_node();
             node.next_borrow_slot_idx().set(1);
             node
         });
         let node1 = thread.join().unwrap();
-        let node2 = TestList::thread_local_node();
+        let node2 = TestDomain::thread_local_node();
         assert_eq!(node1.as_ptr(), node2.as_ptr());
         assert_eq!(node2.next_borrow_slot_idx().get(), 1);
     }
