@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::{mem::ManuallyDrop, ops::Deref, pin::Pin, ptr};
 
 use crate::{NULL, atomic::ArcPtrBorrow};
@@ -79,6 +79,25 @@ unsafe impl<T> ArcPtr for Arc<T> {
     #[inline(always)]
     fn as_ptr(arc: &Self) -> *mut () {
         Arc::as_ptr(arc).cast_mut().cast()
+    }
+}
+
+unsafe impl<T> ArcPtr for Weak<T> {
+    #[inline(always)]
+    unsafe fn from_ptr(ptr: *mut ()) -> Self {
+        unsafe { Weak::from_raw(ptr.cast()) }
+    }
+    #[inline(always)]
+    fn into_ptr(arc: Self) -> *mut () {
+        #[cfg(target_pointer_width = "16")]
+        const {
+            assert!(align_of::<T>() >= 4);
+        }
+        Weak::into_raw(arc).cast_mut().cast()
+    }
+    #[inline(always)]
+    fn as_ptr(arc: &Self) -> *mut () {
+        Weak::as_ptr(arc).cast_mut().cast()
     }
 }
 
