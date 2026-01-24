@@ -112,9 +112,15 @@ impl<A: ArcPtr> ArcRef<A> for &A {
     }
 }
 
+impl<A: ArcPtr + NonNullPtr> ArcRef<Option<A>> for &A {
+    fn as_ptr(this: Self) -> *mut () {
+        <A as ArcPtr>::as_ptr(this)
+    }
+}
+
 impl<A: ArcPtr + NonNullPtr> ArcRef<Option<A>> for Option<&A> {
     fn as_ptr(this: Self) -> *mut () {
-        this.map_or(NULL, ArcRef::as_ptr)
+        this.map_or(NULL, A::as_ptr)
     }
 }
 
