@@ -22,4 +22,6 @@ pub type AtomicOptionArc<T, D = DefaultDomain> = atomic::AtomicOptionArcPtr<Arc<
 pub type AtomicOptionArc<T, L> = atomic::AtomicOptionArcPtr<Arc<T>, L>;
 pub type ArcBorrow<T> = atomic::ArcPtrBorrow<Arc<T>>;
 
+pub use cache::Cache;
+
 const NULL: *mut () = core::ptr::null_mut();

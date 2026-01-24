@@ -1,4 +1,4 @@
-use core::{fmt, ops::Deref};
+use core::ops::Deref;
 
 use crate::{
     arc::{ArcPtr, NonNullPtr},
@@ -6,108 +6,112 @@ use crate::{
     domain::Domain,
 };
 
-pub trait AtomicArcRef {
-    type Arc: ArcPtr;
-    type BorrowList: Domain;
-    fn atomic_arc(&self) -> &AtomicArcPtr<Self::Arc, Self::BorrowList>;
+pub trait Cacheable {
+    type Arc;
+    type Cached;
+    type Load<'a>
+    where
+        Self::Arc: 'a;
+    fn load_owned(&self) -> Self::Cached;
+    fn load_cached<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a>;
+    fn load_cached_relaxed<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a>;
 }
 
-impl<A: ArcPtr, L: Domain> AtomicArcRef for AtomicArcPtr<A, L> {
+impl<A: ArcPtr, L: Domain> Cacheable for AtomicArcPtr<A, L> {
     type Arc = A;
-    type BorrowList = L;
+    type Cached = A;
+    type Load<'a>
+        = &'a A
+    where
+        Self::Arc: 'a;
     #[inline]
-    fn atomic_arc(&self) -> &AtomicArcPtr<Self::Arc, Self::BorrowList> {
-        self
+    fn load_owned(&self) -> Self::Cached {
+        self.load_owned()
+    }
+    #[inline]
+    fn load_cached<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a> {
+        self.load_cached(cached)
+    }
+    #[inline]
+    fn load_cached_relaxed<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a> {
+        self.load_cached_relaxed(cached)
     }
 }
 
-impl<A: ArcPtr + NonNullPtr, L: Domain> AtomicArcRef for AtomicOptionArcPtr<A, L> {
-    type Arc = Option<A>;
-    type BorrowList = L;
+impl<A: ArcPtr + NonNullPtr, L: Domain> Cacheable for AtomicOptionArcPtr<A, L> {
+    type Arc = A;
+    type Cached = Option<A>;
+    type Load<'a>
+        = Option<&'a A>
+    where
+        Self::Arc: 'a;
     #[inline]
-    fn atomic_arc(&self) -> &AtomicArcPtr<Self::Arc, Self::BorrowList> {
-        self.inner()
+    fn load_owned(&self) -> Self::Cached {
+        self.load_owned()
+    }
+    #[inline]
+    fn load_cached<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a> {
+        self.load_cached(cached)
+    }
+    #[inline]
+    fn load_cached_relaxed<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a> {
+        self.load_cached_relaxed(cached)
     }
 }
 
-impl<T: Deref> AtomicArcRef for T
+impl<T: Deref> Cacheable for T
 where
-    T::Target: AtomicArcRef,
+    T::Target: Cacheable,
 {
-    type Arc = <T::Target as AtomicArcRef>::Arc;
-    type BorrowList = <T::Target as AtomicArcRef>::BorrowList;
+    type Arc = <T::Target as Cacheable>::Arc;
+    type Cached = <T::Target as Cacheable>::Cached;
+    type Load<'a>
+        = <T::Target as Cacheable>::Load<'a>
+    where
+        Self::Arc: 'a;
     #[inline]
-    fn atomic_arc(&self) -> &AtomicArcPtr<Self::Arc, Self::BorrowList> {
-        (**self).atomic_arc()
+    fn load_owned(&self) -> Self::Cached {
+        (**self).load_owned()
+    }
+    #[inline]
+    fn load_cached<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a> {
+        (**self).load_cached(cached)
+    }
+    #[inline]
+    fn load_cached_relaxed<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a> {
+        (**self).load_cached_relaxed(cached)
     }
 }
 
 // Arc parameter is necessary for `load` method disambiguation.
 #[derive(Debug, Clone)]
-pub struct ArcCache<A: AtomicArcRef> {
-    atomic_arc: A,
-    cached: A::Arc,
+pub struct Cache<A: Cacheable> {
+    inner: A,
+    cached: A::Cached,
 }
 
-impl<A: AtomicArcRef> ArcCache<A> {
-    #[inline]
-    pub fn new(atomic_arc: A) -> Self {
-        let cached = atomic_arc.atomic_arc().load_owned();
-        Self { atomic_arc, cached }
-    }
-
-    pub fn atomic_arc(&self) -> &A {
-        &self.atomic_arc
-    }
-
-    pub fn into_atomic_arc(self) -> A {
-        self.atomic_arc
-    }
-
-    #[inline]
-    pub fn load(&mut self) -> &A::Arc {
-        self.atomic_arc.atomic_arc().load_cached(&mut self.cached)
-    }
-
-    #[inline]
-    pub fn load_relaxed(&mut self) -> &A::Arc {
-        self.atomic_arc
-            .atomic_arc()
-            .load_cached_relaxed(&mut self.cached)
-    }
-}
-
-// Arc parameter is necessary for `load` method disambiguation.
-#[derive(Clone)]
-pub struct OptionArcCache<A: AtomicArcRef>(ArcCache<A>);
-
-impl<A: AtomicArcRef<Arc = Option<Arc>>, Arc> OptionArcCache<A> {
+impl<A: Cacheable> Cache<A> {
     #[inline]
     pub fn new(inner: A) -> Self {
-        Self(ArcCache::new(inner))
+        let cached = inner.load_owned();
+        Self { inner, cached }
     }
 
-    pub fn inner(&self) -> &ArcCache<A> {
-        &self.0
+    pub fn inner(&self) -> &A {
+        &self.inner
     }
 
-    pub fn into_inner(self) -> ArcCache<A> {
-        self.0
-    }
-
-    #[inline]
-    pub fn load(&mut self) -> Option<&Arc> {
-        self.0.load().as_ref()
+    pub fn into_inner(self) -> A {
+        self.inner
     }
 
     #[inline]
-    pub fn load_relaxed(&mut self) -> Option<&Arc> {
-        self.0.load_relaxed().as_ref()
+    pub fn load(&mut self) -> A::Load<'_> {
+        self.inner.load_cached(&mut self.cached)
     }
-}
 
-impl<A: AtomicArcRef<Arc: fmt::Debug> + fmt::Debug> fmt::Debug for OptionArcCache<A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("OptionArcCache").field(&self.0).finish()
+    #[inline]
+    pub fn load_relaxed(&mut self) -> A::Load<'_> {
+        self.inner.load_cached_relaxed(&mut self.cached)
     }
 }

@@ -25,11 +25,11 @@ fn task(shared_cfg: &AtomicArc<Config>) {
 }
 ```
 
-`AtomicArc::load` is already very fast, but `ArcCache::load` is blazingly fast
+`AtomicArc::load` is already very fast, but `Cache::load` is blazingly fast
 
 ```rust
 use std::sync::Arc;
-use hazarc::{AtomicArc, cache::ArcCache};
+use hazarc::AtomicArc;
 
 struct Config;
 
@@ -39,7 +39,7 @@ fn update_config(shared_cfg: &AtomicArc<Config>, /* ... */) {
 
 fn spawn_task(shared_cfg: Arc<AtomicArc<Config>>) {
     thread::spawn(move || {
-        let mut cache = ArcCache::new(shared_cfg);
+        let mut cache = hazarc::Cache::new(shared_cfg);
         loop {
             let cfg = cache.load();
             /* ... */

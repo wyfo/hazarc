@@ -19,7 +19,7 @@ use crossbeam_utils::CachePadded;
 use crate::NULL;
 
 #[allow(clippy::missing_safety_doc)]
-pub unsafe trait Domain {
+pub unsafe trait Domain: 'static + Send + Sync {
     fn static_list() -> &'static BorrowList;
     fn thread_local_node() -> BorrowNodeRef;
 }
