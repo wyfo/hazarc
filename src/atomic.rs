@@ -268,10 +268,13 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
         }
     }
 
-    pub fn fetch_update<F: FnMut(&A) -> Option<A>>(&self, mut f: F) -> Result<A, ArcPtrBorrow<A>> {
+    pub fn fetch_update<F: FnMut(&A) -> Option<R>, R: Into<A>>(
+        &self,
+        mut f: F,
+    ) -> Result<A, ArcPtrBorrow<A>> {
         let mut current = self.load();
         while let Some(new) = f(&current) {
-            match self.compare_exchange(&*current, new) {
+            match self.compare_exchange(&*current, new.into()) {
                 Ok(old_arc) => return Ok(old_arc),
                 Err(old_arc) => current = old_arc,
             }
@@ -529,7 +532,7 @@ impl<A: ArcPtr + NonNullPtr, D: Domain> AtomicOptionArcPtr<A, D> {
             .map_err(ArcPtrBorrow::transpose)
     }
 
-    pub fn fetch_update<F: FnMut(Option<&A>) -> Option<Option<A>>>(
+    pub fn fetch_update<F: FnMut(Option<&A>) -> Option<R>, R: Into<Option<A>>>(
         &self,
         mut f: F,
     ) -> Result<Option<A>, Option<ArcPtrBorrow<A>>> {
