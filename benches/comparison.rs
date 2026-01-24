@@ -234,12 +234,6 @@ fn hazarc_load_none(b: Bencher) {
     AtomicOptionArc::bench_load(b, false)
 }
 #[divan::bench]
-fn hazarc_load_none_relaxed(b: Bencher) {
-    let x = black_box(AtomicOptionArc::<usize>::default());
-    drop(x.load());
-    b.bench_local(|| drop(x.load_relaxed()));
-}
-#[divan::bench]
 fn hazarc_load_contended(b: Bencher) {
     AtomicArc::bench_load_contended(b, false)
 }

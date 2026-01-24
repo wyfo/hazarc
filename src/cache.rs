@@ -14,7 +14,6 @@ pub trait AtomicArcRef {
         Self::Arc: 'a;
     fn load_owned(&self) -> Self::Cached;
     fn load_cached<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a>;
-    fn load_cached_relaxed<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a>;
 }
 
 impl<A: ArcPtr, L: Domain> AtomicArcRef for AtomicArcPtr<A, L> {
@@ -32,10 +31,6 @@ impl<A: ArcPtr, L: Domain> AtomicArcRef for AtomicArcPtr<A, L> {
     fn load_cached<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a> {
         self.load_cached(cached)
     }
-    #[inline]
-    fn load_cached_relaxed<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a> {
-        self.load_cached_relaxed(cached)
-    }
 }
 
 impl<A: ArcPtr + NonNullPtr, L: Domain> AtomicArcRef for AtomicOptionArcPtr<A, L> {
@@ -52,10 +47,6 @@ impl<A: ArcPtr + NonNullPtr, L: Domain> AtomicArcRef for AtomicOptionArcPtr<A, L
     #[inline]
     fn load_cached<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a> {
         self.load_cached(cached)
-    }
-    #[inline]
-    fn load_cached_relaxed<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a> {
-        self.load_cached_relaxed(cached)
     }
 }
 
@@ -76,10 +67,6 @@ where
     #[inline]
     fn load_cached<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a> {
         (**self).load_cached(cached)
-    }
-    #[inline]
-    fn load_cached_relaxed<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a> {
-        (**self).load_cached_relaxed(cached)
     }
 }
 
@@ -109,11 +96,6 @@ impl<A: AtomicArcRef> Cache<A> {
     pub fn load(&mut self) -> A::Load<'_> {
         self.inner.load_cached(&mut self.cached)
     }
-
-    #[inline]
-    pub fn load_relaxed(&mut self) -> A::Load<'_> {
-        self.inner.load_cached_relaxed(&mut self.cached)
-    }
 }
 
 impl<A: AtomicArcRef> From<A> for Cache<A> {
@@ -135,7 +117,7 @@ mod tests {
         let mut cache = Cache::new(atomic_arc);
         assert_eq!(**cache.load(), 0);
         cache.inner().store(1.into());
-        assert_eq!(**cache.load_relaxed(), 1);
+        assert_eq!(**cache.load(), 1);
         assert_eq!(*cache.cached, 1);
     }
 
@@ -146,7 +128,7 @@ mod tests {
         let mut cache = Cache::new(atomic_arc);
         assert_eq!(**cache.load().unwrap(), 0);
         cache.inner().store(None);
-        assert!(cache.load_relaxed().is_none());
+        assert!(cache.load().is_none());
         assert_eq!(cache.cached, None);
     }
 }
