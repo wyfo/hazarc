@@ -345,6 +345,7 @@ impl<T, D: Domain> From<Option<T>> for AtomicArcPtr<Option<Arc<T>>, D> {
     }
 }
 
+#[must_use]
 #[derive(Debug)]
 pub struct ArcPtrBorrow<A: ArcPtr> {
     arc: ManuallyDrop<A>,
