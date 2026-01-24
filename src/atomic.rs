@@ -325,7 +325,13 @@ impl<A: ArcPtr + Default, D: Domain> Default for AtomicArcPtr<A, D> {
 
 impl<A: ArcPtr + fmt::Debug, D: Domain> fmt::Debug for AtomicArcPtr<A, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("AtomicArcPtr").field(&self.load()).finish()
+        f.debug_tuple("AtomicArcPtr").field(&*self.load()).finish()
+    }
+}
+
+impl<A: ArcPtr + fmt::Display, D: Domain> fmt::Display for AtomicArcPtr<A, D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (*self.load()).fmt(f)
     }
 }
 
@@ -418,6 +424,12 @@ impl<A: ArcPtr + NonNullPtr> AsRef<A> for ArcPtrBorrow<A> {
     #[inline]
     fn as_ref(&self) -> &A {
         self
+    }
+}
+
+impl<A: ArcPtr + fmt::Display> fmt::Display for ArcPtrBorrow<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
     }
 }
 
