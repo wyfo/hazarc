@@ -6,7 +6,7 @@ use crate::{
     domain::Domain,
 };
 
-pub trait Cacheable {
+pub trait AtomicArcRef {
     type Arc;
     type Cached;
     type Load<'a>
@@ -17,7 +17,7 @@ pub trait Cacheable {
     fn load_cached_relaxed<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a>;
 }
 
-impl<A: ArcPtr, L: Domain> Cacheable for AtomicArcPtr<A, L> {
+impl<A: ArcPtr, L: Domain> AtomicArcRef for AtomicArcPtr<A, L> {
     type Arc = A;
     type Cached = A;
     type Load<'a>
@@ -38,7 +38,7 @@ impl<A: ArcPtr, L: Domain> Cacheable for AtomicArcPtr<A, L> {
     }
 }
 
-impl<A: ArcPtr + NonNullPtr, L: Domain> Cacheable for AtomicOptionArcPtr<A, L> {
+impl<A: ArcPtr + NonNullPtr, L: Domain> AtomicArcRef for AtomicOptionArcPtr<A, L> {
     type Arc = A;
     type Cached = Option<A>;
     type Load<'a>
@@ -59,14 +59,14 @@ impl<A: ArcPtr + NonNullPtr, L: Domain> Cacheable for AtomicOptionArcPtr<A, L> {
     }
 }
 
-impl<T: Deref> Cacheable for T
+impl<T: Deref> AtomicArcRef for T
 where
-    T::Target: Cacheable,
+    T::Target: AtomicArcRef,
 {
-    type Arc = <T::Target as Cacheable>::Arc;
-    type Cached = <T::Target as Cacheable>::Cached;
+    type Arc = <T::Target as AtomicArcRef>::Arc;
+    type Cached = <T::Target as AtomicArcRef>::Cached;
     type Load<'a>
-        = <T::Target as Cacheable>::Load<'a>
+        = <T::Target as AtomicArcRef>::Load<'a>
     where
         Self::Arc: 'a;
     #[inline]
@@ -85,12 +85,12 @@ where
 
 // Arc parameter is necessary for `load` method disambiguation.
 #[derive(Debug, Clone)]
-pub struct Cache<A: Cacheable> {
+pub struct Cache<A: AtomicArcRef> {
     inner: A,
     cached: A::Cached,
 }
 
-impl<A: Cacheable> Cache<A> {
+impl<A: AtomicArcRef> Cache<A> {
     #[inline]
     pub fn new(inner: A) -> Self {
         let cached = inner.load_owned();
@@ -113,5 +113,40 @@ impl<A: Cacheable> Cache<A> {
     #[inline]
     pub fn load_relaxed(&mut self) -> A::Load<'_> {
         self.inner.load_cached_relaxed(&mut self.cached)
+    }
+}
+
+impl<A: AtomicArcRef> From<A> for Cache<A> {
+    fn from(value: A) -> Self {
+        Self::new(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+
+    use crate::{AtomicArc, AtomicOptionArc, Cache, domain};
+
+    #[test]
+    fn cache() {
+        domain!(TestDomain(1));
+        let atomic_arc = Arc::new(AtomicArc::<usize, TestDomain>::from(0));
+        let mut cache = Cache::new(atomic_arc);
+        assert_eq!(**cache.load(), 0);
+        cache.inner().store(1.into());
+        assert_eq!(**cache.load_relaxed(), 1);
+        assert_eq!(*cache.cached, 1);
+    }
+
+    #[test]
+    fn cache_option() {
+        domain!(TestDomain(1));
+        let atomic_arc = Arc::new(AtomicOptionArc::<usize, TestDomain>::from(0));
+        let mut cache = Cache::new(atomic_arc);
+        assert_eq!(**cache.load().unwrap(), 0);
+        cache.inner().store(None);
+        assert!(cache.load_relaxed().is_none());
+        assert_eq!(cache.cached, None);
     }
 }
