@@ -413,7 +413,8 @@ impl<A: ArcPtr> Deref for ArcPtrBorrow<A> {
     }
 }
 
-impl<A: ArcPtr> AsRef<A> for ArcPtrBorrow<A> {
+// NonNullPtr bound to avoid collision with `Option::as_ref`
+impl<A: ArcPtr + NonNullPtr> AsRef<A> for ArcPtrBorrow<A> {
     #[inline]
     fn as_ref(&self) -> &A {
         self
