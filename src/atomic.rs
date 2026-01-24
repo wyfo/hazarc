@@ -81,6 +81,17 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
 
     #[cold]
     #[inline(never)]
+    fn load_find_available_slot(&self, ptr: *mut (), node: BorrowNodeRef) -> ArcPtrBorrow<A> {
+        match (node.borrow_slots().iter().enumerate())
+            .find(|(_, borrow)| borrow.load(Relaxed).is_null())
+        {
+            Some((slot_idx, slot)) => self.load_with_slot(ptr, node, slot, slot_idx),
+            None => self.load_clone(node),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
     fn load_outdated(
         &self,
         node: BorrowNodeRef,
@@ -97,17 +108,6 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
         match borrow.compare_exchange(ptr, NULL, SeqCst, Relaxed) {
             Ok(_) => self.load_clone(node),
             Err(_) => ArcPtrBorrow::new(ptr, None),
-        }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn load_find_available_slot(&self, ptr: *mut (), node: BorrowNodeRef) -> ArcPtrBorrow<A> {
-        match (node.borrow_slots().iter().enumerate())
-            .find(|(_, borrow)| borrow.load(Relaxed).is_null())
-        {
-            Some((slot_idx, slot)) => self.load_with_slot(ptr, node, slot, slot_idx),
-            None => self.load_clone(node),
         }
     }
 
@@ -142,24 +142,48 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
         self.load().into_owned()
     }
 
-    #[inline]
-    pub fn load_if_outdated<'a>(&self, arc: &'a A) -> Result<&'a A, ArcPtrBorrow<A>> {
-        let ptr = self.ptr.load(Relaxed);
+    #[cold]
+    fn load_impl_cold(&self, ptr: *mut ()) -> ArcPtrBorrow<A> {
+        self.load_impl(ptr)
+    }
+
+    #[inline(always)]
+    fn load_if_outdated_impl<'a>(
+        &self,
+        arc: &'a A,
+        ordering: Ordering,
+    ) -> Result<&'a A, ArcPtrBorrow<A>> {
+        let ptr = self.ptr.load(ordering);
         if ptr == A::as_ptr(arc) {
             Ok(arc)
         } else {
-            Err(self.load_impl(ptr))
+            Err(self.load_impl_cold(ptr))
         }
     }
 
     #[inline]
+    pub fn load_if_outdated<'a>(&self, arc: &'a A) -> Result<&'a A, ArcPtrBorrow<A>> {
+        self.load_if_outdated_impl(arc, SeqCst)
+    }
+
+    #[inline]
+    pub fn load_if_outdated_relaxed<'a>(&self, arc: &'a A) -> Result<&'a A, ArcPtrBorrow<A>> {
+        self.load_if_outdated_impl(arc, Relaxed)
+    }
+
+    #[inline]
     pub fn load_cached_impl<'a>(&self, cached: &'a mut A, ordering: Ordering) -> &'a A {
-        // using `load_if_outdated` doesn't give the exact same code
         let ptr = self.ptr.load(ordering);
         if ptr != A::as_ptr(cached) {
-            *cached = self.load_impl(ptr).into_owned();
+            self.reload_cache(ptr, cached);
         }
         cached
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn reload_cache(&self, ptr: *mut (), cached: &mut A) {
+        *cached = self.load_impl(ptr).into_owned();
     }
 
     #[inline]
@@ -461,6 +485,16 @@ impl<A: ArcPtr + NonNullPtr, D: Domain> AtomicOptionArcPtr<A, D> {
     ) -> Result<&'a Option<A>, Option<ArcPtrBorrow<A>>> {
         self.0
             .load_if_outdated(arc)
+            .map_err(ArcPtrBorrow::transpose)
+    }
+
+    #[inline]
+    pub fn load_if_outdated_relaxed<'a>(
+        &self,
+        arc: &'a Option<A>,
+    ) -> Result<&'a Option<A>, Option<ArcPtrBorrow<A>>> {
+        self.0
+            .load_if_outdated_relaxed(arc)
             .map_err(ArcPtrBorrow::transpose)
     }
 
