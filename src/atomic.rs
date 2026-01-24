@@ -142,6 +142,24 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
         self.load().into_owned()
     }
 
+    /// # Safety
+    ///
+    /// `self` must not be reused after.
+    #[inline(always)]
+    unsafe fn take_owned(&mut self) -> A {
+        let ptr = *self.ptr.get_mut();
+        if A::NULLABLE && ptr.is_null() {
+            return unsafe { A::from_ptr(ptr) };
+        }
+        self.swap_impl(ptr, None)
+    }
+
+    #[inline]
+    pub fn into_owned(self) -> A {
+        // SAFETY: self is not reused after
+        unsafe { ManuallyDrop::new(self).take_owned() }
+    }
+
     #[cold]
     fn load_impl_cold(&self, ptr: *mut ()) -> ArcPtrBorrow<A> {
         self.load_impl(ptr)
@@ -310,10 +328,8 @@ impl<A: ArcPtr + NonNullPtr, D: Domain> AtomicArcPtr<Option<A>, D> {
 
 impl<A: ArcPtr, D: Domain> Drop for AtomicArcPtr<A, D> {
     fn drop(&mut self) {
-        let ptr = *self.ptr.get_mut();
-        if !A::NULLABLE || !ptr.is_null() {
-            self.swap_impl(ptr, None);
-        }
+        // SAFETY: self is not reused after
+        drop(unsafe { self.take_owned() });
     }
 }
 
@@ -495,6 +511,11 @@ impl<A: ArcPtr + NonNullPtr, D: Domain> AtomicOptionArcPtr<A, D> {
     #[inline]
     pub fn load_owned(&self) -> Option<A> {
         self.0.load_owned()
+    }
+
+    #[inline]
+    pub fn into_owned(self) -> Option<A> {
+        self.0.into_owned()
     }
 
     #[inline]
