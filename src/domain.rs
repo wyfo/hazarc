@@ -61,7 +61,7 @@ impl BorrowList {
         }
         let new_node = BorrowNodeRef::allocate(slot_count);
         while let Err(next) = node_ptr
-            .compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Relaxed)
+            .compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Acquire)
             .map_err(|err| unsafe { &(*err).next })
         {
             // No need to check free, because it's highly improbable
