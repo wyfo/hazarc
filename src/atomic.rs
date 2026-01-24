@@ -261,7 +261,10 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
         let new_clone = A::into_ptr(new.clone());
         match (self.ptr).compare_exchange(C::as_ptr(current), new_clone, SeqCst, Relaxed) {
             Ok(old_ptr) => Ok(self.swap_impl(old_ptr, Some(new))),
-            Err(old_ptr) => Err(self.load_impl(old_ptr)),
+            Err(old_ptr) => {
+                unsafe { A::decr_rc(new_clone) };
+                Err(self.load_impl(old_ptr))
+            }
         }
     }
 
