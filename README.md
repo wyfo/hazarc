@@ -48,7 +48,7 @@ fn spawn_task(shared_cfg: Arc<AtomicArc<Config>>) {
 }
 ```
 
-With custom domain, it can be used in `no_std` environment, for example with `pthread_domain`.
+With custom domain, it can be used in `no_std` environment
 
 ```rust
 #![no_std]
