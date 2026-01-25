@@ -126,6 +126,15 @@ impl BorrowNodeRef {
         NonNull::new(ptr.cast_mut()).map(Self)
     }
 
+    pub fn into_raw(self) -> NonNull<()> {
+        self.0.cast()
+    }
+
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn from_raw(ptr: NonNull<()>) -> Self {
+        Self(ptr.cast())
+    }
+
     fn allocate(borrows: usize) -> BorrowNodeRef {
         let borrows = borrows.next_power_of_two();
         let (layout, _) = Layout::new::<BorrowNode>()
@@ -180,13 +189,8 @@ impl fmt::Debug for BorrowNodeRef {
 #[macro_export]
 macro_rules! domain {
     ($vis:vis $name:ident($borrow_slots:expr)) => {
+        #[derive(Debug)]
         $vis struct $name;
-        impl ::core::fmt::Debug for $name {
-            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-                let list = <$name as $crate::domain::Domain>::static_list();
-                f.debug_tuple(::core::stringify!($name)).field(list).finish()
-            }
-        }
         unsafe impl $crate::domain::Domain for $name {
             #[inline(always)]
             fn static_list() -> &'static $crate::domain::BorrowList {
@@ -195,8 +199,7 @@ macro_rules! domain {
             }
             #[inline(always)]
             fn thread_local_node() -> $crate::domain::BorrowNodeRef {
-                extern crate std;
-                std::thread_local! {
+                ::std::thread_local! {
                     static LOCAL: std::cell::Cell<std::option::Option<$crate::domain::BorrowNodeRef>> = const { std::cell::Cell::new(None) };
                 }
                 #[cold]
@@ -206,14 +209,14 @@ macro_rules! domain {
                     impl Drop for NodeGuard {
                         fn drop(&mut self) {
                             if let Some(node) = LOCAL.take() {
-                                unsafe { <$name as  $crate::domain::Domain>::static_list().remove_node(node) };
+                                unsafe { <$name as $crate::domain::Domain>::static_list().remove_node(node) };
                             }
                         }
                     }
-                    std::thread_local! {
+                    ::std::thread_local! {
                         static GUARD: NodeGuard = const { NodeGuard };
                     }
-                    let node = <$name as  $crate::domain::Domain>::static_list().insert_node($borrow_slots);
+                    let node = <$name as $crate::domain::Domain>::static_list().insert_node($borrow_slots);
                     LOCAL.set(Some(node));
                     GUARD.with(|_| ());
                     node
@@ -224,14 +227,58 @@ macro_rules! domain {
     };
 }
 
+#[cfg(feature = "pthread-domain")]
+#[macro_export]
+macro_rules! pthread_domain {
+    ($vis:vis $name:ident($borrow_slots:expr)) => {
+        #[derive(Debug)]
+        $vis struct $name;
+        unsafe impl $crate::domain::Domain for $name {
+            #[inline(always)]
+            fn static_list() -> &'static $crate::domain::BorrowList {
+                static LIST: $crate::domain::BorrowList = $crate::domain::BorrowList::new();
+                &LIST
+            }
+            #[inline(always)]
+            fn thread_local_node() -> $crate::domain::BorrowNodeRef {
+                static mut KEY: ::core::mem::MaybeUninit<$crate::libc::pthread_key_t> = core::mem::MaybeUninit::uninit();
+                static mut KEY_ONCE: $crate::libc::pthread_once_t = $crate::libc::PTHREAD_ONCE_INIT;
+                unsafe extern "C" fn make_key() {
+                    unsafe extern "C" fn remove_node(ptr: *mut $crate::libc::c_void) {
+                        if let Some(ptr) = ::core::ptr::NonNull::new(ptr) {
+                            let node = unsafe { $crate::domain::BorrowNodeRef::from_raw(ptr.cast()) };
+                            unsafe { <$name as $crate::domain::Domain>::static_list().remove_node(node) };
+                        }
+                    }
+                    unsafe { $crate::libc::pthread_key_create((&raw mut KEY).cast(), Some(remove_node)) };
+                }
+                #[cold]
+                #[inline(never)]
+                fn new_node() -> $crate::domain::BorrowNodeRef {
+                    let node = <$name as $crate::domain::Domain>::static_list().insert_node($borrow_slots);
+                    unsafe { $crate::libc::pthread_setspecific(KEY.assume_init(), node.into_raw().as_ptr().cast()) };
+                    node
+                }
+                #[allow(clippy::missing_transmute_annotations)] // signature is different across platforms
+                unsafe { $crate::libc::pthread_once(&raw mut KEY_ONCE, ::core::mem::transmute(make_key as unsafe extern "C" fn())) };
+                match unsafe { ::core::ptr::NonNull::new($crate::libc::pthread_getspecific(KEY.assume_init())) } {
+                    Some(ptr) => unsafe { $crate::domain::BorrowNodeRef::from_raw(ptr.cast()) },
+                    None => new_node()
+                }
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
-    extern crate std;
-
     use crate::domain::Domain;
 
     #[test]
     fn node_reuse() {
+        #[cfg(feature = "pthread-domain")]
+        pthread_domain!(TestDomain(1));
+        #[cfg(not(feature = "pthread-domain"))]
         domain!(TestDomain(1));
         let thread = std::thread::spawn(|| {
             let node = TestDomain::thread_local_node();

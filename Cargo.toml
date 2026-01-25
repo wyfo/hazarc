@@ -6,9 +6,11 @@ edition = "2024"
 [features]
 default = ["default-domain"]
 default-domain = []
+pthread-domain = ["dep:libc"]
 
 [dependencies]
 crossbeam-utils = "0.8"
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 arc-swap = "1.8.0"

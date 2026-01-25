@@ -47,10 +47,34 @@ fn spawn_task(shared_cfg: Arc<AtomicArc<Config>>) {
     });
 }
 ```
+
+With custom domain, it can be used in `no_std` environment, for example with `pthread_domain`.
+
+```rust
+#![no_std]
+extern crate alloc;
+
+use alloc::sync::Arc;
+use hazarc::AtomicArc;
+
+hazarc::pthread_domain!(NoStdDomain(2));
+struct Config;
+
+fn update_config(shared_cfg: &AtomicArc<Config, NoStdDomain>, /* ... */) {
+    shared_cfg.store(/* ... */);
+}
+
+fn task(shared_cfg: &AtomicArc<Config, NoStdDomain>) {
+    loop {
+        let cfg = shared_cfg.load();
+        /* ... */
+    }
+}
+```
  
 ## Differences with `arc-swap`
 
-- Custom domains to reduce contention
+- Custom domains to reduce contention and add `no_std` support
 - Wait-free `AtomicArc::swap` thanks to an original load fallback algorithm
 - `AtomicArc::load` critical path inlined in less than 30 instructions
 - Less atomic RMW instructions

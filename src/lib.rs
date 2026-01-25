@@ -1,6 +1,8 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![no_std]
 extern crate alloc;
+#[cfg(any(feature = "default-domain", test))]
+extern crate std;
 
 use alloc::sync::Arc;
 
@@ -11,6 +13,9 @@ pub mod domain;
 
 #[cfg(feature = "default-domain")]
 domain!(pub DefaultDomain(8));
+#[cfg(feature = "pthread-domain")]
+#[doc(hidden)]
+pub use libc;
 
 #[cfg(feature = "default-domain")]
 pub type AtomicArc<T, D = DefaultDomain> = atomic::AtomicArcPtr<Arc<T>, D>;
