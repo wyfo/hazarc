@@ -246,19 +246,18 @@ macro_rules! domain {
 #[cfg(feature = "pthread-domain")]
 #[macro_export]
 macro_rules! pthread_domain {
-    ($vis:vis $name:ident($borrow_slot_count:expr)) => {
+    ($vis:vis $name:ident) => {
         #[derive(Debug)]
         $vis struct $name;
-        unsafe impl $crate::domain::Domain for $name {
+        impl $name {
+            #[doc(hidden)]
             #[inline(always)]
-            fn static_list() -> &'static $crate::domain::BorrowList {
-                static LIST: $crate::domain::BorrowList = $crate::domain::BorrowList::new();
-                &LIST
-            }
-            #[inline(always)]
-            fn thread_local_node() -> $crate::domain::BorrowNodeRef {
+            pub fn key() -> *mut $crate::libc::pthread_key_t {
                 static mut KEY: ::core::mem::MaybeUninit<$crate::libc::pthread_key_t> = core::mem::MaybeUninit::uninit();
-                static mut KEY_ONCE: $crate::libc::pthread_once_t = $crate::libc::PTHREAD_ONCE_INIT;
+                (&raw mut KEY).cast()
+            }
+            #[inline]
+            pub unsafe fn init_thread_local() {
                 unsafe extern "C" fn make_key() {
                     unsafe extern "C" fn remove_node(ptr: *mut $crate::libc::c_void) {
                         if let Some(ptr) = ::core::ptr::NonNull::new(ptr) {
@@ -266,21 +265,45 @@ macro_rules! pthread_domain {
                             unsafe { <$name as $crate::domain::Domain>::static_list().remove_node(node) };
                         }
                     }
-                    unsafe { $crate::libc::pthread_key_create((&raw mut KEY).cast(), Some(remove_node)) };
+                    unsafe { $crate::libc::pthread_key_create($name::key(), Some(remove_node)) };
                 }
-                #[cold]
-                #[inline(never)]
-                fn new_node() -> $crate::domain::BorrowNodeRef {
-                    let node = <$name as $crate::domain::Domain>::static_list().insert_node($borrow_slot_count);
-                    unsafe { $crate::libc::pthread_setspecific(KEY.assume_init(), node.into_raw().as_ptr().cast()) };
-                    node
-                }
+                static mut KEY_ONCE: $crate::libc::pthread_once_t = $crate::libc::PTHREAD_ONCE_INIT;
                 #[allow(clippy::missing_transmute_annotations)] // signature is different across platforms
                 unsafe { $crate::libc::pthread_once(&raw mut KEY_ONCE, ::core::mem::transmute(make_key as unsafe extern "C" fn())) };
-                match unsafe { ::core::ptr::NonNull::new($crate::libc::pthread_getspecific(KEY.assume_init())) } {
-                    Some(ptr) => unsafe { $crate::domain::BorrowNodeRef::from_raw(ptr.cast()) },
-                    None => new_node()
-                }
+            }
+        }
+    };
+    ($vis:vis $name:ident($borrow_slot_count:expr)) => {
+        $crate::pthread_domain!($vis $name);
+        unsafe impl $crate::domain::Domain for $name {
+            $crate::pthread_domain_methods!($name($borrow_slot_count), unsafe { Self::init_thread_local() });
+        }
+    }
+
+}
+
+#[cfg(feature = "pthread-domain")]
+#[macro_export]
+macro_rules! pthread_domain_methods {
+     ($name:ident($borrow_slot_count:expr)$(, $init:expr)?) => {
+        #[inline(always)]
+        fn static_list() -> &'static $crate::domain::BorrowList {
+            static LIST: $crate::domain::BorrowList = $crate::domain::BorrowList::new();
+            &LIST
+        }
+        #[inline(always)]
+        fn thread_local_node() -> $crate::domain::BorrowNodeRef {
+            #[cold]
+            #[inline(never)]
+            fn new_node() -> $crate::domain::BorrowNodeRef {
+                let node = <$name as $crate::domain::Domain>::static_list().insert_node($borrow_slot_count);
+                unsafe { $crate::libc::pthread_setspecific(*$name::key(), node.into_raw().as_ptr().cast()) };
+                node
+            }
+            $($init;)?
+            match unsafe { ::core::ptr::NonNull::new($crate::libc::pthread_getspecific(*Self::key())) } {
+                Some(ptr) => unsafe { $crate::domain::BorrowNodeRef::from_raw(ptr.cast()) },
+                None => new_node()
             }
         }
     };
