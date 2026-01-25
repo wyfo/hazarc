@@ -50,7 +50,7 @@ impl BorrowList {
         })
     }
 
-    pub fn insert_node(&self, slot_count: usize) -> BorrowNodeRef {
+    pub fn insert_node(&self, borrow_slot_count: usize) -> BorrowNodeRef {
         let mut node_ptr = &self.head;
         // Cannot use `Self::nodes` because the final node pointer is needed for chaining
         while let Some(node) = unsafe { BorrowNodeRef::new(node_ptr.load(Acquire)) } {
@@ -59,7 +59,7 @@ impl BorrowList {
             }
             node_ptr = node.next();
         }
-        let new_node = BorrowNodeRef::allocate(slot_count);
+        let new_node = BorrowNodeRef::allocate(borrow_slot_count);
         while let Err(next) = node_ptr
             .compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Acquire)
             .map_err(|err| unsafe { &(*err).next })
@@ -286,23 +286,23 @@ macro_rules! pthread_domain {
 #[macro_export]
 macro_rules! pthread_domain_methods {
      ($name:ident($borrow_slot_count:expr)$(, $init:expr)?) => {
-        #[inline(always)]
-        fn static_list() -> &'static $crate::domain::BorrowList {
-            static LIST: $crate::domain::BorrowList = $crate::domain::BorrowList::new();
-            &LIST
-        }
-        #[inline(always)]
-        fn thread_local_node() -> $crate::domain::BorrowNodeRef {
-            #[cold]
-            #[inline(never)]
-            fn new_node() -> $crate::domain::BorrowNodeRef {
-                let node = <$name as $crate::domain::Domain>::static_list().insert_node($borrow_slot_count);
-                unsafe { $crate::libc::pthread_setspecific(*$name::key(), node.into_raw().as_ptr().cast()) };
-                node
-            }
-            $($init;)?
-            match unsafe { ::core::ptr::NonNull::new($crate::libc::pthread_getspecific(*Self::key())) } {
-                Some(ptr) => unsafe { $crate::domain::BorrowNodeRef::from_raw(ptr.cast()) },
+         #[inline(always)]
+         fn static_list() -> &'static $crate::domain::BorrowList {
+             static LIST: $crate::domain::BorrowList = $crate::domain::BorrowList::new();
+             &LIST
+         }
+         #[inline(always)]
+         fn thread_local_node() -> $crate::domain::BorrowNodeRef {
+             #[cold]
+             #[inline(never)]
+             fn new_node() -> $crate::domain::BorrowNodeRef {
+                 let node = <$name as $crate::domain::Domain>::static_list().insert_node ($borrow_slot_count);
+                 unsafe { $crate::libc::pthread_setspecific(*$name::key(), node.into_raw().as_ptr() .cast()) };
+                 node
+             }
+             $($init;)?
+             match unsafe { ::core::ptr::NonNull::new($crate::libc::pthread_getspecific(*Self::key()) ) } {
+                 Some(ptr) => unsafe { $crate::domain::BorrowNodeRef::from_raw(ptr.cast()) },
                 None => new_node()
             }
         }
