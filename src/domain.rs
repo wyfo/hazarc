@@ -1,5 +1,5 @@
 use alloc::{
-    alloc::{alloc_zeroed, handle_alloc_error},
+    alloc::{alloc_zeroed, dealloc, handle_alloc_error},
     vec::Vec,
 };
 use core::{
@@ -76,6 +76,11 @@ impl BorrowList {
         // SAFETY: same contract
         unsafe { node.release() };
     }
+
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn dealloc(&self) {
+        self.nodes().for_each(|node| unsafe { node.deallocate() });
+    }
 }
 
 impl fmt::Debug for BorrowList {
@@ -135,31 +140,42 @@ impl BorrowNodeRef {
         Self(ptr.cast())
     }
 
-    fn allocate(borrows: usize) -> BorrowNodeRef {
-        let borrows = borrows.next_power_of_two();
+    fn layout(borrow_slot_count: usize) -> Layout {
+        assert!(borrow_slot_count.is_power_of_two());
         let (layout, _) = Layout::new::<BorrowNode>()
-            .extend(Layout::array::<AtomicPtr<()>>(borrows).unwrap())
+            .extend(Layout::array::<AtomicPtr<()>>(borrow_slot_count).unwrap())
             .unwrap();
+        layout
+    }
+
+    fn allocate(borrow_slot_count: usize) -> BorrowNodeRef {
+        let borrow_slot_count = borrow_slot_count.next_power_of_two();
+        let layout = Self::layout(borrow_slot_count);
         // SAFETY: layout has non-zero size
         let ptr = unsafe { alloc_zeroed(layout) }.cast::<BorrowNode>();
         let mut node =
             BorrowNodeRef(NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout)));
-        unsafe { node.0.as_mut() }.borrow_slot_idx_mask = borrows - 1;
+        unsafe { node.0.as_mut() }.borrow_slot_idx_mask = borrow_slot_count - 1;
         *unsafe { node.0.as_mut() }.in_use.get_mut() = true;
         node
     }
 
-    fn try_acquire(&self) -> bool {
+    unsafe fn deallocate(self) {
+        let layout = Self::layout(self.borrow_slots().len());
+        unsafe { dealloc(self.0.as_ptr().cast(), layout) }
+    }
+
+    fn try_acquire(self) -> bool {
         // Acquire load for `next_slot` synchronization
         !self.in_use().load(Relaxed) && !self.in_use().swap(true, Acquire)
     }
 
-    unsafe fn release(&self) {
+    unsafe fn release(self) {
         // Release store for `next_slot` synchronization
         self.in_use().store(false, Release);
     }
 
-    fn as_ptr(&self) -> *mut BorrowNode {
+    fn as_ptr(self) -> *mut BorrowNode {
         self.0.as_ptr()
     }
 
@@ -188,7 +204,7 @@ impl fmt::Debug for BorrowNodeRef {
 
 #[macro_export]
 macro_rules! domain {
-    ($vis:vis $name:ident($borrow_slots:expr)) => {
+    ($vis:vis $name:ident($borrow_slot_count:expr)) => {
         #[derive(Debug)]
         $vis struct $name;
         unsafe impl $crate::domain::Domain for $name {
@@ -216,7 +232,7 @@ macro_rules! domain {
                     ::std::thread_local! {
                         static GUARD: NodeGuard = const { NodeGuard };
                     }
-                    let node = <$name as $crate::domain::Domain>::static_list().insert_node($borrow_slots);
+                    let node = <$name as $crate::domain::Domain>::static_list().insert_node($borrow_slot_count);
                     LOCAL.set(Some(node));
                     GUARD.with(|_| ());
                     node
@@ -230,7 +246,7 @@ macro_rules! domain {
 #[cfg(feature = "pthread-domain")]
 #[macro_export]
 macro_rules! pthread_domain {
-    ($vis:vis $name:ident($borrow_slots:expr)) => {
+    ($vis:vis $name:ident($borrow_slot_count:expr)) => {
         #[derive(Debug)]
         $vis struct $name;
         unsafe impl $crate::domain::Domain for $name {
@@ -255,7 +271,7 @@ macro_rules! pthread_domain {
                 #[cold]
                 #[inline(never)]
                 fn new_node() -> $crate::domain::BorrowNodeRef {
-                    let node = <$name as $crate::domain::Domain>::static_list().insert_node($borrow_slots);
+                    let node = <$name as $crate::domain::Domain>::static_list().insert_node($borrow_slot_count);
                     unsafe { $crate::libc::pthread_setspecific(KEY.assume_init(), node.into_raw().as_ptr().cast()) };
                     node
                 }
