@@ -80,6 +80,9 @@ impl BorrowList {
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn dealloc(&self) {
         self.nodes().for_each(|node| unsafe { node.deallocate() });
+        // no need to reset head before deallocating nodes,
+        // as this function is fully unsynchronized anyway
+        self.head.store(NULL.cast(), SeqCst);
     }
 }
 
