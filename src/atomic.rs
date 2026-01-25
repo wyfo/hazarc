@@ -164,7 +164,7 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
 
     #[inline]
     pub fn load_if_outdated<'a>(&self, arc: &'a A) -> Result<&'a A, ArcPtrBorrow<A>> {
-        let ptr = self.ptr.load(SeqCst);
+        let ptr = self.ptr.load(Relaxed);
         if ptr == A::as_ptr(arc) {
             Ok(arc)
         } else {
@@ -180,7 +180,7 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
 
     #[inline]
     pub fn load_cached<'a>(&self, cached: &'a mut A) -> &'a A {
-        let ptr = self.ptr.load(SeqCst);
+        let ptr = self.ptr.load(Relaxed);
         if ptr != A::as_ptr(cached) {
             self.reload_cache(ptr, cached);
         }
