@@ -87,3 +87,15 @@ fn task(shared_cfg: &AtomicArc<Config, NoStdDomain>) {
 This library uses unsafe code to deal with `AtomicPtr` manipulation and DST allocations. It is extensively tested with [`miri`](https://github.com/rust-lang/miri) to ensure its soundness, including over multiple weak memory model permutations.
 
 [^1]: The idea is the same: try to acquire a hazard-pointer-like slot, falling back to acquiring a full ownership of the loaded arc in a wait-free manner. The underlying algorithm is different, both for the hazard pointer part and especially for the fallback part — it allows `AtomicArc` to be fully wait-free.
+
+## Wait-freedom
+
+### Load
+
+`AtomicArc::load` relies on a domain's thread-local node which is lazily allocated and inserted in the domain's global list on first access. As a consequence, the first `AtomicArc::load` for a given domain may not be wait-free.
+
+It is however possible to access the thread-local node before using `AtomicArc`, making all subsequent accesses wait-free. Another solution is to pre-allocate the number of nodes required by the program. In that case, insertion in the domain's global list is bounded by the number of allocated nodes, and thread-local accesses are wait-free.
+
+### Store
+
+`AtomicArc::store`, which wraps `AtomicArc::swap`, needs to scan the whole domain's global list, executing a bounded number of atomic operations on each node. If the number of nodes is bounded too — which should be the case most of the time — then the whole operation is wait-free.
