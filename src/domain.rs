@@ -281,8 +281,7 @@ macro_rules! pthread_domain {
         unsafe impl $crate::domain::Domain for $name {
             $crate::pthread_domain_methods!($name($borrow_slot_count), unsafe { Self::init_thread_local() });
         }
-    }
-
+    };
 }
 
 #[cfg(feature = "pthread-domain")]
