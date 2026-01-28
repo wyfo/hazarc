@@ -31,6 +31,10 @@ jobs:
   miri:
     needs: test
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        seeds: [0..256, 256..512, 512..768, 768..1024, 1024..1280, 1280..1536, 1536..1792, 1792..2048]
     steps:
       - uses: actions/checkout@v6
       - name: install miri
@@ -38,7 +42,7 @@ jobs:
       - name: miri
         run: cargo +nightly miri test
         env:
-          MIRIFLAGS: -Zmiri-many-seeds=..1024
+          MIRIFLAGS: -Zmiri-many-seeds=${{ matrix.seeds }}
   benchmark:
     needs: test
     strategy:
