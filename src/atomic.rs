@@ -198,24 +198,6 @@ impl<A: ArcPtr, D: Domain, P: LoadPolicy> AtomicArcPtr<A, D, P> {
         self.load().into_owned()
     }
 
-    /// # Safety
-    ///
-    /// `self` must not be reused after.
-    #[inline(always)]
-    unsafe fn take_owned(&mut self) -> A {
-        let ptr = self.ptr.get_mut().into();
-        if A::NULLABLE && ptr.is_null() {
-            return unsafe { A::from_ptr(NULL) };
-        }
-        self.swap_impl(ptr, None)
-    }
-
-    #[inline]
-    pub fn into_owned(self) -> A {
-        // SAFETY: self is not reused after
-        unsafe { ManuallyDrop::new(self).take_owned() }
-    }
-
     #[cold]
     fn load_impl_cold(&self, ptr: P::Ptr) -> ArcPtrBorrow<A> {
         self.load_impl(ptr)
@@ -331,6 +313,24 @@ impl<A: ArcPtr, D: Domain, P: LoadPolicy> AtomicArcPtr<A, D, P> {
             }
         }
         Err(current)
+    }
+
+    /// # Safety
+    ///
+    /// `self` must not be reused after.
+    #[inline(always)]
+    unsafe fn take_owned(&mut self) -> A {
+        let ptr = self.ptr.get_mut().into();
+        if A::NULLABLE && ptr.is_null() {
+            return unsafe { A::from_ptr(NULL) };
+        }
+        self.swap_impl(ptr, None)
+    }
+
+    #[inline]
+    pub fn into_owned(self) -> A {
+        // SAFETY: self is not reused after
+        unsafe { ManuallyDrop::new(self).take_owned() }
     }
 }
 
