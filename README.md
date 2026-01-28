@@ -4,7 +4,7 @@ A wait-free `AtomicArc` optimized for read-intensive use cases.
 
 ## Acknowledgement
 
-This library is based on the brilliant idea behind [`arc-swap`](https://github.com/vorner/arc-swap) from [Michal Vaner](https://github.com/vorner): mixing hazard pointer-based protection with atomic reference counting.
+This library is based on the brilliant idea behind [`arc-swap`](https://crates.io/crates/arc-swap) from [Michal Vaner](https://github.com/vorner): mixing hazard pointer-based protection with atomic reference counting.
 
 ## Examples
 
