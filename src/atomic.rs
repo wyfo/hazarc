@@ -369,12 +369,6 @@ impl<A: ArcPtr + fmt::Debug, D: Domain, P: LoadPolicy> fmt::Debug for AtomicArcP
     }
 }
 
-impl<A: ArcPtr + fmt::Display, D: Domain, P: LoadPolicy> fmt::Display for AtomicArcPtr<A, D, P> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        (*self.load()).fmt(f)
-    }
-}
-
 impl<A: ArcPtr, D: Domain, P: LoadPolicy> From<A> for AtomicArcPtr<A, D, P> {
     fn from(value: A) -> Self {
         Self::new(value)
