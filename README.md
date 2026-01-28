@@ -100,7 +100,6 @@ The rest of `AtomicArc::load` algorithm is determined by a generic `LoadPolicy` 
 
 `AtomicArc::store`, which wraps `AtomicArc::swap`, needs to scan the whole domain's global list, executing a bounded number of atomic operations on each node. If the number of nodes is bounded as well — which should be the case most of the time — then the whole operation is wait-free.
 
-
 ## Safety
 
 This library uses unsafe code to deal with `AtomicPtr` manipulation and DST allocations. It is extensively tested with [`miri`](https://github.com/rust-lang/miri) to ensure its soundness, including over multiple weak memory model permutations.
