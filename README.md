@@ -87,7 +87,7 @@ It is however possible to access the thread-local node explicitly before using `
 The rest of `AtomicArc::load` algorithm is determined by a generic `LoadPolicy` with the following variants:
 - `WaitFree`, loads are wait-free, but may cause non-monotonic reads as soon as there are **multiple concurrent stores**. When stores are serialized — with a lock, a MPSC task, etc. —, loads are guaranteed to be monotonic. *Multiple loads concurrent with a single store is not an issue.*  
 - `LockFree`, loads are lock-free and supports multiple concurrent stores.
-- `Adaptive` (the default), loads are wait-free until multiple concurrent stores happen. At that point, loads are downgraded to lock-free for the given `AtomicArc` until it is dropped. The impact on performance is mostly negligible compared to `WaitFree`.
+- `Adaptive` (the default), loads are wait-free until multiple concurrent stores happen. At that point, loads are downgraded to lock-free for the given `AtomicArc` until it is dropped. The impact on performance is [mostly negligible](benches/README.md) compared to `WaitFree`.
 
 ### Store
 
@@ -104,7 +104,7 @@ This library uses unsafe code to deal with `AtomicPtr` manipulation and DST allo
 - Enforce monotonic reads — a thread cannot observe an older value after having observed a newer one
 - Wait-free `AtomicArc::swap` — `ArcSwap::swap` is only lock-free
 - Less atomic RMW instructions
-- Better performance, especially on ARM architecture
-- `AtomicArc::load` critical path inlined in less than 30 assembly instructions
+- `AtomicArc::load` critical path fully inlined
+- [Better performance](benches/README.md), especially on ARM architecture
 - Null pointer/`None` load optimized
 - Ergonomic API for `Option`, `AtomicOptionArc<T>::load` returns `Option<ArcBorrow<T>>`
