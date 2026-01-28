@@ -55,9 +55,16 @@ With custom domains, it can be used in a `no_std` environment.
 extern crate alloc;
 
 use alloc::sync::Arc;
-use hazarc::AtomicArc;
+use hazarc::{AtomicArc, domain::Domain};
 
 hazarc::pthread_domain!(NoStdDomain(2)); // 2 hazard pointer slots
+fn register_domain_cleanup() {
+    extern "C" fn deallocate_domain() {
+        unsafe { NoStdDomain::static_list().deallocate() };
+    }
+    unsafe { libc::atexit(deallocate_domain) };
+}
+
 struct Config { /* ... */ }
 
 fn update_config(shared_cfg: &AtomicArc<Config, NoStdDomain>, /* ... */) {
