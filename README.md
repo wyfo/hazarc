@@ -71,21 +71,6 @@ fn task(shared_cfg: &AtomicArc<Config, NoStdDomain>) {
     }
 }
 ```
- 
-## Differences with `arc-swap`
-
-- Custom domains to reduce contention and add `no_std` support
-- Enforce monotonic reads — a thread cannot observe an older value after having observed a newer one
-- Wait-free `AtomicArc::swap` — `ArcSwap::swap` is only lock-free
-- Less atomic RMW instructions
-- Better performance, especially on ARM architecture
-- `AtomicArc::load` critical path inlined in less than 30 assembly instructions
-- Null pointer/`None` load optimized
-- Ergonomic API for `Option`, `AtomicOptionArc<T>::load` returns `Option<ArcBorrow<T>>`
-
-## Safety
-
-This library uses unsafe code to deal with `AtomicPtr` manipulation and DST allocations. It is extensively tested with [`miri`](https://github.com/rust-lang/miri) to ensure its soundness, including over multiple weak memory model permutations.
 
 ## Wait-freedom
 
@@ -107,3 +92,19 @@ The rest of `AtomicArc::load` algorithm is determined by a generic `LoadPolicy` 
 ### Store
 
 `AtomicArc::store`, which wraps `AtomicArc::swap`, needs to scan the whole domain's global list, executing a bounded number of atomic operations on each node. If the number of nodes is bounded as well — which should be the case most of the time — then the whole operation is wait-free.
+
+
+## Safety
+
+This library uses unsafe code to deal with `AtomicPtr` manipulation and DST allocations. It is extensively tested with [`miri`](https://github.com/rust-lang/miri) to ensure its soundness, including over multiple weak memory model permutations.
+ 
+## Differences with `arc-swap`
+
+- Custom domains to reduce contention and add `no_std` support
+- Enforce monotonic reads — a thread cannot observe an older value after having observed a newer one
+- Wait-free `AtomicArc::swap` — `ArcSwap::swap` is only lock-free
+- Less atomic RMW instructions
+- Better performance, especially on ARM architecture
+- `AtomicArc::load` critical path inlined in less than 30 assembly instructions
+- Null pointer/`None` load optimized
+- Ergonomic API for `Option`, `AtomicOptionArc<T>::load` returns `Option<ArcBorrow<T>>`
