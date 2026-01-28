@@ -152,11 +152,11 @@ impl<A: ArcPtr, D: Domain, P: LoadPolicy> AtomicArcPtr<A, D, P> {
         // Failure ordering must be SeqCst for load to have a full SeqCst semantic
         if let Err(ptr) = clone_slot.compare_exchange(prepare_ptr, confirm_ptr, SeqCst, SeqCst) {
             if P::check_concurrent_writers()
-                && let ptr = self.ptr.load(SeqCst)
-                && ptr.has_concurrent_writers()
+                && let ptr_checked = self.ptr.load(SeqCst)
+                && ptr_checked.has_concurrent_writers()
             {
-                unsafe { A::decr_rc(ptr.into()) };
-                return self.load_clone_loop(node, ptr_checked);
+                unsafe { A::decr_rc(ptr) };
+                return self.load_clone_loop(node, ptr_checked.into());
             }
             clone_slot.store(NULL, SeqCst);
             return ArcPtrBorrow::new(ptr, None);

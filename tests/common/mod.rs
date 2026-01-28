@@ -33,7 +33,7 @@ fn concurrent_writes() {
     domain!(TestDomain(1));
     let check_borrow = |b: &ArcBorrow<_>| assert!([0, 1, 2].contains(b));
     let barrier = SpinBarrier::new(3);
-    let atomic_arc = AtomicArc::<_, TestDomain, LoadPolicy>::from(0);
+    let atomic_arc = AtomicArc::<usize, TestDomain, LoadPolicy>::from(0);
     thread::scope(|s| {
         s.spawn(barrier.wrap(|| {
             let swapped = atomic_arc.swap(1.into());
