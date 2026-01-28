@@ -167,8 +167,8 @@ impl<A: ArcPtr, D: Domain, P: LoadPolicy> AtomicArcPtr<A, D, P> {
     fn load_clone_confirmed(&self, node: BorrowNodeRef, ptr: *mut ()) -> ArcPtrBorrow<A> {
         unsafe { A::incr_rc(ptr) };
         let confirm_ptr = ptr.map_addr(|addr| addr | CONFIRM_CLONE_FLAG);
-        if let Err(ptr) = (node.clone_slot()).compare_exchange(confirm_ptr, NULL, SeqCst, Acquire) {
-            debug_assert!(ptr.is_null());
+        if let Err(p) = (node.clone_slot()).compare_exchange(confirm_ptr, NULL, SeqCst, Acquire) {
+            debug_assert!(p.is_null());
             unsafe { A::decr_rc(ptr) };
         }
         ArcPtrBorrow::new(ptr, None)
