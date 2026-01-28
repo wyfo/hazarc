@@ -10,7 +10,7 @@ use core::{
     slice,
     sync::atomic::{
         AtomicBool, AtomicPtr,
-        Ordering::{Acquire, Relaxed, Release, SeqCst},
+        Ordering::{Acquire, Relaxed, SeqCst},
     },
 };
 
@@ -85,10 +85,13 @@ impl BorrowList {
 
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn dealloc(&self) {
-        self.nodes().for_each(|node| unsafe { node.deallocate() });
-        // no need to reset head before deallocating nodes,
-        // as this function is fully unsynchronized anyway
-        self.head.store(NULL.cast(), SeqCst);
+        let mut head = unsafe { BorrowNodeRef::new(self.head.swap(NULL.cast(), SeqCst)) };
+        while let Some(node) = head {
+            #[allow(unused_unsafe)]
+            let next = unsafe { BorrowNodeRef::new(node_field!(node.next).load(Acquire)) };
+            unsafe { node.deallocate() };
+            head = next;
+        }
     }
 }
 
@@ -161,6 +164,11 @@ impl BorrowNodeRef {
     }
 
     unsafe fn deallocate(self) {
+        // load `self.in_use` to avoid data race
+        let in_use = node_field!(self.in_use).load(SeqCst);
+        debug_assert!(!in_use);
+        debug_assert!((self.borrow_slots().iter()).all(|s| s.load(Relaxed).is_null()));
+        debug_assert!(self.clone_slot().load(Relaxed).is_null());
         let layout = Self::layout(self.borrow_slots().len());
         unsafe { dealloc(self.as_ptr().cast(), layout) }
     }
@@ -171,8 +179,8 @@ impl BorrowNodeRef {
     }
 
     unsafe fn release(self) {
-        // Release store for `next_slot` synchronization
-        node_field!(self.in_use).store(false, Release);
+        // Release store for `next_slot` synchronization + SeqCst for `deallocate` synchronization
+        node_field!(self.in_use).store(false, SeqCst);
     }
 
     fn as_ptr(self) -> *mut BorrowNode {
@@ -351,5 +359,20 @@ mod tests {
             let ptr = |n| unsafe { core::mem::transmute::<BorrowNodeRef, *mut ()>(n) };
             assert!(ptr(node1) == ptr(node2) || ptr(node1) == ptr(node3));
         });
+    }
+
+    #[test]
+    fn deallocation() {
+        #[cfg(feature = "pthread-domain")]
+        pthread_domain!(TestDomain(2));
+        #[cfg(not(feature = "pthread-domain"))]
+        domain!(TestDomain(2));
+        std::thread::scope(|s| {
+            s.spawn(TestDomain::thread_local_node);
+            s.spawn(TestDomain::thread_local_node);
+        });
+        assert_eq!(TestDomain::static_list().nodes().count(), 2);
+        unsafe { TestDomain::static_list().dealloc() };
+        assert_eq!(TestDomain::static_list().nodes().count(), 0);
     }
 }
