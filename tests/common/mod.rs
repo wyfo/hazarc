@@ -29,9 +29,24 @@ impl SpinBarrier {
 }
 
 #[test]
+fn concurrent_reads() {
+    domain!(TestDomain(1));
+    let barrier = SpinBarrier::new(3);
+    let check_borrow = |b: &_| assert!([0, 1, 2].contains(b));
+    let atomic_arc = AtomicArc::<usize, TestDomain, LoadPolicy>::from(0);
+    thread::scope(|s| {
+        s.spawn(barrier.wrap(|| check_borrow(&atomic_arc.load())));
+        s.spawn(barrier.wrap(|| check_borrow(&atomic_arc.load())));
+        barrier.wait();
+        atomic_arc.store(1.into());
+        atomic_arc.store(2.into());
+    });
+}
+
+#[test]
 fn concurrent_writes() {
     domain!(TestDomain(1));
-    let check_borrow = |b: &ArcBorrow<_>| assert!([0, 1, 2].contains(b));
+    let check_borrow = |b: &_| assert!([0, 1, 2].contains(b));
     let barrier = SpinBarrier::new(3);
     let atomic_arc = AtomicArc::<usize, TestDomain, LoadPolicy>::from(0);
     thread::scope(|s| {
