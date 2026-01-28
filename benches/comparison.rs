@@ -268,7 +268,7 @@ fn hazarc_load_contended<P: LoadPolicy>(b: Bencher) {
 #[divan::bench(types = [WaitFree, Adaptive, LockFree], args = [0, 1, 2, 4, 8, 16])]
 fn hazarc_store<P: LoadPolicy>(b: Bencher, threads: usize) {
     DefaultDomain::reset_thread_local_node();
-    unsafe { DefaultDomain::static_list().dealloc() };
+    unsafe { DefaultDomain::static_list().deallocate() };
     DefaultDomain::thread_local_node();
     AtomicArc::<_, DefaultDomain, P>::bench_store(b, threads);
 }

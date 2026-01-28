@@ -85,7 +85,7 @@ impl BorrowList {
     }
 
     #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn dealloc(&self) {
+    pub unsafe fn deallocate(&self) {
         let mut head = unsafe { BorrowNodeRef::new(self.head.swap(NULL.cast(), SeqCst)) };
         while let Some(node) = head {
             #[allow(unused_unsafe)]
@@ -402,7 +402,7 @@ mod tests {
             });
         });
         assert_eq!(TestDomain::static_list().nodes().count(), 2);
-        unsafe { TestDomain::static_list().dealloc() };
+        unsafe { TestDomain::static_list().deallocate() };
         assert_eq!(TestDomain::static_list().nodes().count(), 0);
     }
 }
