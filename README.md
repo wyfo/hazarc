@@ -75,6 +75,7 @@ fn task(shared_cfg: &AtomicArc<Config, NoStdDomain>) {
 ## Differences with `arc-swap`
 
 - Custom domains to reduce contention and add `no_std` support
+- Enforce monotonic reads — a thread cannot observe an older value after having observed a newer one
 - Wait-free `AtomicArc::swap` — `ArcSwap::swap` is only lock-free
 - Less atomic RMW instructions
 - Better performance, especially on ARM architecture
@@ -92,10 +93,19 @@ This library uses unsafe code to deal with `AtomicPtr` manipulation and DST allo
 
 ### Load
 
+#### Thread-local storage
+
 `AtomicArc::load` relies on a domain's thread-local node which is lazily allocated and inserted in the domain's global list on first access. As a consequence, the first `AtomicArc::load` for a given domain may not be wait-free.
 
-It is however possible to access the thread-local node before using `AtomicArc`, making all subsequent accesses wait-free. Another solution is to pre-allocate the number of nodes required by the program. In that case, insertion in the domain's global list is bounded by the number of allocated nodes, and thread-local accesses are wait-free.
+It is however possible to access the thread-local node explicitly before using `AtomicArc`, making all subsequent accesses wait-free. Another solution is to pre-allocate the number of nodes required by the program. In that case, insertion into the domain's global list is bounded by the number of allocated nodes, and thread-local accesses are wait-free.
+
+#### Load policy
+
+The rest of `AtomicArc::load` algorithm is determined by a generic `LoadPolicy` with the following variants:
+- `WaitFree`, loads are wait-free, but may cause non-monotonic reads as soon as there are **multiple concurrent stores**. When stores are serialized — with a lock, a MPSC task, etc. —, loads are guaranteed to be monotonic. *Multiple loads concurrent with a single store is not an issue.*  
+- `LockFree`, loads are lock-free and supports multiple concurrent stores.
+- `Adaptive` (the default), loads are wait-free until multiple concurrent stores happen. At that point, loads are downgraded to lock-free for the given `AtomicArc` until it is dropped. The impact on performance is mostly negligible compared to `WaitFree`.
 
 ### Store
 
-`AtomicArc::store`, which wraps `AtomicArc::swap`, needs to scan the whole domain's global list, executing a bounded number of atomic operations on each node. If the number of nodes is bounded too — which should be the case most of the time — then the whole operation is wait-free.
+`AtomicArc::store`, which wraps `AtomicArc::swap`, needs to scan the whole domain's global list, executing a bounded number of atomic operations on each node. If the number of nodes is bounded as well — which should be the case most of the time — then the whole operation is wait-free.

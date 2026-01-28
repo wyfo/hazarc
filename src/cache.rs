@@ -4,6 +4,7 @@ use crate::{
     arc::{ArcPtr, NonNullPtr},
     atomic::{AtomicArcPtr, AtomicOptionArcPtr},
     domain::Domain,
+    load_policy::LoadPolicy,
 };
 
 pub trait AtomicArcRef {
@@ -16,7 +17,7 @@ pub trait AtomicArcRef {
     fn load_cached<'a>(&self, cached: &'a mut Self::Cached) -> Self::Load<'a>;
 }
 
-impl<A: ArcPtr, L: Domain> AtomicArcRef for AtomicArcPtr<A, L> {
+impl<A: ArcPtr, D: Domain, P: LoadPolicy> AtomicArcRef for AtomicArcPtr<A, D, P> {
     type Arc = A;
     type Cached = A;
     type Load<'a>
@@ -33,7 +34,9 @@ impl<A: ArcPtr, L: Domain> AtomicArcRef for AtomicArcPtr<A, L> {
     }
 }
 
-impl<A: ArcPtr + NonNullPtr, L: Domain> AtomicArcRef for AtomicOptionArcPtr<A, L> {
+impl<A: ArcPtr + NonNullPtr, D: Domain, P: LoadPolicy> AtomicArcRef
+    for AtomicOptionArcPtr<A, D, P>
+{
     type Arc = A;
     type Cached = Option<A>;
     type Load<'a>

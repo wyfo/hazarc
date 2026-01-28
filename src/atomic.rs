@@ -6,34 +6,32 @@ use core::{
     mem::ManuallyDrop,
     ops::Deref,
     ptr,
-    sync::atomic::{
-        AtomicPtr,
-        Ordering::{Acquire, Relaxed, SeqCst},
-    },
+    sync::atomic::Ordering::{Acquire, Relaxed, SeqCst},
 };
 
 use crate::{
     NULL,
     arc::{ArcPtr, ArcRef, NonNullPtr},
     domain::{BorrowNodeRef, BorrowSlot, Domain},
+    load_policy::{Adaptive, AdaptiveAtomicPtr, AdaptivePtr, LoadPolicy},
 };
 
 const PREPARE_CLONE_FLAG: usize = 0b01;
 const CONFIRM_CLONE_FLAG: usize = 0b10;
 
-pub struct AtomicArcPtr<A: ArcPtr, D: Domain> {
-    ptr: AtomicPtr<()>,
+pub struct AtomicArcPtr<A: ArcPtr, D: Domain, P: LoadPolicy = Adaptive> {
+    ptr: P::AtomicPtr,
     _arc: PhantomData<A>,
-    _list: PhantomData<D>,
+    _domain: PhantomData<D>,
 }
 
-impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
+impl<A: ArcPtr, D: Domain, P: LoadPolicy> AtomicArcPtr<A, D, P> {
     #[inline]
     pub fn new(arc: A) -> Self {
         Self {
-            ptr: AtomicPtr::new(A::into_ptr(arc)),
+            ptr: P::AtomicPtr::new(A::into_ptr(arc)),
             _arc: PhantomData,
-            _list: PhantomData,
+            _domain: PhantomData,
         }
     }
 
@@ -43,13 +41,13 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
     }
 
     #[inline(always)]
-    fn load_impl(&self, ptr: *mut ()) -> ArcPtrBorrow<A> {
+    fn load_impl(&self, ptr: P::Ptr) -> ArcPtrBorrow<A> {
         if A::NULLABLE && ptr.is_null() {
-            return ArcPtrBorrow::new(ptr, None);
+            return ArcPtrBorrow::new(NULL, None);
         }
         debug_assert!(!ptr.is_null());
         let node = D::thread_local_node();
-        let slot_idx = node.next_borrow_slot_idx().get();
+        let slot_idx = node.next_borrow_slot_idx();
         let slot = unsafe { node.borrow_slots().get_unchecked(slot_idx) };
         if slot.load(Relaxed).is_null() {
             self.load_with_slot(ptr, node, slot, slot_idx)
@@ -61,28 +59,28 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
     #[inline(always)]
     fn load_with_slot(
         &self,
-        ptr: *mut (),
+        ptr: P::Ptr,
         node: BorrowNodeRef,
         slot: &'static BorrowSlot,
         slot_idx: usize,
     ) -> ArcPtrBorrow<A> {
-        slot.store(ptr, SeqCst);
+        slot.store(ptr.into(), SeqCst);
         let ptr_checked = self.ptr.load(SeqCst);
         if ptr != ptr_checked {
             return self.load_outdated(node, ptr, ptr_checked, slot);
         }
-        node.next_borrow_slot_idx()
-            .set((slot_idx + 1) & node.borrow_slot_idx_mask());
-        ArcPtrBorrow::new(ptr_checked, Some(slot))
+        node.set_next_borrow_slot_idx(slot_idx + 1);
+        ArcPtrBorrow::new(ptr_checked.into(), Some(slot))
     }
 
     #[cold]
     #[inline(never)]
-    fn load_find_available_slot(&self, ptr: *mut (), node: BorrowNodeRef) -> ArcPtrBorrow<A> {
+    fn load_find_available_slot(&self, ptr: P::Ptr, node: BorrowNodeRef) -> ArcPtrBorrow<A> {
         match (node.borrow_slots().iter().enumerate())
-            .find(|(_, borrow)| borrow.load(Relaxed).is_null())
+            .find(|(_, slot)| slot.load(Relaxed).is_null())
         {
             Some((slot_idx, slot)) => self.load_with_slot(ptr, node, slot, slot_idx),
+            None if ptr.has_concurrent_writers() => self.load_clone_loop(node, ptr.into()),
             None => self.load_clone(node),
         }
     }
@@ -92,19 +90,46 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
     fn load_outdated(
         &self,
         node: BorrowNodeRef,
-        ptr: *mut (),
-        ptr_checked: *mut (),
-        borrow: &'static BorrowSlot,
+        ptr: P::Ptr,
+        ptr_checked: P::Ptr,
+        slot: &'static BorrowSlot,
     ) -> ArcPtrBorrow<A> {
         if A::NULLABLE && ptr_checked.is_null() {
-            if (borrow.compare_exchange(ptr, NULL, SeqCst, Relaxed)).is_err() {
-                unsafe { A::decr_rc(ptr) };
+            if let Err(p) = slot.compare_exchange(ptr.into(), NULL, SeqCst, Relaxed) {
+                debug_assert!(p.is_null());
+                unsafe { A::decr_rc(ptr.into()) };
             }
-            return ArcPtrBorrow::new(ptr_checked, None);
+            ArcPtrBorrow::new(NULL, None)
+        } else if ptr_checked.has_concurrent_writers() {
+            self.load_with_slot_loop(node, ptr.into(), ptr_checked.into(), slot)
+        } else if let Err(p) = slot.compare_exchange(ptr.into(), NULL, SeqCst, Relaxed) {
+            debug_assert!(p.is_null());
+            ArcPtrBorrow::new(ptr.into(), None)
+        } else {
+            self.load_clone(node)
         }
-        match borrow.compare_exchange(ptr, NULL, SeqCst, Relaxed) {
-            Ok(_) => self.load_clone(node),
-            Err(_) => ArcPtrBorrow::new(ptr, None),
+    }
+
+    fn load_with_slot_loop(
+        &self,
+        node: BorrowNodeRef,
+        mut ptr: *mut (),
+        mut ptr_checked: *mut (),
+        slot: &'static BorrowSlot,
+    ) -> ArcPtrBorrow<A> {
+        loop {
+            if let Err(p) = slot.compare_exchange(ptr, ptr_checked, SeqCst, Relaxed) {
+                debug_assert!(p.is_null());
+                return ArcPtrBorrow::new(ptr, None);
+            }
+            ptr = ptr_checked;
+            ptr_checked = self.ptr.load(SeqCst).into();
+            if ptr_checked == ptr {
+                node.set_next_borrow_slot_idx(unsafe {
+                    ptr::from_ref(slot).offset_from_unsigned(node.borrow_slots().as_ptr()) + 1
+                });
+                return ArcPtrBorrow::new(ptr_checked, Some(slot));
+            }
         }
     }
 
@@ -115,23 +140,57 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
             .cast_mut()
             .cast();
         clone_slot.store(prepare_ptr, SeqCst);
-        let ptr_checked = self.ptr.load(SeqCst);
+        let ptr_checked = self.ptr.load(SeqCst).into();
         if A::NULLABLE && ptr_checked.is_null() {
             let ptr = clone_slot.swap(NULL, SeqCst);
-            return ArcPtrBorrow::new(if ptr != prepare_ptr { ptr } else { ptr_checked }, None);
+            if ptr != prepare_ptr {
+                unsafe { A::decr_rc(ptr) };
+            }
+            return ArcPtrBorrow::new(NULL, None);
         }
-        let confirm_ptr = ptr_checked.map_addr(|addr| addr | CONFIRM_CLONE_FLAG);
+        let confirm_ptr = (ptr_checked).map_addr(|addr| addr | CONFIRM_CLONE_FLAG);
         // Failure ordering must be SeqCst for load to have a full SeqCst semantic
         if let Err(ptr) = clone_slot.compare_exchange(prepare_ptr, confirm_ptr, SeqCst, SeqCst) {
+            if P::check_concurrent_writers()
+                && let ptr = self.ptr.load(SeqCst)
+                && ptr.has_concurrent_writers()
+            {
+                unsafe { A::decr_rc(ptr.into()) };
+                return self.load_clone_loop(node, ptr_checked);
+            }
             clone_slot.store(NULL, SeqCst);
             return ArcPtrBorrow::new(ptr, None);
         }
-        unsafe { A::incr_rc(ptr_checked) };
-        if let Err(ptr) = clone_slot.compare_exchange(confirm_ptr, NULL, SeqCst, Acquire) {
+        self.load_clone_confirmed(node, ptr_checked)
+    }
+
+    fn load_clone_confirmed(&self, node: BorrowNodeRef, ptr: *mut ()) -> ArcPtrBorrow<A> {
+        unsafe { A::incr_rc(ptr) };
+        let confirm_ptr = ptr.map_addr(|addr| addr | CONFIRM_CLONE_FLAG);
+        if let Err(ptr) = (node.clone_slot()).compare_exchange(confirm_ptr, NULL, SeqCst, Acquire) {
             debug_assert!(ptr.is_null());
-            unsafe { A::decr_rc(ptr_checked) };
+            unsafe { A::decr_rc(ptr) };
         }
-        ArcPtrBorrow::new(ptr_checked, None)
+        ArcPtrBorrow::new(ptr, None)
+    }
+
+    fn load_clone_loop(&self, node: BorrowNodeRef, mut ptr: *mut ()) -> ArcPtrBorrow<A> {
+        let clone_slot = node.clone_slot();
+        let confirm = |ptr: *mut ()| ptr.map_addr(|addr| addr | CONFIRM_CLONE_FLAG);
+        clone_slot.store(confirm(ptr), SeqCst);
+        loop {
+            let ptr_checked = self.ptr.load(SeqCst).into();
+            if ptr == ptr_checked {
+                return self.load_clone_confirmed(node, ptr_checked);
+            }
+            if let Err(p) =
+                clone_slot.compare_exchange(confirm(ptr), confirm(ptr_checked), SeqCst, SeqCst)
+            {
+                debug_assert!(p.is_null());
+                return ArcPtrBorrow::new(ptr, None);
+            }
+            ptr = ptr_checked;
+        }
     }
 
     #[inline]
@@ -144,9 +203,9 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
     /// `self` must not be reused after.
     #[inline(always)]
     unsafe fn take_owned(&mut self) -> A {
-        let ptr = *self.ptr.get_mut();
+        let ptr = self.ptr.get_mut().into();
         if A::NULLABLE && ptr.is_null() {
-            return unsafe { A::from_ptr(ptr) };
+            return unsafe { A::from_ptr(NULL) };
         }
         self.swap_impl(ptr, None)
     }
@@ -158,14 +217,14 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
     }
 
     #[cold]
-    fn load_impl_cold(&self, ptr: *mut ()) -> ArcPtrBorrow<A> {
+    fn load_impl_cold(&self, ptr: P::Ptr) -> ArcPtrBorrow<A> {
         self.load_impl(ptr)
     }
 
     #[inline]
     pub fn load_if_outdated<'a>(&self, arc: &'a A) -> Result<&'a A, ArcPtrBorrow<A>> {
         let ptr = self.ptr.load(Relaxed);
-        if ptr == A::as_ptr(arc) {
+        if ptr.into() == A::as_ptr(arc) {
             Ok(arc)
         } else {
             Err(self.load_impl_cold(ptr))
@@ -174,14 +233,14 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
 
     #[cold]
     #[inline(never)]
-    fn reload_cache(&self, ptr: *mut (), cached: &mut A) {
+    fn reload_cache(&self, ptr: P::Ptr, cached: &mut A) {
         *cached = self.load_impl(ptr).into_owned();
     }
 
     #[inline]
     pub fn load_cached<'a>(&self, cached: &'a mut A) -> &'a A {
         let ptr = self.ptr.load(Relaxed);
-        if ptr != A::as_ptr(cached) {
+        if ptr.into() != A::as_ptr(cached) {
             self.reload_cache(ptr, cached);
         }
         cached
@@ -189,8 +248,8 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
 
     pub fn swap(&self, arc: A) -> A {
         // store a clone in order to keep an owned arc, in case its ownership must be transferred
-        let old_ptr = self.ptr.swap(A::into_ptr(arc.clone()), SeqCst);
-        self.swap_impl(old_ptr, Some(arc))
+        let old_ptr = self.ptr.swap(A::into_ptr(arc.clone()));
+        self.swap_impl(old_ptr.into(), Some(arc))
     }
 
     fn swap_impl(&self, old_ptr: *mut (), new: Option<A>) -> A {
@@ -240,6 +299,7 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
                 })
             }
         }
+        self.ptr.finish_write(old_ptr);
         old_arc
     }
 
@@ -250,8 +310,8 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
     pub fn compare_exchange<C: ArcRef<A>>(&self, current: C, new: A) -> Result<A, ArcPtrBorrow<A>> {
         // store a clone in order to keep an owned arc, in case its ownership must be transferred
         let new_clone = A::into_ptr(new.clone());
-        match (self.ptr).compare_exchange(C::as_ptr(current), new_clone, SeqCst, Relaxed) {
-            Ok(old_ptr) => Ok(self.swap_impl(old_ptr, Some(new))),
+        match self.ptr.compare_exchange(C::as_ptr(current), new_clone) {
+            Ok(old_ptr) => Ok(self.swap_impl(old_ptr.into(), Some(new))),
             Err(old_ptr) => {
                 unsafe { A::decr_rc(new_clone) };
                 Err(self.load_impl(old_ptr))
@@ -274,13 +334,13 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D> {
     }
 }
 
-impl<A: ArcPtr + NonNullPtr, D: Domain> AtomicArcPtr<Option<A>, D> {
+impl<A: ArcPtr + NonNullPtr, D: Domain, P: LoadPolicy> AtomicArcPtr<Option<A>, D, P> {
     #[inline]
     pub const fn none() -> Self {
         Self {
-            ptr: AtomicPtr::new(NULL),
+            ptr: P::AtomicPtr::NULL,
             _arc: PhantomData,
-            _list: PhantomData,
+            _domain: PhantomData,
         }
     }
 
@@ -290,56 +350,56 @@ impl<A: ArcPtr + NonNullPtr, D: Domain> AtomicArcPtr<Option<A>, D> {
     }
 }
 
-impl<A: ArcPtr, D: Domain> Drop for AtomicArcPtr<A, D> {
+impl<A: ArcPtr, D: Domain, P: LoadPolicy> Drop for AtomicArcPtr<A, D, P> {
     fn drop(&mut self) {
         // SAFETY: self is not reused after
         drop(unsafe { self.take_owned() });
     }
 }
 
-impl<A: ArcPtr + Default, D: Domain> Default for AtomicArcPtr<A, D> {
+impl<A: ArcPtr + Default, D: Domain, P: LoadPolicy> Default for AtomicArcPtr<A, D, P> {
     fn default() -> Self {
         Self::new(A::default())
     }
 }
 
-impl<A: ArcPtr + fmt::Debug, D: Domain> fmt::Debug for AtomicArcPtr<A, D> {
+impl<A: ArcPtr + fmt::Debug, D: Domain, P: LoadPolicy> fmt::Debug for AtomicArcPtr<A, D, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AtomicArcPtr").field(&*self.load()).finish()
     }
 }
 
-impl<A: ArcPtr + fmt::Display, D: Domain> fmt::Display for AtomicArcPtr<A, D> {
+impl<A: ArcPtr + fmt::Display, D: Domain, P: LoadPolicy> fmt::Display for AtomicArcPtr<A, D, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         (*self.load()).fmt(f)
     }
 }
 
-impl<A: ArcPtr, D: Domain> From<A> for AtomicArcPtr<A, D> {
+impl<A: ArcPtr, D: Domain, P: LoadPolicy> From<A> for AtomicArcPtr<A, D, P> {
     fn from(value: A) -> Self {
         Self::new(value)
     }
 }
 
-impl<A: ArcPtr + NonNullPtr, D: Domain> From<A> for AtomicArcPtr<Option<A>, D> {
+impl<A: ArcPtr + NonNullPtr, D: Domain, P: LoadPolicy> From<A> for AtomicArcPtr<Option<A>, D, P> {
     fn from(value: A) -> Self {
         Some(value).into()
     }
 }
 
-impl<T, D: Domain> From<T> for AtomicArcPtr<Arc<T>, D> {
+impl<T, D: Domain, P: LoadPolicy> From<T> for AtomicArcPtr<Arc<T>, D, P> {
     fn from(value: T) -> Self {
         Arc::new(value).into()
     }
 }
 
-impl<T, D: Domain> From<T> for AtomicArcPtr<Option<Arc<T>>, D> {
+impl<T, D: Domain, P: LoadPolicy> From<T> for AtomicArcPtr<Option<Arc<T>>, D, P> {
     fn from(value: T) -> Self {
         Some(Arc::new(value)).into()
     }
 }
 
-impl<T, D: Domain> From<Option<T>> for AtomicArcPtr<Option<Arc<T>>, D> {
+impl<T, D: Domain, P: LoadPolicy> From<Option<T>> for AtomicArcPtr<Option<Arc<T>>, D, P> {
     fn from(value: Option<T>) -> Self {
         value.map(Arc::new).into()
     }
@@ -349,19 +409,19 @@ impl<T, D: Domain> From<Option<T>> for AtomicArcPtr<Option<Arc<T>>, D> {
 #[derive(Debug)]
 pub struct ArcPtrBorrow<A: ArcPtr> {
     arc: ManuallyDrop<A>,
-    borrow: Option<&'static BorrowSlot>,
+    slot: Option<&'static BorrowSlot>,
 }
 
 impl<A: ArcPtr> ArcPtrBorrow<A> {
     #[inline(always)]
-    fn new(ptr: *mut (), borrow: Option<&'static BorrowSlot>) -> Self {
+    pub(crate) fn new(ptr: *mut (), slot: Option<&'static BorrowSlot>) -> Self {
         let arc = ManuallyDrop::new(unsafe { A::from_ptr(ptr) });
-        Self { arc, borrow }
+        Self { arc, slot }
     }
 
     #[inline]
     pub fn into_owned(self) -> A {
-        if self.borrow.is_none() {
+        if self.slot.is_none() {
             return unsafe { ManuallyDrop::take(&mut ManuallyDrop::new(self).arc) };
         }
         self.clone()
@@ -372,10 +432,7 @@ impl<A: ArcPtr + NonNullPtr> ArcPtrBorrow<Option<A>> {
     #[inline(always)]
     pub fn transpose(self) -> Option<ArcPtrBorrow<A>> {
         let this = ManuallyDrop::new(self);
-        Some(ArcPtrBorrow::new(
-            A::as_ptr(this.arc.as_ref()?),
-            this.borrow,
-        ))
+        Some(ArcPtrBorrow::new(A::as_ptr(this.arc.as_ref()?), this.slot))
     }
 }
 
@@ -383,7 +440,7 @@ impl<A: ArcPtr> Drop for ArcPtrBorrow<A> {
     #[inline]
     fn drop(&mut self) {
         let ptr = A::as_ptr(&self.arc);
-        if (self.borrow).is_none_or(|b| b.compare_exchange(ptr, NULL, SeqCst, Relaxed).is_err()) {
+        if (self.slot).is_none_or(|b| b.compare_exchange(ptr, NULL, SeqCst, Relaxed).is_err()) {
             #[cold]
             #[inline(never)]
             fn drop_arc<A>(_: A) {}
@@ -419,7 +476,7 @@ impl<A: ArcPtr> From<A> for ArcPtrBorrow<A> {
     fn from(value: A) -> Self {
         Self {
             arc: ManuallyDrop::new(value),
-            borrow: None,
+            slot: None,
         }
     }
 }
@@ -428,28 +485,30 @@ impl<A: ArcPtr + NonNullPtr> From<Option<ArcPtrBorrow<A>>> for ArcPtrBorrow<Opti
     #[inline]
     fn from(value: Option<ArcPtrBorrow<A>>) -> Self {
         match value.map(ManuallyDrop::new) {
-            Some(a) => Self::new(A::as_ptr(&a.arc), a.borrow),
+            Some(a) => Self::new(A::as_ptr(&a.arc), a.slot),
             None => Self::new(NULL, None),
         }
     }
 }
 
 #[repr(transparent)]
-pub struct AtomicOptionArcPtr<A: ArcPtr + NonNullPtr, D: Domain>(AtomicArcPtr<Option<A>, D>);
+pub struct AtomicOptionArcPtr<A: ArcPtr + NonNullPtr, D: Domain, P: LoadPolicy>(
+    AtomicArcPtr<Option<A>, D, P>,
+);
 
-impl<A: ArcPtr + NonNullPtr, D: Domain> AtomicOptionArcPtr<A, D> {
+impl<A: ArcPtr + NonNullPtr, D: Domain, P: LoadPolicy> AtomicOptionArcPtr<A, D, P> {
     #[inline]
     pub fn new(arc: Option<A>) -> Self {
         Self(AtomicArcPtr::new(arc))
     }
 
     #[inline]
-    pub fn inner(&self) -> &AtomicArcPtr<Option<A>, D> {
+    pub fn inner(&self) -> &AtomicArcPtr<Option<A>, D, P> {
         &self.0
     }
 
     #[inline]
-    pub fn into_inner(self) -> AtomicArcPtr<Option<A>, D> {
+    pub fn into_inner(self) -> AtomicArcPtr<Option<A>, D, P> {
         self.0
     }
 
@@ -520,31 +579,33 @@ impl<A: ArcPtr + NonNullPtr, D: Domain> AtomicOptionArcPtr<A, D> {
             .map_err(ArcPtrBorrow::transpose)
     }
 }
-impl<A: ArcPtr + NonNullPtr, D: Domain> Default for AtomicOptionArcPtr<A, D> {
+impl<A: ArcPtr + NonNullPtr, D: Domain, P: LoadPolicy> Default for AtomicOptionArcPtr<A, D, P> {
     fn default() -> Self {
         Self::none()
     }
 }
 
-impl<A: ArcPtr + NonNullPtr + fmt::Debug, D: Domain> fmt::Debug for AtomicOptionArcPtr<A, D> {
+impl<A: ArcPtr + NonNullPtr + fmt::Debug, D: Domain, P: LoadPolicy> fmt::Debug
+    for AtomicOptionArcPtr<A, D, P>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AtomicOptionArcPtr").field(&self.0).finish()
     }
 }
 
-impl<T, A: ArcPtr + NonNullPtr, D: Domain> From<T> for AtomicOptionArcPtr<A, D>
+impl<T, A: ArcPtr + NonNullPtr, D: Domain, P: LoadPolicy> From<T> for AtomicOptionArcPtr<A, D, P>
 where
-    AtomicArcPtr<Option<A>, D>: From<T>,
+    AtomicArcPtr<Option<A>, D, P>: From<T>,
 {
     fn from(value: T) -> Self {
         Self(value.into())
     }
 }
 
-impl<'a, A: ArcPtr + NonNullPtr, D: Domain> From<&'a AtomicArcPtr<Option<A>, D>>
-    for &'a AtomicOptionArcPtr<A, D>
+impl<'a, A: ArcPtr + NonNullPtr, D: Domain, P: LoadPolicy> From<&'a AtomicArcPtr<Option<A>, D, P>>
+    for &'a AtomicOptionArcPtr<A, D, P>
 {
-    fn from(value: &'a AtomicArcPtr<Option<A>, D>) -> Self {
-        unsafe { mem::transmute::<&'a AtomicArcPtr<Option<A>, D>, Self>(value) }
+    fn from(value: &'a AtomicArcPtr<Option<A>, D, P>) -> Self {
+        unsafe { mem::transmute::<&'a AtomicArcPtr<Option<A>, D, P>, Self>(value) }
     }
 }

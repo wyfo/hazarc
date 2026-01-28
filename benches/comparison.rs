@@ -10,7 +10,11 @@ use std::{
 
 use arc_swap::{ArcSwap, ArcSwapOption, Guard};
 use divan::Bencher;
-use hazarc::{ArcBorrow, AtomicArc, AtomicOptionArc};
+use hazarc::{
+    ArcBorrow, AtomicArc, AtomicOptionArc, DefaultDomain,
+    domain::Domain,
+    load_policy::{Adaptive, LoadPolicy, LockFree, WaitFree},
+};
 
 trait LoadBench: Default + Send + Sync {
     type Guard<'a>
@@ -118,18 +122,18 @@ impl LoadBench for ArcSwapOption<usize> {
     }
 }
 
-impl LoadBench for AtomicArc<usize> {
+impl<D: Domain, P: LoadPolicy> LoadBench for AtomicArc<usize, D, P> {
     type Guard<'a> = ArcBorrow<usize>;
     fn load(&self) -> Self::Guard<'_> {
         self.load()
     }
 }
-impl StoreBench for AtomicArc<usize> {
+impl<D: Domain, P: LoadPolicy> StoreBench for AtomicArc<usize, D, P> {
     fn store(&self, arc: Arc<usize>) {
         self.store(arc);
     }
 }
-impl LoadBench for AtomicOptionArc<usize> {
+impl<D: Domain, P: LoadPolicy> LoadBench for AtomicOptionArc<usize, D, P> {
     type Guard<'a> = Option<ArcBorrow<usize>>;
     fn load(&self) -> Self::Guard<'_> {
         self.load()
@@ -138,24 +142,10 @@ impl LoadBench for AtomicOptionArc<usize> {
 #[cfg(feature = "pthread-domain")]
 hazarc::pthread_domain!(PthreadDomain(8));
 #[cfg(feature = "pthread-domain")]
-impl LoadBench for AtomicArc<usize, PthreadDomain> {
-    type Guard<'a> = ArcBorrow<usize>;
-    fn load(&self) -> Self::Guard<'_> {
-        self.load()
-    }
-}
-#[cfg(feature = "pthread-domain")]
 hazarc::pthread_domain!(UnsafePthreadDomain);
 #[cfg(feature = "pthread-domain")]
 unsafe impl hazarc::domain::Domain for UnsafePthreadDomain {
     hazarc::pthread_domain_methods!(UnsafePthreadDomain(8));
-}
-#[cfg(feature = "pthread-domain")]
-impl LoadBench for AtomicArc<usize, UnsafePthreadDomain> {
-    type Guard<'a> = ArcBorrow<usize>;
-    fn load(&self) -> Self::Guard<'_> {
-        self.load()
-    }
 }
 
 impl LoadBench for RwLock<Arc<usize>> {
@@ -236,48 +226,48 @@ fn arcswap_store_contended(b: Bencher, threads: usize) {
     ArcSwap::bench_store_contended(b, threads)
 }
 
-#[divan::bench]
-fn hazarc_load(b: Bencher) {
-    AtomicArc::<_>::bench_load(b, false)
+#[divan::bench(types = [WaitFree, Adaptive, LockFree])]
+fn hazarc_load<P: LoadPolicy>(b: Bencher) {
+    AtomicArc::<_, DefaultDomain, P>::bench_load(b, false)
 }
 #[cfg(feature = "pthread-domain")]
-#[divan::bench]
-fn hazarc_load_pthread(b: Bencher) {
-    AtomicArc::<_, PthreadDomain>::bench_load(b, false)
+#[divan::bench(types = [WaitFree, Adaptive, LockFree])]
+fn hazarc_load_pthread<P: LoadPolicy>(b: Bencher) {
+    AtomicArc::<_, PthreadDomain, P>::bench_load(b, false)
 }
 #[cfg(feature = "pthread-domain")]
-#[divan::bench]
-fn hazarc_load_pthread_unsafe(b: Bencher) {
+#[divan::bench(types = [WaitFree, Adaptive, LockFree])]
+fn hazarc_load_pthread_unsafe<P: LoadPolicy>(b: Bencher) {
     unsafe { UnsafePthreadDomain::init_thread_local() };
-    AtomicArc::<_, UnsafePthreadDomain>::bench_load(b, false)
+    AtomicArc::<_, UnsafePthreadDomain, P>::bench_load(b, false)
 }
-#[divan::bench]
-fn hazarc_load_spin(b: Bencher) {
-    LoadSpin::<AtomicArc<_>>::bench_load(b, false)
+#[divan::bench(types = [WaitFree, Adaptive, LockFree])]
+fn hazarc_load_spin<P: LoadPolicy>(b: Bencher) {
+    LoadSpin::<AtomicArc<_, DefaultDomain, P>>::bench_load(b, false)
 }
-#[divan::bench]
-fn hazarc_load_no_slot(b: Bencher) {
-    AtomicArc::<_>::bench_load_no_slot(b)
+#[divan::bench(types = [WaitFree, Adaptive, LockFree])]
+fn hazarc_load_no_slot<P: LoadPolicy>(b: Bencher) {
+    AtomicArc::<_, DefaultDomain, P>::bench_load_no_slot(b)
 }
-#[divan::bench]
-fn hazarc_load_no_slot_spin(b: Bencher) {
-    LoadSpin::<AtomicArc<_>>::bench_load_no_slot(b)
+#[divan::bench(types = [WaitFree, Adaptive, LockFree])]
+fn hazarc_load_no_slot_spin<P: LoadPolicy>(b: Bencher) {
+    LoadSpin::<AtomicArc<_, DefaultDomain, P>>::bench_load_no_slot(b)
 }
-#[divan::bench]
-fn hazarc_load_none(b: Bencher) {
-    AtomicOptionArc::bench_load(b, false)
+#[divan::bench(types = [WaitFree, Adaptive, LockFree])]
+fn hazarc_load_none<P: LoadPolicy>(b: Bencher) {
+    AtomicOptionArc::<_, DefaultDomain, P>::bench_load(b, false)
 }
-#[divan::bench]
-fn hazarc_load_contended(b: Bencher) {
-    AtomicArc::bench_load_contended(b, false)
+#[divan::bench(types = [WaitFree, Adaptive, LockFree])]
+fn hazarc_load_contended<P: LoadPolicy>(b: Bencher) {
+    AtomicArc::<_, DefaultDomain, P>::bench_load_contended(b, false)
 }
-#[divan::bench(args = [0, 1, 2, 4, 8, 16])]
-fn hazarc_store(b: Bencher, threads: usize) {
-    AtomicArc::bench_store(b, threads)
+#[divan::bench(types = [WaitFree, Adaptive, LockFree], args = [0, 1, 2, 4, 8, 16])]
+fn hazarc_store<P: LoadPolicy>(b: Bencher, threads: usize) {
+    AtomicArc::<_, DefaultDomain, P>::bench_store(b, threads)
 }
-#[divan::bench(args = [0, 1, 2, 4, 8, 16])]
-fn hazarc_store_contended(b: Bencher, threads: usize) {
-    AtomicArc::bench_store_contended(b, threads)
+#[divan::bench(types = [WaitFree, Adaptive, LockFree], args = [0, 1, 2, 4, 8, 16])]
+fn hazarc_store_contended<P: LoadPolicy>(b: Bencher, threads: usize) {
+    AtomicArc::<_, DefaultDomain, P>::bench_store_contended(b, threads)
 }
 
 #[divan::bench(threads = [0, 1, 2, 4, 8, 16])]

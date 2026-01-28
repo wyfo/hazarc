@@ -18,6 +18,12 @@ use crossbeam_utils::CachePadded;
 
 use crate::NULL;
 
+macro_rules! node_field {
+    ($node:ident.$field:ident) => {
+        unsafe { &(*$node.as_ptr()).$field }
+    };
+}
+
 #[allow(clippy::missing_safety_doc)]
 pub unsafe trait Domain: 'static + Send + Sync {
     fn static_list() -> &'static BorrowList;
@@ -45,7 +51,7 @@ impl BorrowList {
         let mut node_ptr = &self.head;
         iter::from_fn(move || {
             let node = unsafe { BorrowNodeRef::new(node_ptr.load(SeqCst))? };
-            node_ptr = node.next();
+            node_ptr = node_field!(node.next);
             Some(node)
         })
     }
@@ -57,7 +63,7 @@ impl BorrowList {
             if node.try_acquire() {
                 return node;
             }
-            node_ptr = node.next();
+            node_ptr = node_field!(node.next);
         }
         let new_node = BorrowNodeRef::allocate(borrow_slot_count);
         while let Err(next) = node_ptr
@@ -120,15 +126,6 @@ unsafe impl Send for BorrowNodeRef {}
 // SAFETY: `NodeRef` is equivalent to `&'static Node`
 unsafe impl Sync for BorrowNodeRef {}
 
-macro_rules! ref_field {
-    ($field:ident: $ty:ty) => {
-        #[inline(always)]
-        pub(crate) fn $field(self) -> &'static $ty {
-            unsafe { &(*self.as_ptr()).$field }
-        }
-    };
-}
-
 impl BorrowNodeRef {
     unsafe fn new(ptr: *const BorrowNode) -> Option<Self> {
         NonNull::new(ptr.cast_mut()).map(Self)
@@ -165,42 +162,49 @@ impl BorrowNodeRef {
 
     unsafe fn deallocate(self) {
         let layout = Self::layout(self.borrow_slots().len());
-        unsafe { dealloc(self.0.as_ptr().cast(), layout) }
+        unsafe { dealloc(self.as_ptr().cast(), layout) }
     }
 
     fn try_acquire(self) -> bool {
         // Acquire load for `next_slot` synchronization
-        !self.in_use().load(Relaxed) && !self.in_use().swap(true, Acquire)
+        !node_field!(self.in_use).load(Relaxed) && !node_field!(self.in_use).swap(true, Acquire)
     }
 
     unsafe fn release(self) {
         // Release store for `next_slot` synchronization
-        self.in_use().store(false, Release);
+        node_field!(self.in_use).store(false, Release);
     }
 
     fn as_ptr(self) -> *mut BorrowNode {
         self.0.as_ptr()
     }
 
-    ref_field!(next: AtomicPtr<BorrowNode>);
-    ref_field!(in_use: AtomicBool);
-    ref_field!(clone_slot: AtomicPtr<()>);
-    ref_field!(next_borrow_slot_idx: Cell<usize>);
-    ref_field!(borrow_slot_idx_mask: usize);
-
+    #[inline(always)]
+    pub(crate) fn next_borrow_slot_idx(self) -> usize {
+        node_field!(self.next_borrow_slot_idx).get()
+    }
+    #[inline(always)]
+    pub(crate) fn set_next_borrow_slot_idx(self, slot_idx: usize) {
+        node_field!(self.next_borrow_slot_idx)
+            .set(slot_idx & node_field!(self.borrow_slot_idx_mask));
+    }
     #[inline(always)]
     pub(crate) fn borrow_slots(self) -> &'static [BorrowSlot] {
-        let len = self.borrow_slot_idx_mask() + 1;
+        let len = node_field!(self.borrow_slot_idx_mask) + 1;
         unsafe { slice::from_raw_parts(&raw const (*self.as_ptr()).borrow_slots as _, len) }
+    }
+
+    pub(crate) fn clone_slot(self) -> &'static AtomicPtr<()> {
+        node_field!(self.clone_slot)
     }
 }
 
 impl fmt::Debug for BorrowNodeRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BorrowNodeRef")
-            .field("in_use", self.in_use())
+            .field("in_use", node_field!(self.in_use))
             .field("borrow_slots", &self.borrow_slots())
-            .field("clone_slot", self.clone_slot())
+            .field("clone_slot", node_field!(self.clone_slot))
             .finish_non_exhaustive()
     }
 }
@@ -313,22 +317,39 @@ macro_rules! pthread_domain_methods {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::Domain;
+    use crate::domain::{BorrowNodeRef, Domain};
 
     #[test]
     fn node_reuse() {
         #[cfg(feature = "pthread-domain")]
-        pthread_domain!(TestDomain(1));
+        pthread_domain!(TestDomain(2));
         #[cfg(not(feature = "pthread-domain"))]
-        domain!(TestDomain(1));
+        domain!(TestDomain(2));
         let thread = std::thread::spawn(|| {
             let node = TestDomain::thread_local_node();
-            node.next_borrow_slot_idx().set(1);
+            node.set_next_borrow_slot_idx(1);
             node
         });
         let node1 = thread.join().unwrap();
         let node2 = TestDomain::thread_local_node();
         assert_eq!(node1.as_ptr(), node2.as_ptr());
-        assert_eq!(node2.next_borrow_slot_idx().get(), 1);
+        assert_eq!(node2.next_borrow_slot_idx(), 1);
+    }
+
+    #[test]
+    fn node_reuse2() {
+        #[cfg(feature = "pthread-domain")]
+        pthread_domain!(TestDomain(2));
+        #[cfg(not(feature = "pthread-domain"))]
+        domain!(TestDomain(2));
+        std::thread::scope(|s| {
+            let node1 = s.spawn(TestDomain::thread_local_node).join().unwrap();
+            let thread2 = s.spawn(TestDomain::thread_local_node);
+            let thread3 = s.spawn(TestDomain::thread_local_node);
+            let node2 = thread2.join().unwrap();
+            let node3 = thread3.join().unwrap();
+            let ptr = |n| unsafe { core::mem::transmute::<BorrowNodeRef, *mut ()>(n) };
+            assert!(ptr(node1) == ptr(node2) || ptr(node1) == ptr(node3));
+        });
     }
 }

@@ -10,6 +10,7 @@ pub mod arc;
 pub mod atomic;
 pub mod cache;
 pub mod domain;
+pub mod load_policy;
 
 #[cfg(feature = "default-domain")]
 domain!(pub DefaultDomain(8));
@@ -18,13 +19,16 @@ domain!(pub DefaultDomain(8));
 pub use libc;
 
 #[cfg(feature = "default-domain")]
-pub type AtomicArc<T, D = DefaultDomain> = atomic::AtomicArcPtr<Arc<T>, D>;
+pub type AtomicArc<T, D = DefaultDomain, P = load_policy::Adaptive> =
+    atomic::AtomicArcPtr<Arc<T>, D, P>;
 #[cfg(not(feature = "default-domain"))]
-pub type AtomicArc<T, L> = atomic::AtomicArcPtr<Arc<T>, L>;
+pub type AtomicArc<T, D, P = load_policy::Adaptive> = atomic::AtomicArcPtr<Arc<T>, D, P>;
 #[cfg(feature = "default-domain")]
-pub type AtomicOptionArc<T, D = DefaultDomain> = atomic::AtomicOptionArcPtr<Arc<T>, D>;
+pub type AtomicOptionArc<T, D = DefaultDomain, P = load_policy::Adaptive> =
+    atomic::AtomicOptionArcPtr<Arc<T>, D, P>;
 #[cfg(not(feature = "default-domain"))]
-pub type AtomicOptionArc<T, L> = atomic::AtomicOptionArcPtr<Arc<T>, L>;
+pub type AtomicOptionArc<T, D, P = load_policy::Adaptive> =
+    atomic::AtomicOptionArcPtr<Arc<T>, D, P>;
 pub type ArcBorrow<T> = atomic::ArcPtrBorrow<Arc<T>>;
 
 pub use cache::Cache;
