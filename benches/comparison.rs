@@ -2,7 +2,7 @@ use std::{
     array, hint,
     hint::black_box,
     sync::{
-        Arc, RwLock, RwLockReadGuard,
+        Arc, Barrier, RwLock, RwLockReadGuard,
         atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
     },
     thread,
@@ -70,9 +70,13 @@ trait StoreBench: LoadBench + From<Arc<usize>> {
     fn bench_store(b: Bencher, threads: usize) {
         let arc = Arc::new(0);
         let x = black_box(Self::from(arc.clone()));
+        let barrier = Barrier::new(threads);
         thread::scope(|s| {
             for _ in 0..threads {
-                s.spawn(|| drop(x.load()));
+                s.spawn(|| {
+                    drop(x.load());
+                    barrier.wait();
+                });
             }
         });
         b.bench_local(|| x.store(arc.clone()));
@@ -263,7 +267,10 @@ fn hazarc_load_contended<P: LoadPolicy>(b: Bencher) {
 }
 #[divan::bench(types = [WaitFree, Adaptive, LockFree], args = [0, 1, 2, 4, 8, 16])]
 fn hazarc_store<P: LoadPolicy>(b: Bencher, threads: usize) {
-    AtomicArc::<_, DefaultDomain, P>::bench_store(b, threads)
+    DefaultDomain::reset_thread_local_node();
+    unsafe { DefaultDomain::static_list().dealloc() };
+    DefaultDomain::thread_local_node();
+    AtomicArc::<_, DefaultDomain, P>::bench_store(b, threads);
 }
 #[divan::bench(types = [WaitFree, Adaptive, LockFree], args = [0, 1, 2, 4, 8, 16])]
 fn hazarc_store_contended<P: LoadPolicy>(b: Bencher, threads: usize) {

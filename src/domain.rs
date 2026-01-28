@@ -28,6 +28,7 @@ macro_rules! node_field {
 pub unsafe trait Domain: 'static + Send + Sync {
     fn static_list() -> &'static BorrowList;
     fn thread_local_node() -> BorrowNodeRef;
+    fn reset_thread_local_node();
 }
 
 pub struct BorrowList {
@@ -222,6 +223,16 @@ macro_rules! domain {
     ($vis:vis $name:ident($borrow_slot_count:expr)) => {
         #[derive(Debug)]
         $vis struct $name;
+        impl $name {
+            #[doc(hidden)]
+            #[inline(always)]
+            unsafe fn local_key() -> &'static ::std::thread::LocalKey<::std::cell::Cell<::std::option::Option<$crate::domain::BorrowNodeRef>>> {
+                ::std::thread_local! {
+                    static LOCAL: ::std::cell::Cell<::std::option::Option<$crate::domain::BorrowNodeRef>> = const { ::std::cell::Cell::new(None) };
+                }
+                &LOCAL
+            }
+        }
         unsafe impl $crate::domain::Domain for $name {
             #[inline(always)]
             fn static_list() -> &'static $crate::domain::BorrowList {
@@ -230,29 +241,29 @@ macro_rules! domain {
             }
             #[inline(always)]
             fn thread_local_node() -> $crate::domain::BorrowNodeRef {
-                ::std::thread_local! {
-                    static LOCAL: std::cell::Cell<std::option::Option<$crate::domain::BorrowNodeRef>> = const { std::cell::Cell::new(None) };
-                }
                 #[cold]
                 #[inline(never)]
                 fn new_node() -> $crate::domain::BorrowNodeRef {
                     struct NodeGuard;
                     impl Drop for NodeGuard {
                         fn drop(&mut self) {
-                            if let Some(node) = LOCAL.take() {
-                                unsafe { <$name as $crate::domain::Domain>::static_list().remove_node(node) };
-                            }
+                            <$name as $crate::domain::Domain>::reset_thread_local_node();
                         }
                     }
                     ::std::thread_local! {
                         static GUARD: NodeGuard = const { NodeGuard };
                     }
                     let node = <$name as $crate::domain::Domain>::static_list().insert_node($borrow_slot_count);
-                    LOCAL.set(Some(node));
+                    unsafe { $name::local_key() }.set(Some(node));
                     GUARD.with(|_| ());
                     node
                 }
-                LOCAL.get().unwrap_or_else(new_node)
+                unsafe { $name::local_key() }.get().unwrap_or_else(new_node)
+            }
+            fn reset_thread_local_node() {
+                if let Some(node) = unsafe { $name::local_key() }.take() {
+                    unsafe { <$name as $crate::domain::Domain>::static_list().remove_node(node) };
+                }
             }
         }
     };
@@ -271,14 +282,19 @@ macro_rules! pthread_domain {
                 static mut KEY: ::core::mem::MaybeUninit<$crate::libc::pthread_key_t> = core::mem::MaybeUninit::uninit();
                 (&raw mut KEY).cast()
             }
+            #[doc(hidden)]
+            pub unsafe fn remove_node(ptr: *mut $crate::libc::c_void) {
+                if let Some(ptr) = ::core::ptr::NonNull::new(ptr) {
+                    let node = unsafe { $crate::domain::BorrowNodeRef::from_raw(ptr.cast()) };
+                    unsafe { <$name as $crate::domain::Domain>::static_list().remove_node(node) };
+                    unsafe { $crate::libc::pthread_setspecific(*$name::key(), ::core::ptr::null()) };
+                }
+            }
             #[inline]
             pub unsafe fn init_thread_local() {
                 unsafe extern "C" fn make_key() {
                     unsafe extern "C" fn remove_node(ptr: *mut $crate::libc::c_void) {
-                        if let Some(ptr) = ::core::ptr::NonNull::new(ptr) {
-                            let node = unsafe { $crate::domain::BorrowNodeRef::from_raw(ptr.cast()) };
-                            unsafe { <$name as $crate::domain::Domain>::static_list().remove_node(node) };
-                        }
+                        unsafe { $name::remove_node(ptr) };
                     }
                     unsafe { $crate::libc::pthread_key_create($name::key(), Some(remove_node)) };
                 }
@@ -311,15 +327,19 @@ macro_rules! pthread_domain_methods {
              #[inline(never)]
              fn new_node() -> $crate::domain::BorrowNodeRef {
                  let node = <$name as $crate::domain::Domain>::static_list().insert_node ($borrow_slot_count);
-                 unsafe { $crate::libc::pthread_setspecific(*$name::key(), node.into_raw().as_ptr() .cast()) };
+                 unsafe { $crate::libc::pthread_setspecific(*$name::key(), node.into_raw().as_ptr().cast()) };
                  node
              }
              $($init;)?
-             match unsafe { ::core::ptr::NonNull::new($crate::libc::pthread_getspecific(*Self::key()) ) } {
+             match unsafe { ::core::ptr::NonNull::new($crate::libc::pthread_getspecific(*Self::key())) } {
                  Some(ptr) => unsafe { $crate::domain::BorrowNodeRef::from_raw(ptr.cast()) },
-                None => new_node()
-            }
-        }
+                 None => new_node()
+             }
+         }
+         fn reset_thread_local_node() {
+             $($init;)?
+             unsafe { $name::remove_node($crate::libc::pthread_getspecific(*Self::key())) };
+         }
     };
 }
 
@@ -367,9 +387,19 @@ mod tests {
         pthread_domain!(TestDomain(2));
         #[cfg(not(feature = "pthread-domain"))]
         domain!(TestDomain(2));
+        let barrier = std::sync::Barrier::new(2);
         std::thread::scope(|s| {
-            s.spawn(TestDomain::thread_local_node);
-            s.spawn(TestDomain::thread_local_node);
+            s.spawn(|| {
+                TestDomain::thread_local_node();
+                barrier.wait();
+                // It seems TLS can be destroyed after the thread has been joined...
+                TestDomain::reset_thread_local_node();
+            });
+            s.spawn(|| {
+                TestDomain::thread_local_node();
+                barrier.wait();
+                TestDomain::reset_thread_local_node();
+            });
         });
         assert_eq!(TestDomain::static_list().nodes().count(), 2);
         unsafe { TestDomain::static_list().dealloc() };
