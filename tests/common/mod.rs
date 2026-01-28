@@ -37,11 +37,11 @@ fn concurrent_writes() {
     thread::scope(|s| {
         s.spawn(barrier.wrap(|| {
             let swapped = atomic_arc.swap(1.into());
-            assert!(*swapped == 0 || *swapped == 2)
+            assert!(*swapped == 0 || *swapped == 2);
         }));
         s.spawn(barrier.wrap(|| {
             let swapped = atomic_arc.swap(2.into());
-            assert!(*swapped == 0 || *swapped == 1)
+            assert!(*swapped == 0 || *swapped == 1);
         }));
         barrier.wait();
         let guard = atomic_arc.load();
@@ -55,18 +55,18 @@ fn concurrent_writes() {
 fn concurrent_writes_option() {
     domain!(TestDomain(1));
     let check_borrow = |b: &Option<ArcBorrow<_>>| {
-        assert!([Some(0), Some(1), None].contains(&b.as_ref().map(|b| ***b)))
+        assert!([Some(0), Some(1), None].contains(&b.as_ref().map(|b| ***b)));
     };
     let barrier = SpinBarrier::new(3);
     let atomic_arc = AtomicOptionArc::<usize, TestDomain, LoadPolicy>::from(0);
     thread::scope(|s| {
         s.spawn(barrier.wrap(|| {
             let swapped = atomic_arc.swap(Some(1.into()));
-            assert!(swapped.as_deref() == Some(&0) || swapped.is_none())
+            assert!(swapped.as_deref() == Some(&0) || swapped.is_none());
         }));
         s.spawn(barrier.wrap(|| {
             let swapped = atomic_arc.swap(None);
-            assert!(swapped.as_deref() == Some(&1) || swapped.as_deref() == Some(&0))
+            assert!(swapped.as_deref() == Some(&1) || swapped.as_deref() == Some(&0));
         }));
         barrier.wait();
         let guard = atomic_arc.load();

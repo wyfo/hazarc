@@ -199,71 +199,71 @@ impl<T: LoadBench> LoadBench for LoadSpin<T> {
 
 #[divan::bench]
 fn arcswap_load(b: Bencher) {
-    ArcSwap::bench_load(b, false)
+    ArcSwap::bench_load(b, false);
 }
 #[divan::bench]
 fn arcswap_load_spin(b: Bencher) {
-    LoadSpin::<ArcSwap<_>>::bench_load(b, false)
+    LoadSpin::<ArcSwap<_>>::bench_load(b, false);
 }
 #[divan::bench]
 fn arcswap_load_no_slot(b: Bencher) {
-    ArcSwap::bench_load_no_slot(b)
+    ArcSwap::bench_load_no_slot(b);
 }
 #[divan::bench]
 fn arcswap_load_no_slot_spin(b: Bencher) {
-    LoadSpin::<ArcSwap<_>>::bench_load_no_slot(b)
+    LoadSpin::<ArcSwap<_>>::bench_load_no_slot(b);
 }
 #[divan::bench]
 fn arcswap_load_none(b: Bencher) {
-    ArcSwapOption::bench_load(b, false)
+    ArcSwapOption::bench_load(b, false);
 }
 #[divan::bench]
 fn arcswap_load_contended(b: Bencher) {
-    ArcSwap::bench_load_contended(b, false)
+    ArcSwap::bench_load_contended(b, false);
 }
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
 fn arcswap_store(b: Bencher, threads: usize) {
-    ArcSwap::bench_store(b, threads)
+    ArcSwap::bench_store(b, threads);
 }
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
 fn arcswap_store_contended(b: Bencher, threads: usize) {
-    ArcSwap::bench_store_contended(b, threads)
+    ArcSwap::bench_store_contended(b, threads);
 }
 
 #[divan::bench(types = [WaitFree, Adaptive, LockFree])]
 fn hazarc_load<P: LoadPolicy>(b: Bencher) {
-    AtomicArc::<_, DefaultDomain, P>::bench_load(b, false)
+    AtomicArc::<_, DefaultDomain, P>::bench_load(b, false);
 }
 #[cfg(feature = "pthread-domain")]
 #[divan::bench(types = [WaitFree, Adaptive, LockFree])]
 fn hazarc_load_pthread<P: LoadPolicy>(b: Bencher) {
-    AtomicArc::<_, PthreadDomain, P>::bench_load(b, false)
+    AtomicArc::<_, PthreadDomain, P>::bench_load(b, false);
 }
 #[cfg(feature = "pthread-domain")]
 #[divan::bench(types = [WaitFree, Adaptive, LockFree])]
 fn hazarc_load_pthread_unsafe<P: LoadPolicy>(b: Bencher) {
     unsafe { UnsafePthreadDomain::init_thread_local() };
-    AtomicArc::<_, UnsafePthreadDomain, P>::bench_load(b, false)
+    AtomicArc::<_, UnsafePthreadDomain, P>::bench_load(b, false);
 }
 #[divan::bench(types = [WaitFree, Adaptive, LockFree])]
 fn hazarc_load_spin<P: LoadPolicy>(b: Bencher) {
-    LoadSpin::<AtomicArc<_, DefaultDomain, P>>::bench_load(b, false)
+    LoadSpin::<AtomicArc<_, DefaultDomain, P>>::bench_load(b, false);
 }
 #[divan::bench(types = [WaitFree, Adaptive, LockFree])]
 fn hazarc_load_no_slot<P: LoadPolicy>(b: Bencher) {
-    AtomicArc::<_, DefaultDomain, P>::bench_load_no_slot(b)
+    AtomicArc::<_, DefaultDomain, P>::bench_load_no_slot(b);
 }
 #[divan::bench(types = [WaitFree, Adaptive, LockFree])]
 fn hazarc_load_no_slot_spin<P: LoadPolicy>(b: Bencher) {
-    LoadSpin::<AtomicArc<_, DefaultDomain, P>>::bench_load_no_slot(b)
+    LoadSpin::<AtomicArc<_, DefaultDomain, P>>::bench_load_no_slot(b);
 }
 #[divan::bench(types = [WaitFree, Adaptive, LockFree])]
 fn hazarc_load_none<P: LoadPolicy>(b: Bencher) {
-    AtomicOptionArc::<_, DefaultDomain, P>::bench_load(b, false)
+    AtomicOptionArc::<_, DefaultDomain, P>::bench_load(b, false);
 }
 #[divan::bench(types = [WaitFree, Adaptive, LockFree])]
 fn hazarc_load_contended<P: LoadPolicy>(b: Bencher) {
-    AtomicArc::<_, DefaultDomain, P>::bench_load_contended(b, false)
+    AtomicArc::<_, DefaultDomain, P>::bench_load_contended(b, false);
 }
 #[divan::bench(types = [WaitFree, Adaptive, LockFree], args = [0, 1, 2, 4, 8, 16])]
 fn hazarc_store<P: LoadPolicy>(b: Bencher, threads: usize) {
@@ -274,44 +274,44 @@ fn hazarc_store<P: LoadPolicy>(b: Bencher, threads: usize) {
 }
 #[divan::bench(types = [WaitFree, Adaptive, LockFree], args = [0, 1, 2, 4, 8, 16])]
 fn hazarc_store_contended<P: LoadPolicy>(b: Bencher, threads: usize) {
-    AtomicArc::<_, DefaultDomain, P>::bench_store_contended(b, threads)
+    AtomicArc::<_, DefaultDomain, P>::bench_store_contended(b, threads);
 }
 
 #[divan::bench(threads = [0, 1, 2, 4, 8, 16])]
 fn rwlock_read(b: Bencher) {
-    RwLock::bench_load(b, true)
+    RwLock::bench_load(b, true);
 }
 #[divan::bench(threads = [0, 1, 2, 4, 8, 16])]
 fn rwlock_read_spin(b: Bencher) {
-    LoadSpin::<RwLock<_>>::bench_load(b, true)
+    LoadSpin::<RwLock<_>>::bench_load(b, true);
 }
 #[divan::bench(threads = [0, 1, 2, 4, 8, 16])]
 fn rwlock_read_clone(b: Bencher) {
-    RwLockClone::bench_load(b, true)
+    RwLockClone::bench_load(b, true);
 }
 #[divan::bench(threads = [0, 1, 2, 4, 8, 16])]
 fn rwlock_read_clone_spin(b: Bencher) {
-    LoadSpin::<RwLockClone<_>>::bench_load(b, true)
+    LoadSpin::<RwLockClone<_>>::bench_load(b, true);
 }
 #[divan::bench(threads = [0, 1, 2, 4, 8, 16])]
 fn rwlock_read_contended(b: Bencher) {
-    RwLock::bench_load_contended(b, true)
+    RwLock::bench_load_contended(b, true);
 }
 #[divan::bench(threads = [0, 1, 2, 4, 8, 16])]
 fn rwlock_read_contended_clone(b: Bencher) {
-    RwLockClone::bench_load_contended(b, true)
+    RwLockClone::bench_load_contended(b, true);
 }
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
 fn rwlock_write(b: Bencher, threads: usize) {
-    RwLock::bench_store(b, threads)
+    RwLock::bench_store(b, threads);
 }
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
 fn rwlock_write_contended(b: Bencher, threads: usize) {
-    RwLock::bench_store_contended(b, threads)
+    RwLock::bench_store_contended(b, threads);
 }
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
 fn rwlock_write_contended_clone(b: Bencher, threads: usize) {
-    RwLockClone::bench_store_contended(b, threads)
+    RwLockClone::bench_store_contended(b, threads);
 }
 
 fn main() {

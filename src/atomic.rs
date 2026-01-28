@@ -278,7 +278,7 @@ impl<A: ArcPtr, D: Domain, P: LoadPolicy> AtomicArcPtr<A, D, P> {
             } else if ptr.addr() == old_ptr.addr() | CONFIRM_CLONE_FLAG {
                 transfer_ownership::<A>(old_ptr, || {
                     clone_slot.compare_exchange(ptr, NULL, SeqCst, Relaxed)
-                })
+                });
             }
         }
         self.ptr.finish_write(old_ptr);
@@ -444,7 +444,7 @@ impl<A: ArcPtr> Drop for ArcPtrBorrow<A> {
             #[cold]
             #[inline(never)]
             fn drop_arc<A>(_: A) {}
-            drop_arc(unsafe { ManuallyDrop::take(&mut self.arc) })
+            drop_arc(unsafe { ManuallyDrop::take(&mut self.arc) });
         }
     }
 }

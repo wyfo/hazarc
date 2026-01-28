@@ -26,3 +26,6 @@ required-features = ["default-domain"]
 
 [lints.rust]
 missing_debug_implementations = "forbid"
+
+[lints.clippy]
+semicolon_if_nothing_returned = "forbid"
