@@ -281,7 +281,9 @@ impl<A: ArcPtr, D: Domain, P: LoadPolicy> AtomicArcPtr<A, D, P> {
                 });
             }
         }
-        self.ptr.finish_write(old_ptr);
+        if let Some(new_ptr) = new_ptr {
+            self.ptr.finish_write(new_ptr);
+        }
         old_arc
     }
 
@@ -434,7 +436,8 @@ impl<A: ArcPtr> Drop for ArcPtrBorrow<A> {
     #[inline]
     fn drop(&mut self) {
         let ptr = A::as_ptr(&self.arc);
-        if (self.slot).is_none_or(|b| b.compare_exchange(ptr, NULL, SeqCst, Relaxed).is_err()) {
+        if (self.slot).is_none_or(|slot| slot.compare_exchange(ptr, NULL, SeqCst, SeqCst).is_err())
+        {
             #[cold]
             #[inline(never)]
             fn drop_arc<A>(_: A) {}

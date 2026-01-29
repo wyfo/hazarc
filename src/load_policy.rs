@@ -172,10 +172,10 @@ impl AdaptiveAtomicPtr for FlaggedAtomicPtr {
         .map(FlaggedPtr)
         .map_err(FlaggedPtr)
     }
-    fn finish_write(&self, old: *mut ()) {
+    fn finish_write(&self, new: *mut ()) {
         let ptr = self.0.load(SeqCst);
-        if ptr.addr() == old.addr() | ONGOING_WRITE_FLAG
-            && let Err(ptr) = self.0.compare_exchange(ptr, old, SeqCst, Relaxed)
+        if ptr.addr() == new.addr() | ONGOING_WRITE_FLAG
+            && let Err(ptr) = self.0.compare_exchange(ptr, new, SeqCst, Relaxed)
         {
             debug_assert!(ptr.addr() & ONGOING_WRITE_FLAG != 0);
             debug_assert!(ptr.addr() & CONCURRENT_WRITES_FLAG != 0);
