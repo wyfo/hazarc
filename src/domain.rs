@@ -274,7 +274,8 @@ impl Drop for WriterGuard {
 
 #[macro_export]
 macro_rules! domain {
-    ($vis:vis $name:ident($borrow_slot_count:expr)) => {
+    ($(#[$attrs:meta])* $vis:vis $name:ident($borrow_slot_count:expr)) => {
+        $(#[$attrs])*
         #[derive(Debug)]
         $vis struct $name;
         impl $name {
@@ -326,7 +327,8 @@ macro_rules! domain {
 #[cfg(feature = "pthread-domain")]
 #[macro_export]
 macro_rules! pthread_domain {
-    ($vis:vis $name:ident) => {
+    ($(#[$attrs:meta])* $vis:vis $name:ident) => {
+        $(#[$attrs])*
         #[derive(Debug)]
         $vis struct $name;
         impl $name {
@@ -358,7 +360,7 @@ macro_rules! pthread_domain {
             }
         }
     };
-    ($vis:vis $name:ident($borrow_slot_count:expr)) => {
+    ($(#[$attrs:meta])* $vis:vis $name:ident($borrow_slot_count:expr)) => {
         $crate::pthread_domain!($vis $name);
         unsafe impl $crate::domain::Domain for $name {
             $crate::pthread_domain_methods!($name($borrow_slot_count), unsafe { Self::init_thread_local() });

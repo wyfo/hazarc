@@ -13,17 +13,23 @@ pub mod domain;
 pub mod write_policy;
 
 #[cfg(feature = "default-domain")]
-domain!(pub DefaultDomain(8));
+domain! {
+    #[cfg(feature = "default-domain")]
+    /// Default domain with 8 borrow slots.
+    pub DefaultDomain(8)
+}
 #[cfg(feature = "pthread-domain")]
 #[doc(hidden)]
 pub use libc;
 
 #[cfg(feature = "default-domain")]
+#[cfg_attr(docsrs, doc(cfg(all())))]
 pub type AtomicArc<T, D = DefaultDomain, W = write_policy::Concurrent> =
     atomic::AtomicArcPtr<Arc<T>, D, W>;
 #[cfg(not(feature = "default-domain"))]
 pub type AtomicArc<T, D, W = write_policy::Concurrent> = atomic::AtomicArcPtr<Arc<T>, D, W>;
 #[cfg(feature = "default-domain")]
+#[cfg_attr(docsrs, doc(cfg(all())))]
 pub type AtomicOptionArc<T, D = DefaultDomain, W = write_policy::Concurrent> =
     atomic::AtomicOptionArcPtr<Arc<T>, D, W>;
 #[cfg(not(feature = "default-domain"))]
