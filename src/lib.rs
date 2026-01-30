@@ -11,6 +11,8 @@ pub mod atomic;
 pub mod cache;
 pub mod domain;
 mod msrv;
+#[cfg(feature = "serde")]
+mod serde;
 pub mod write_policy;
 
 #[cfg(feature = "default-domain")]
