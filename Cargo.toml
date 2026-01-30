@@ -3,6 +3,11 @@ name = "hazarc"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/wyfo/hazarc"
+readme = "README.md"
+keywords = ["atomic", "arc", "cache", "no_std"]
+categories = ["concurrency", "data-structures", "memory-management", "caching", "no-std"]
+description = "Wait-free AtomicArc"
 
 [features]
 default = ["default-domain"]
