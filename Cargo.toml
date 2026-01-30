@@ -26,6 +26,7 @@ required-features = ["default-domain"]
 
 [lints.rust]
 missing_debug_implementations = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hazarc_force_active_writer_count_64bit)'] }
 
 [lints.clippy]
 semicolon_if_nothing_returned = "forbid"

@@ -9,7 +9,7 @@ use core::{
     ptr::NonNull,
     slice,
     sync::atomic::{
-        AtomicBool, AtomicPtr,
+        AtomicPtr, AtomicUsize,
         Ordering::{Acquire, Relaxed, SeqCst},
     },
 };
@@ -18,6 +18,9 @@ use crossbeam_utils::CachePadded;
 
 use crate::NULL;
 
+const IN_USE: usize = 1;
+const WRITER_SHIFT: usize = 1;
+
 macro_rules! node_field {
     ($node:ident.$field:ident) => {
         unsafe { &(*$node.as_ptr()).$field }
@@ -25,7 +28,7 @@ macro_rules! node_field {
 }
 
 #[allow(clippy::missing_safety_doc)]
-pub unsafe trait Domain: 'static + Send + Sync {
+pub unsafe trait Domain: Send + Sync + 'static {
     fn static_list() -> &'static BorrowList;
     fn thread_local_node() -> BorrowNodeRef;
     fn reset_thread_local_node();
@@ -110,16 +113,18 @@ pub(crate) type BorrowSlot = AtomicPtr<()>;
 pub(crate) struct BorrowNode {
     _align: CachePadded<()>,
     next: AtomicPtr<BorrowNode>,
-    in_use: AtomicBool,
+    in_use: AtomicUsize,
     clone_slot: AtomicPtr<()>,
+    atomic_arc_slot: AtomicPtr<()>,
+    clone_generation: Cell<usize>,
     next_borrow_slot_idx: Cell<usize>,
     borrow_slot_idx_mask: usize,
     borrow_slots: [BorrowSlot; 0],
 }
 
-// SAFETY: `next_slot` access is synchronized with `inserted`
+// SAFETY: `next_slot` and `clone_generation` accesses are synchronized with `in_use`
 unsafe impl Send for BorrowNode {}
-// SAFETY: `next_slot` access is synchronized with `inserted`
+// SAFETY: `next_slot` and `clone_generation` accesses are synchronized with `in_use`
 unsafe impl Sync for BorrowNode {}
 
 #[derive(Clone, Copy)]
@@ -160,14 +165,14 @@ impl BorrowNodeRef {
         let mut node =
             BorrowNodeRef(NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout)));
         unsafe { node.0.as_mut() }.borrow_slot_idx_mask = borrow_slot_count - 1;
-        *unsafe { node.0.as_mut() }.in_use.get_mut() = true;
+        *unsafe { node.0.as_mut() }.in_use.get_mut() = IN_USE;
         node
     }
 
     unsafe fn deallocate(self) {
         // load `self.in_use` to avoid data race
         let in_use = node_field!(self.in_use).load(SeqCst);
-        debug_assert!(!in_use);
+        debug_assert_eq!(in_use, 0);
         debug_assert!((self.borrow_slots().iter()).all(|s| s.load(Relaxed).is_null()));
         debug_assert!(self.clone_slot().load(Relaxed).is_null());
         let layout = Self::layout(self.borrow_slots().len());
@@ -175,13 +180,35 @@ impl BorrowNodeRef {
     }
 
     fn try_acquire(self) -> bool {
-        // Acquire load for `next_slot` synchronization
-        !node_field!(self.in_use).load(Relaxed) && !node_field!(self.in_use).swap(true, Acquire)
+        node_field!(self.in_use).load(Relaxed) == 0
+            && node_field!(self.in_use)
+                // Acquire load for `next_slot` synchronization
+                .compare_exchange(0, IN_USE, SeqCst, Relaxed)
+                .is_ok()
     }
 
     unsafe fn release(self) {
         // Release store for `next_slot` synchronization + SeqCst for `deallocate` synchronization
-        node_field!(self.in_use).store(false, SeqCst);
+        node_field!(self.in_use).fetch_and(!IN_USE, SeqCst);
+    }
+
+    #[cfg(any(
+        not(target_pointer_width = "64"),
+        hazarc_force_active_writer_count_64bit
+    ))]
+    pub(crate) fn writer_guard(self) -> WriterGuard {
+        let in_use = node_field!(self.in_use).fetch_add(1 << WRITER_SHIFT, SeqCst);
+        if in_use >= usize::MAX / 2 {
+            struct PanicInDrop;
+            impl Drop for PanicInDrop {
+                fn drop(&mut self) {
+                    panic!("panic in drop");
+                }
+            }
+            let _guard = PanicInDrop;
+            panic!("too many concurrent writers; abort");
+        }
+        WriterGuard(self)
     }
 
     fn as_ptr(self) -> *mut BorrowNode {
@@ -206,15 +233,42 @@ impl BorrowNodeRef {
     pub(crate) fn clone_slot(self) -> &'static AtomicPtr<()> {
         node_field!(self.clone_slot)
     }
+
+    pub(crate) fn atomic_arc_slot(self) -> &'static AtomicPtr<()> {
+        node_field!(self.atomic_arc_slot)
+    }
+
+    pub(crate) fn clone_generation(self) -> &'static Cell<usize> {
+        node_field!(self.clone_generation)
+    }
 }
 
 impl fmt::Debug for BorrowNodeRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let in_use = node_field!(self.in_use).load(Relaxed);
         f.debug_struct("BorrowNodeRef")
-            .field("in_use", node_field!(self.in_use))
+            .field("in_use", &(in_use & IN_USE == IN_USE))
+            .field("active_writers", &(in_use >> WRITER_SHIFT))
             .field("borrow_slots", &self.borrow_slots())
             .field("clone_slot", node_field!(self.clone_slot))
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(
+    not(target_pointer_width = "64"),
+    hazarc_force_active_writer_count_64bit
+))]
+pub(crate) struct WriterGuard(BorrowNodeRef);
+
+#[cfg(any(
+    not(target_pointer_width = "64"),
+    hazarc_force_active_writer_count_64bit
+))]
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        let node = self.0;
+        node_field!(node.in_use).fetch_sub(1 << WRITER_SHIFT, SeqCst);
     }
 }
 

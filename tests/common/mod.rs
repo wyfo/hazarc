@@ -5,19 +5,21 @@ use std::{
 
 use hazarc::{ArcBorrow, AtomicArc, AtomicOptionArc, domain};
 
-struct SpinBarrier(AtomicUsize);
+use super::WritePolicy;
+
+pub(crate) struct SpinBarrier(AtomicUsize);
 
 impl SpinBarrier {
-    fn new(n: usize) -> Self {
+    pub(crate) fn new(n: usize) -> Self {
         Self(AtomicUsize::new(n))
     }
 
-    fn wait(&self) {
+    pub(crate) fn wait(&self) {
         self.0.fetch_sub(1, Relaxed);
         while self.0.load(Relaxed) != 0 {}
     }
 
-    fn wrap<R: Send>(&self, f: impl FnOnce() -> R + Send) -> impl FnOnce() -> R + Send {
+    pub(crate) fn wrap<R: Send>(&self, f: impl FnOnce() -> R + Send) -> impl FnOnce() -> R + Send {
         || {
             self.wait();
             f()
@@ -30,7 +32,7 @@ fn concurrent_reads() {
     domain!(TestDomain(1));
     let barrier = SpinBarrier::new(3);
     let check_borrow = |b: &_| assert!([0, 1, 2].contains(b));
-    let atomic_arc = AtomicArc::<usize, TestDomain>::from(0);
+    let atomic_arc = AtomicArc::<usize, TestDomain, WritePolicy>::from(0);
     thread::scope(|s| {
         s.spawn(barrier.wrap(|| check_borrow(&atomic_arc.load())));
         s.spawn(barrier.wrap(|| check_borrow(&atomic_arc.load())));
@@ -45,7 +47,7 @@ fn concurrent_writes() {
     domain!(TestDomain(1));
     let check_borrow = |b: &_| assert!([0, 1, 2].contains(b));
     let barrier = SpinBarrier::new(3);
-    let atomic_arc = AtomicArc::<usize, TestDomain>::from(0);
+    let atomic_arc = AtomicArc::<usize, TestDomain, WritePolicy>::from(0);
     thread::scope(|s| {
         s.spawn(barrier.wrap(|| {
             let swapped = atomic_arc.swap(1.into());
@@ -70,7 +72,7 @@ fn concurrent_writes_option() {
         assert!([Some(0), Some(1), None].contains(&b.as_ref().map(|b| ***b)));
     };
     let barrier = SpinBarrier::new(3);
-    let atomic_arc = AtomicOptionArc::<usize, TestDomain>::from(0);
+    let atomic_arc = AtomicOptionArc::<usize, TestDomain, WritePolicy>::from(0);
     thread::scope(|s| {
         s.spawn(barrier.wrap(|| {
             let swapped = atomic_arc.swap(Some(1.into()));
@@ -91,7 +93,7 @@ fn concurrent_writes_option() {
 #[test]
 fn drop_atomic_arc_with_active_borrow() {
     domain!(TestDomain(1));
-    let atomic_arc = AtomicArc::<usize, TestDomain>::from(0);
+    let atomic_arc = AtomicArc::<usize, TestDomain, WritePolicy>::from(0);
     let borrow = atomic_arc.load();
     drop(atomic_arc);
     drop(borrow);
@@ -101,41 +103,12 @@ fn drop_atomic_arc_with_active_borrow() {
 fn drop_borrow_in_another_thread() {
     domain!(TestDomain(1));
     let barrier = SpinBarrier::new(2);
-    let atomic_arc = AtomicOptionArc::<usize, TestDomain>::from(0);
+    let atomic_arc = AtomicOptionArc::<usize, TestDomain, WritePolicy>::from(0);
     thread::scope(|s| {
         let thread = s.spawn(barrier.wrap(|| atomic_arc.load()));
         barrier.wait();
         atomic_arc.store(None);
         let borrow = thread.join().unwrap();
         drop(borrow);
-    });
-}
-
-#[test]
-fn fetch_and_add() {
-    domain!(TestDomain(1));
-    let barrier = SpinBarrier::new(2);
-    let atomic_arc = AtomicArc::<usize, TestDomain>::from(0);
-    thread::scope(|s| {
-        s.spawn(barrier.wrap(|| atomic_arc.fetch_update(|i| Some(**i + 1))));
-        s.spawn(barrier.wrap(|| atomic_arc.fetch_update(|i| Some(**i + 1))));
-    });
-    assert_eq!(**atomic_arc.load(), 2);
-}
-
-#[test]
-fn consecutive_loads() {
-    domain!(TestDomain(1));
-    let atomic_arc = AtomicArc::<usize, TestDomain>::from(0);
-    let barrier = SpinBarrier::new(3);
-    thread::scope(|s| {
-        s.spawn(barrier.wrap(|| atomic_arc.store(1.into())));
-        s.spawn(barrier.wrap(|| atomic_arc.store(2.into())));
-        barrier.wait();
-        let a1 = atomic_arc.load();
-        let a2 = atomic_arc.load();
-        if **a1 != **a2 && **a1 != 0 {
-            assert_eq!(**a2, **atomic_arc.load());
-        }
     });
 }
