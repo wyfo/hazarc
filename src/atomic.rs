@@ -240,7 +240,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
                 if W::CONCURRENT {
                     // Reload the arc if it is outdated to avoid non-monotonic loads,
                     // as this swap execution could be late, and a previous load of
-                    // this node's thread could have loaded the value arc of a subsequent load
+                    // this node's thread could have loaded the value arc of a subsequent swap
                     let ptr_checked = self.ptr.load(SeqCst);
                     if ptr_checked != new_ptr {
                         let arc = self.load_impl(ptr_checked).into_owned();
