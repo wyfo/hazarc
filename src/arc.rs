@@ -1,7 +1,9 @@
 use alloc::sync::{Arc, Weak};
 use core::{mem::ManuallyDrop, ops::Deref, pin::Pin, ptr};
 
-use crate::{NULL, atomic::ArcPtrBorrow};
+#[allow(unused_imports)]
+use crate::msrv::StrictProvenance;
+use crate::{atomic::ArcPtrBorrow, NULL};
 
 #[allow(clippy::missing_safety_doc)]
 pub unsafe trait NonNullPtr {}
@@ -63,38 +65,36 @@ unsafe impl<A: ArcPtr + Deref> ArcPtr for Pin<A> {
     }
 }
 
+#[cfg(not(target_pointer_width = "16"))]
 unsafe impl<T> ArcPtr for Arc<T> {
     #[inline(always)]
     unsafe fn from_ptr(ptr: *mut ()) -> Self {
         unsafe { Arc::from_raw(ptr.cast()) }
     }
+    #[allow(unstable_name_collisions)]
     #[inline(always)]
     fn into_ptr(arc: Self) -> *mut () {
-        #[cfg(target_pointer_width = "16")]
-        const {
-            assert!(align_of::<T>() >= 4);
-        }
         Arc::into_raw(arc).cast_mut().cast()
     }
+    #[allow(unstable_name_collisions)]
     #[inline(always)]
     fn as_ptr(arc: &Self) -> *mut () {
         Arc::as_ptr(arc).cast_mut().cast()
     }
 }
 
+#[cfg(not(target_pointer_width = "16"))]
 unsafe impl<T> ArcPtr for Weak<T> {
     #[inline(always)]
     unsafe fn from_ptr(ptr: *mut ()) -> Self {
         unsafe { Weak::from_raw(ptr.cast()) }
     }
+    #[allow(unstable_name_collisions)]
     #[inline(always)]
     fn into_ptr(arc: Self) -> *mut () {
-        #[cfg(target_pointer_width = "16")]
-        const {
-            assert!(align_of::<T>() >= 4);
-        }
         Weak::into_raw(arc).cast_mut().cast()
     }
+    #[allow(unstable_name_collisions)]
     #[inline(always)]
     fn as_ptr(arc: &Self) -> *mut () {
         Weak::as_ptr(arc).cast_mut().cast()

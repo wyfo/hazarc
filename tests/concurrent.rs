@@ -2,7 +2,7 @@ use std::thread;
 
 #[allow(unused_imports)]
 use hazarc::write_policy::Concurrent as WritePolicy;
-use hazarc::{AtomicArc, domain};
+use hazarc::{domain, AtomicArc};
 
 use crate::concurrent::SpinBarrier;
 

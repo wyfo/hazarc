@@ -5,18 +5,20 @@ use core::{
     mem,
     mem::ManuallyDrop,
     ops::Deref,
-    ptr,
     sync::atomic::{
         AtomicPtr,
         Ordering::{Acquire, Relaxed, SeqCst},
     },
 };
 
+#[allow(unused_imports)]
+use crate::msrv::{OptionExt, StrictProvenance};
 use crate::{
-    NULL,
     arc::{ArcPtr, ArcRef, NonNullPtr},
     domain::{BorrowNodeRef, BorrowSlot, Domain},
+    msrv::ptr,
     write_policy::{Concurrent, WritePolicy},
+    NULL,
 };
 
 const PREPARE_CLONE_FLAG: usize = 0b01;
@@ -114,6 +116,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         }
     }
 
+    #[allow(unstable_name_collisions)]
     fn load_clone(&self, node: BorrowNodeRef) -> ArcPtrBorrow<A> {
         let clone_slot = node.clone_slot();
         let self_ptr = ptr::from_ref(&self.ptr).cast_mut().cast();
@@ -193,6 +196,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         self.swap_impl(old_ptr, Some(arc))
     }
 
+    #[allow(unstable_name_collisions)]
     fn swap_impl(&self, old_ptr: *mut (), mut new: Option<A>) -> A {
         fn transfer_ownership<A: ArcPtr>(
             ptr: *mut (),
@@ -259,6 +263,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         old_arc
     }
 
+    #[allow(unstable_name_collisions)]
     fn is_same_atomic_arc(&self, node: BorrowNodeRef, clone_ptr: &mut *mut ()) -> bool {
         let self_ptr = ptr::from_ref(&self.ptr).cast_mut().cast();
         if W::CONCURRENT {

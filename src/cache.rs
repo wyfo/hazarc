@@ -111,7 +111,7 @@ impl<A: AtomicArcRef> From<A> for Cache<A> {
 mod tests {
     use alloc::sync::Arc;
 
-    use crate::{AtomicArc, AtomicOptionArc, Cache, domain};
+    use crate::{domain, AtomicArc, AtomicOptionArc, Cache};
 
     #[test]
     fn cache() {

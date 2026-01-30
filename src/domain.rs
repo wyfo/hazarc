@@ -16,7 +16,7 @@ use core::{
 
 use crossbeam_utils::CachePadded;
 
-use crate::NULL;
+use crate::{msrv::ptr, NULL};
 
 const IN_USE: usize = 1;
 const WRITER_SHIFT: usize = 1;
@@ -51,7 +51,7 @@ impl BorrowList {
         }
     }
 
-    pub(crate) fn nodes(&self) -> impl Iterator<Item = BorrowNodeRef> {
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = BorrowNodeRef> + '_ {
         let mut node_ptr = &self.head;
         iter::from_fn(move || {
             let node = unsafe { BorrowNodeRef::new(node_ptr.load(SeqCst))? };
@@ -136,6 +136,7 @@ unsafe impl Send for BorrowNodeRef {}
 unsafe impl Sync for BorrowNodeRef {}
 
 impl BorrowNodeRef {
+    #[allow(unstable_name_collisions)]
     unsafe fn new(ptr: *const BorrowNode) -> Option<Self> {
         NonNull::new(ptr.cast_mut()).map(Self)
     }
@@ -227,7 +228,7 @@ impl BorrowNodeRef {
     #[inline(always)]
     pub(crate) fn borrow_slots(self) -> &'static [BorrowSlot] {
         let len = node_field!(self.borrow_slot_idx_mask) + 1;
-        unsafe { slice::from_raw_parts(&raw const (*self.as_ptr()).borrow_slots as _, len) }
+        unsafe { slice::from_raw_parts(ptr::addr_of!((*self.as_ptr()).borrow_slots) as _, len) }
     }
 
     pub(crate) fn clone_slot(self) -> &'static AtomicPtr<()> {
@@ -309,14 +310,14 @@ macro_rules! domain {
                         static GUARD: NodeGuard = const { NodeGuard };
                     }
                     let node = <$name as $crate::domain::Domain>::static_list().insert_node($borrow_slot_count);
-                    unsafe { $name::local_key() }.set(Some(node));
+                    unsafe { $name::local_key() }.with(|cell| cell.set(Some(node)));
                     GUARD.with(|_| ());
                     node
                 }
-                unsafe { $name::local_key() }.get().unwrap_or_else(new_node)
+                unsafe { $name::local_key() }.with(::std::cell::Cell::get).unwrap_or_else(new_node)
             }
             fn reset_thread_local_node() {
-                if let Some(node) = unsafe { $name::local_key() }.take() {
+                if let Some(node) = unsafe { $name::local_key() }.with(::std::cell::Cell::take) {
                     unsafe { <$name as $crate::domain::Domain>::static_list().remove_node(node) };
                 }
             }

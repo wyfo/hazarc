@@ -10,6 +10,7 @@ pub mod arc;
 pub mod atomic;
 pub mod cache;
 pub mod domain;
+mod msrv;
 pub mod write_policy;
 
 #[cfg(feature = "default-domain")]

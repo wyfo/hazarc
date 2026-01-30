@@ -3,7 +3,7 @@ use std::{
     thread,
 };
 
-use hazarc::{ArcBorrow, AtomicArc, AtomicOptionArc, domain};
+use hazarc::{domain, ArcBorrow, AtomicArc, AtomicOptionArc};
 
 use super::WritePolicy;
 
@@ -19,7 +19,10 @@ impl SpinBarrier {
         while self.0.load(Relaxed) != 0 {}
     }
 
-    pub(crate) fn wrap<R: Send>(&self, f: impl FnOnce() -> R + Send) -> impl FnOnce() -> R + Send {
+    pub(crate) fn wrap<'a, R: Send>(
+        &'a self,
+        f: impl FnOnce() -> R + Send + 'a,
+    ) -> impl FnOnce() -> R + Send + 'a {
         || {
             self.wait();
             f()

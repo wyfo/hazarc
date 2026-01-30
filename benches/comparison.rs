@@ -2,15 +2,15 @@ use std::{
     array, hint,
     hint::black_box,
     sync::{
-        Arc, Barrier, RwLock, RwLockReadGuard,
         atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
+        Arc, Barrier, RwLock, RwLockReadGuard,
     },
     thread,
 };
 
 use arc_swap::{ArcSwap, ArcSwapOption, Guard};
 use divan::Bencher;
-use hazarc::{ArcBorrow, AtomicArc, AtomicOptionArc, DefaultDomain, domain::Domain};
+use hazarc::{domain::Domain, ArcBorrow, AtomicArc, AtomicOptionArc, DefaultDomain};
 
 trait LoadBench: Default + Send + Sync {
     type Guard<'a>
