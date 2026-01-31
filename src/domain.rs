@@ -29,9 +29,26 @@ macro_rules! node_field {
 
 #[allow(clippy::missing_safety_doc)]
 pub unsafe trait Domain: Send + Sync + 'static {
+    const BORROW_SLOT_COUNT: usize;
     fn static_list() -> &'static BorrowList;
-    fn thread_local_node() -> BorrowNodeRef;
-    fn reset_thread_local_node();
+    fn get_thread_local_node() -> Option<BorrowNodeRef>;
+    fn set_thread_local_node(node: Option<BorrowNodeRef>);
+    fn get_or_insert_thread_local_node() -> BorrowNodeRef {
+        #[cold]
+        #[inline(never)]
+        fn insert_node<D: Domain + ?Sized>() -> BorrowNodeRef {
+            let node = D::static_list().insert_node(D::BORROW_SLOT_COUNT);
+            D::set_thread_local_node(Some(node));
+            node
+        }
+        Self::get_thread_local_node().unwrap_or_else(insert_node::<Self>)
+    }
+    fn reset_thread_local_node() {
+        if let Some(node) = Self::get_thread_local_node() {
+            Self::set_thread_local_node(None);
+            unsafe { Self::static_list().remove_node(node) };
+        }
+    }
 }
 
 pub struct BorrowList {
@@ -122,18 +139,8 @@ pub(crate) struct BorrowNode {
     borrow_slots: [BorrowSlot; 0],
 }
 
-// SAFETY: `next_slot` and `clone_generation` accesses are synchronized with `in_use`
-unsafe impl Send for BorrowNode {}
-// SAFETY: `next_slot` and `clone_generation` accesses are synchronized with `in_use`
-unsafe impl Sync for BorrowNode {}
-
 #[derive(Clone, Copy)]
 pub struct BorrowNodeRef(NonNull<BorrowNode>);
-
-// SAFETY: `NodeRef` is equivalent to `&'static Node`
-unsafe impl Send for BorrowNodeRef {}
-// SAFETY: `NodeRef` is equivalent to `&'static Node`
-unsafe impl Sync for BorrowNodeRef {}
 
 impl BorrowNodeRef {
     #[allow(unstable_name_collisions)]
@@ -282,7 +289,7 @@ macro_rules! domain {
         impl $name {
             #[doc(hidden)]
             #[inline(always)]
-            unsafe fn local_key() -> &'static ::std::thread::LocalKey<::std::cell::Cell<::std::option::Option<$crate::domain::BorrowNodeRef>>> {
+            fn local_key() -> &'static ::std::thread::LocalKey<::std::cell::Cell<::std::option::Option<$crate::domain::BorrowNodeRef>>> {
                 ::std::thread_local! {
                     static LOCAL: ::std::cell::Cell<::std::option::Option<$crate::domain::BorrowNodeRef>> = const { ::std::cell::Cell::new(None) };
                 }
@@ -290,36 +297,28 @@ macro_rules! domain {
             }
         }
         unsafe impl $crate::domain::Domain for $name {
+            const BORROW_SLOT_COUNT: usize = $borrow_slot_count;
             #[inline(always)]
             fn static_list() -> &'static $crate::domain::BorrowList {
                 static LIST: $crate::domain::BorrowList = $crate::domain::BorrowList::new();
                 &LIST
             }
             #[inline(always)]
-            fn thread_local_node() -> $crate::domain::BorrowNodeRef {
-                #[cold]
-                #[inline(never)]
-                fn new_node() -> $crate::domain::BorrowNodeRef {
-                    struct NodeGuard;
-                    impl Drop for NodeGuard {
-                        fn drop(&mut self) {
-                            <$name as $crate::domain::Domain>::reset_thread_local_node();
-                        }
-                    }
-                    ::std::thread_local! {
-                        static GUARD: NodeGuard = const { NodeGuard };
-                    }
-                    let node = <$name as $crate::domain::Domain>::static_list().insert_node($borrow_slot_count);
-                    unsafe { $name::local_key() }.with(|cell| cell.set(Some(node)));
-                    GUARD.with(|_| ());
-                    node
-                }
-                unsafe { $name::local_key() }.with(::std::cell::Cell::get).unwrap_or_else(new_node)
+            fn get_thread_local_node() -> ::std::option::Option<$crate::domain::BorrowNodeRef> {
+                $name::local_key().with(::std::cell::Cell::get)
             }
-            fn reset_thread_local_node() {
-                if let Some(node) = unsafe { $name::local_key() }.with(::std::cell::Cell::take) {
-                    unsafe { <$name as $crate::domain::Domain>::static_list().remove_node(node) };
+            fn set_thread_local_node(node: Option<$crate::domain::BorrowNodeRef>) {
+                struct NodeGuard;
+                impl Drop for NodeGuard {
+                    fn drop(&mut self) {
+                        <$name as $crate::domain::Domain>::reset_thread_local_node();
+                    }
                 }
+                ::std::thread_local! {
+                    static GUARD: NodeGuard = const { NodeGuard };
+                }
+                $name::local_key().with(|cell| cell.set(node));
+                GUARD.try_with(|_| ()).ok();
             }
         }
     };
@@ -335,23 +334,18 @@ macro_rules! pthread_domain {
         impl $name {
             #[doc(hidden)]
             #[inline(always)]
-            pub fn key() -> *mut $crate::libc::pthread_key_t {
+            fn key() -> *mut $crate::libc::pthread_key_t {
                 static mut KEY: ::core::mem::MaybeUninit<$crate::libc::pthread_key_t> = core::mem::MaybeUninit::uninit();
                 (&raw mut KEY).cast()
-            }
-            #[doc(hidden)]
-            pub unsafe fn remove_node(ptr: *mut $crate::libc::c_void) {
-                if let Some(ptr) = ::core::ptr::NonNull::new(ptr) {
-                    let node = unsafe { $crate::domain::BorrowNodeRef::from_raw(ptr.cast()) };
-                    unsafe { <$name as $crate::domain::Domain>::static_list().remove_node(node) };
-                    unsafe { $crate::libc::pthread_setspecific(*$name::key(), ::core::ptr::null()) };
-                }
             }
             #[inline]
             pub unsafe fn init_thread_local() {
                 unsafe extern "C" fn make_key() {
                     unsafe extern "C" fn remove_node(ptr: *mut $crate::libc::c_void) {
-                        unsafe { $name::remove_node(ptr) };
+                        if let Some(ptr) = ::core::ptr::NonNull::new(ptr) {
+                            let node = unsafe { $crate::domain::BorrowNodeRef::from_raw(ptr.cast()) };
+                            unsafe { <$name as $crate::domain::Domain>::static_list().remove_node(node) };
+                        }
                     }
                     unsafe { $crate::libc::pthread_key_create($name::key(), Some(remove_node)) };
                 }
@@ -373,36 +367,28 @@ macro_rules! pthread_domain {
 #[macro_export]
 macro_rules! pthread_domain_methods {
      ($name:ident($borrow_slot_count:expr)$(, $init:expr)?) => {
+         const BORROW_SLOT_COUNT: usize = $borrow_slot_count;
          #[inline(always)]
          fn static_list() -> &'static $crate::domain::BorrowList {
              static LIST: $crate::domain::BorrowList = $crate::domain::BorrowList::new();
              &LIST
          }
          #[inline(always)]
-         fn thread_local_node() -> $crate::domain::BorrowNodeRef {
-             #[cold]
-             #[inline(never)]
-             fn new_node() -> $crate::domain::BorrowNodeRef {
-                 let node = <$name as $crate::domain::Domain>::static_list().insert_node ($borrow_slot_count);
-                 unsafe { $crate::libc::pthread_setspecific(*$name::key(), node.into_raw().as_ptr().cast()) };
-                 node
-             }
+         fn get_thread_local_node() -> ::core::option::Option<$crate::domain::BorrowNodeRef> {
              $($init;)?
-             match unsafe { ::core::ptr::NonNull::new($crate::libc::pthread_getspecific(*Self::key())) } {
-                 Some(ptr) => unsafe { $crate::domain::BorrowNodeRef::from_raw(ptr.cast()) },
-                 None => new_node()
-             }
+             let ptr = unsafe { ::core::ptr::NonNull::new($crate::libc::pthread_getspecific(*Self::key())) }?;
+             Some(unsafe { $crate::domain::BorrowNodeRef::from_raw(ptr.cast()) })
          }
-         fn reset_thread_local_node() {
-             $($init;)?
-             unsafe { $name::remove_node($crate::libc::pthread_getspecific(*Self::key())) };
+         fn set_thread_local_node(node: Option<$crate::domain::BorrowNodeRef>) {
+             let node_ptr = node.map_or(::core::ptr::null(), |n| n.into_raw().as_ptr().cast());
+             unsafe { $crate::libc::pthread_setspecific(*$name::key(), node_ptr) };
          }
     };
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::{BorrowNodeRef, Domain};
+    use crate::domain::Domain;
 
     #[test]
     fn node_reuse() {
@@ -411,13 +397,13 @@ mod tests {
         #[cfg(not(feature = "pthread-domain"))]
         domain!(TestDomain(2));
         let thread = std::thread::spawn(|| {
-            let node = TestDomain::thread_local_node();
+            let node = TestDomain::get_or_insert_thread_local_node();
             node.set_next_borrow_slot_idx(1);
-            node
+            node.into_raw().addr()
         });
-        let node1 = thread.join().unwrap();
-        let node2 = TestDomain::thread_local_node();
-        assert_eq!(node1.as_ptr(), node2.as_ptr());
+        let node1_addr = thread.join().unwrap();
+        let node2 = TestDomain::get_or_insert_thread_local_node();
+        assert_eq!(node1_addr, node2.into_raw().addr());
         assert_eq!(node2.next_borrow_slot_idx(), 1);
     }
 
@@ -427,14 +413,14 @@ mod tests {
         pthread_domain!(TestDomain(2));
         #[cfg(not(feature = "pthread-domain"))]
         domain!(TestDomain(2));
+        let node_addr = || (TestDomain::get_or_insert_thread_local_node().into_raw()).addr();
         std::thread::scope(|s| {
-            let node1 = s.spawn(TestDomain::thread_local_node).join().unwrap();
-            let thread2 = s.spawn(TestDomain::thread_local_node);
-            let thread3 = s.spawn(TestDomain::thread_local_node);
+            let node1 = s.spawn(node_addr).join().unwrap();
+            let thread2 = s.spawn(node_addr);
+            let thread3 = s.spawn(node_addr);
             let node2 = thread2.join().unwrap();
             let node3 = thread3.join().unwrap();
-            let ptr = |n| unsafe { core::mem::transmute::<BorrowNodeRef, *mut ()>(n) };
-            assert!(ptr(node1) == ptr(node2) || ptr(node1) == ptr(node3));
+            assert!(node1 == node2 || node1 == node3);
         });
     }
 
@@ -447,13 +433,13 @@ mod tests {
         let barrier = std::sync::Barrier::new(2);
         std::thread::scope(|s| {
             s.spawn(|| {
-                TestDomain::thread_local_node();
+                TestDomain::get_or_insert_thread_local_node();
                 barrier.wait();
                 // It seems TLS can be destroyed after the thread has been joined...
                 TestDomain::reset_thread_local_node();
             });
             s.spawn(|| {
-                TestDomain::thread_local_node();
+                TestDomain::get_or_insert_thread_local_node();
                 barrier.wait();
                 TestDomain::reset_thread_local_node();
             });
