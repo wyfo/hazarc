@@ -21,9 +21,10 @@ use crate::{
     NULL,
 };
 
-const INIT_CLONE_FLAG: usize = 1;
-const GENERATION_INCR: usize = INIT_CLONE_FLAG + 1;
-const MAX_GENERATION: usize = !INIT_CLONE_FLAG;
+const PREPARE_CLONE_FLAG: usize = 0b01;
+const CONFIRM_CLONE_FLAG: usize = 0b10;
+const GENERATION_INCR: usize = PREPARE_CLONE_FLAG + 1;
+const MAX_GENERATION: usize = !PREPARE_CLONE_FLAG;
 
 pub struct AtomicArcPtr<A: ArcPtr, D: Domain, W: WritePolicy> {
     ptr: AtomicPtr<()>,
@@ -119,7 +120,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     fn load_clone(&self, node: BorrowNodeRef) -> ArcPtrBorrow<A> {
         let clone_slot = node.clone_slot();
         let self_ptr = ptr::from_ref(&self.ptr).cast_mut().cast();
-        let init_clone_ptr = if W::CONCURRENT {
+        let prepare_ptr = if W::CONCURRENT {
             node.atomic_arc_slot().store(self_ptr, Relaxed);
             let generation = node.clone_generation().get();
             node.clone_generation()
@@ -127,26 +128,27 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
             if generation == MAX_GENERATION {
                 D::reset_thread_local_node();
             }
-            ptr::without_provenance_mut(generation | INIT_CLONE_FLAG)
+            ptr::without_provenance_mut(generation | PREPARE_CLONE_FLAG)
         } else {
-            self_ptr.map_addr(|addr| addr | INIT_CLONE_FLAG)
+            self_ptr.map_addr(|addr| addr | PREPARE_CLONE_FLAG)
         };
-        clone_slot.store(init_clone_ptr, SeqCst);
+        clone_slot.store(prepare_ptr, SeqCst);
         let ptr_checked = self.ptr.load(SeqCst);
         if A::NULLABLE && ptr_checked.is_null() {
             let ptr = clone_slot.swap(NULL, SeqCst);
-            if ptr != init_clone_ptr {
+            if ptr != prepare_ptr {
                 unsafe { A::decr_rc(ptr) };
             }
             return ArcPtrBorrow::new(NULL, None);
         }
+        let confirm_ptr = (ptr_checked).map_addr(|addr| addr | CONFIRM_CLONE_FLAG);
         // Failure ordering must be SeqCst for load to have a full SeqCst semantic
-        if let Err(ptr) = clone_slot.compare_exchange(init_clone_ptr, ptr_checked, SeqCst, SeqCst) {
+        if let Err(ptr) = clone_slot.compare_exchange(prepare_ptr, confirm_ptr, SeqCst, SeqCst) {
             clone_slot.store(NULL, SeqCst);
             return ArcPtrBorrow::new(ptr, None);
         }
         unsafe { A::incr_rc(ptr_checked) };
-        if let Err(p) = (node.clone_slot()).compare_exchange(ptr_checked, NULL, SeqCst, Acquire) {
+        if let Err(p) = (node.clone_slot()).compare_exchange(confirm_ptr, NULL, SeqCst, Acquire) {
             debug_assert!(p.is_null());
             unsafe { A::decr_rc(ptr_checked) };
         }
@@ -229,10 +231,10 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
             };
             let clone_slot = node.clone_slot();
             let mut clone_ptr = clone_slot.load(SeqCst);
-            if clone_ptr.is_null() {
+            if clone_ptr.addr() & (PREPARE_CLONE_FLAG | CONFIRM_CLONE_FLAG) == 0 {
                 continue;
             }
-            if clone_ptr.addr() & INIT_CLONE_FLAG != 0
+            if clone_ptr.addr() & PREPARE_CLONE_FLAG != 0
                 && self.is_same_atomic_arc(node, &mut clone_ptr)
             {
                 if W::CONCURRENT {
@@ -252,7 +254,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
                     clone_ptr = p;
                 }
             }
-            if clone_ptr.addr() == old_ptr.addr() {
+            if clone_ptr.addr() == old_ptr.addr() | CONFIRM_CLONE_FLAG {
                 let _ = transfer_ownership::<A>(old_ptr, || {
                     clone_slot.compare_exchange(clone_ptr, NULL, SeqCst, Relaxed)
                 });
@@ -271,7 +273,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
                 *clone_ptr == prev_clone_ptr
             }
         } else {
-            clone_ptr.addr() == self_ptr.addr() | INIT_CLONE_FLAG
+            clone_ptr.addr() == self_ptr.addr() | PREPARE_CLONE_FLAG
         }
     }
 
