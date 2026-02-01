@@ -61,6 +61,9 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         }
         debug_assert!(!ptr.is_null());
         let node = D::get_or_insert_thread_local_node();
+        if D::BORROW_SLOT_COUNT == 0 {
+            return self.load_clone(node);
+        }
         let slot_idx = node.next_borrow_slot_idx().get();
         let slot = unsafe { node.borrow_slots().get_unchecked(slot_idx) };
         if slot.load(Relaxed).is_null() {
