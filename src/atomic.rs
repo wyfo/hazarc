@@ -85,7 +85,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         slot.store(ptr, SeqCst);
         let ptr_checked = self.ptr.load(SeqCst);
         if ptr != ptr_checked {
-            return self.load_outdated(node, ptr, ptr_checked, slot);
+            return self.load_outdated(ptr, node, ptr_checked, slot);
         }
         if D::BORROW_SLOT_COUNT > 1 {
             // The assertion is already known by compiler in `load_impl` with `get_unchecked`,
@@ -103,6 +103,9 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     #[cold]
     #[inline(never)]
     fn load_find_available_slot(&self, ptr: *mut (), node: BorrowNodeRef<D>) -> ArcPtrBorrow<A> {
+        if D::BORROW_SLOT_COUNT == 1 {
+            return self.load_clone(node);
+        }
         match (node.borrow_slots().iter().enumerate())
             .find(|(_, slot)| slot.load(Relaxed).is_null())
         {
@@ -115,8 +118,8 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     #[inline(never)]
     fn load_outdated(
         &self,
-        node: BorrowNodeRef<D>,
         ptr: *mut (),
+        node: BorrowNodeRef<D>,
         ptr_checked: *mut (),
         slot: &'static BorrowSlot,
     ) -> ArcPtrBorrow<A> {
