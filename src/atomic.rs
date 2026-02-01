@@ -61,10 +61,11 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         }
         debug_assert!(!ptr.is_null());
         let node = D::get_or_insert_thread_local_node();
-        if D::BORROW_SLOT_COUNT == 0 {
-            return self.load_clone(node);
-        }
-        let slot_idx = node.next_borrow_slot_idx().get();
+        let slot_idx = match D::BORROW_SLOT_COUNT {
+            0 => return self.load_clone(node),
+            1 => 0,
+            _ => node.next_borrow_slot_idx().get(),
+        };
         let slot = unsafe { node.borrow_slots().get_unchecked(slot_idx) };
         if slot.load(Relaxed).is_null() {
             self.load_with_slot(ptr, node, slot, slot_idx)
@@ -86,14 +87,16 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         if ptr != ptr_checked {
             return self.load_outdated(node, ptr, ptr_checked, slot);
         }
-        // The assertion is already known by compiler in `load_impl` with `get_unchecked`,
-        // but it has to be repeated here to be taken in account for the modulo when borrow
-        // slot count is not a multiple of 2
-        if slot_idx >= D::BORROW_SLOT_COUNT {
-            unsafe { hint::unreachable_unchecked() };
+        if D::BORROW_SLOT_COUNT > 1 {
+            // The assertion is already known by compiler in `load_impl` with `get_unchecked`,
+            // but it has to be repeated here to be taken in account for the modulo when borrow
+            // slot count is not a multiple of 2
+            if slot_idx >= D::BORROW_SLOT_COUNT {
+                unsafe { hint::unreachable_unchecked() }; // MSRV 1.81
+            }
+            node.next_borrow_slot_idx()
+                .set((slot_idx + 1) % D::BORROW_SLOT_COUNT);
         }
-        node.next_borrow_slot_idx()
-            .set((slot_idx + 1) % D::BORROW_SLOT_COUNT);
         ArcPtrBorrow::new(ptr_checked, Some(slot))
     }
 
