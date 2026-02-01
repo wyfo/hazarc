@@ -115,3 +115,22 @@ fn drop_borrow_in_another_thread() {
         drop(borrow);
     });
 }
+
+#[test]
+fn seq_cst_ordering() {
+    domain!(TestDomain(1));
+    let barrier = SpinBarrier::new(2);
+    let x = AtomicOptionArc::<(), TestDomain, WritePolicy>::new(None);
+    let y = AtomicOptionArc::<(), TestDomain, WritePolicy>::new(None);
+    thread::scope(|s| {
+        let a = s.spawn(barrier.wrap(|| {
+            x.store(Some(().into()));
+            y.load()
+        }));
+        let b = s.spawn(barrier.wrap(|| {
+            y.store(Some(().into()));
+            x.load()
+        }));
+        assert!(a.join().unwrap().is_some() || b.join().unwrap().is_some());
+    });
+}

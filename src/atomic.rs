@@ -44,9 +44,14 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         }
     }
 
+    #[inline(always)]
+    fn first_load(&self) -> *mut () {
+        self.ptr.load(if A::NULLABLE { SeqCst } else { Relaxed })
+    }
+
     #[inline]
     pub fn load(&self) -> ArcPtrBorrow<A> {
-        self.load_impl(self.ptr.load(Relaxed))
+        self.load_impl(self.first_load())
     }
 
     #[inline(always)]
@@ -174,7 +179,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
 
     #[inline]
     pub fn load_if_outdated<'a>(&self, arc: &'a A) -> Result<&'a A, ArcPtrBorrow<A>> {
-        let ptr = self.ptr.load(Relaxed);
+        let ptr = self.first_load();
         if ptr == A::as_ptr(arc) {
             Ok(arc)
         } else {
@@ -190,7 +195,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
 
     #[inline]
     pub fn load_cached<'a>(&self, cached: &'a mut A) -> &'a A {
-        let ptr = self.ptr.load(Relaxed);
+        let ptr = self.first_load();
         if ptr != A::as_ptr(cached) {
             self.reload_cache(ptr, cached);
         }
@@ -348,7 +353,7 @@ impl<A: ArcPtr + NonNullPtr, D: Domain, W: WritePolicy> AtomicArcPtr<Option<A>, 
 
     #[inline]
     pub fn is_none(&self) -> bool {
-        self.ptr.load(Relaxed).is_null()
+        self.ptr.load(SeqCst).is_null()
     }
 }
 
