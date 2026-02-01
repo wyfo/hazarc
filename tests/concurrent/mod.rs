@@ -1,17 +1,12 @@
 use std::thread;
 
-#[allow(unused_imports)]
-use hazarc::write_policy::Concurrent as WritePolicy;
 use hazarc::{domain, AtomicArc};
 
-use crate::concurrent::SpinBarrier;
-
-#[path = "common/mod.rs"]
-mod concurrent;
+use super::{common::SpinBarrier, WritePolicy, SLOTS};
 
 #[test]
 fn fetch_and_add() {
-    domain!(TestDomain(1));
+    domain!(TestDomain(SLOTS));
     let barrier = SpinBarrier::new(2);
     let atomic_arc = AtomicArc::<usize, TestDomain, WritePolicy>::from(0);
     thread::scope(|s| {
@@ -23,7 +18,7 @@ fn fetch_and_add() {
 
 #[test]
 fn consecutive_loads() {
-    domain!(TestDomain(1));
+    domain!(TestDomain(SLOTS));
     let atomic_arc = AtomicArc::<usize, TestDomain, WritePolicy>::from(0);
     let barrier = SpinBarrier::new(3);
     thread::scope(|s| {

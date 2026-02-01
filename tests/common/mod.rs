@@ -5,7 +5,7 @@ use std::{
 
 use hazarc::{domain, ArcBorrow, AtomicArc, AtomicOptionArc};
 
-use super::WritePolicy;
+use super::{WritePolicy, SLOTS};
 
 pub(crate) struct SpinBarrier(AtomicUsize);
 
@@ -32,7 +32,7 @@ impl SpinBarrier {
 
 #[test]
 fn concurrent_reads() {
-    domain!(TestDomain(1));
+    domain!(TestDomain(SLOTS));
     let barrier = SpinBarrier::new(3);
     let check_borrow = |b: &_| assert!([0, 1, 2].contains(b));
     let atomic_arc = AtomicArc::<usize, TestDomain, WritePolicy>::from(0);
@@ -47,7 +47,7 @@ fn concurrent_reads() {
 
 #[test]
 fn concurrent_writes() {
-    domain!(TestDomain(1));
+    domain!(TestDomain(SLOTS));
     let check_borrow = |b: &_| assert!([0, 1, 2].contains(b));
     let barrier = SpinBarrier::new(3);
     let atomic_arc = AtomicArc::<usize, TestDomain, WritePolicy>::from(0);
@@ -70,7 +70,7 @@ fn concurrent_writes() {
 
 #[test]
 fn concurrent_writes_option() {
-    domain!(TestDomain(1));
+    domain!(TestDomain(SLOTS));
     let check_borrow = |b: &Option<ArcBorrow<_>>| {
         assert!([Some(0), Some(1), None].contains(&b.as_ref().map(|b| ***b)));
     };
@@ -95,7 +95,7 @@ fn concurrent_writes_option() {
 
 #[test]
 fn drop_atomic_arc_with_active_borrow() {
-    domain!(TestDomain(1));
+    domain!(TestDomain(SLOTS));
     let atomic_arc = AtomicArc::<usize, TestDomain, WritePolicy>::from(0);
     let borrow = atomic_arc.load();
     drop(atomic_arc);
@@ -104,7 +104,7 @@ fn drop_atomic_arc_with_active_borrow() {
 
 #[test]
 fn drop_borrow_in_another_thread() {
-    domain!(TestDomain(1));
+    domain!(TestDomain(SLOTS));
     let barrier = SpinBarrier::new(2);
     let atomic_arc = AtomicOptionArc::<usize, TestDomain, WritePolicy>::from(0);
     thread::scope(|s| {
@@ -118,7 +118,7 @@ fn drop_borrow_in_another_thread() {
 
 #[test]
 fn seq_cst_ordering() {
-    domain!(TestDomain(1));
+    domain!(TestDomain(SLOTS));
     let barrier = SpinBarrier::new(2);
     let x = AtomicOptionArc::<(), TestDomain, WritePolicy>::new(None);
     let y = AtomicOptionArc::<(), TestDomain, WritePolicy>::new(None);
