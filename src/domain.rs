@@ -90,6 +90,29 @@ impl<D: Domain> BorrowList<D> {
         })
     }
 
+    pub fn reserve(&self, node_count: usize) {
+        let mut allocated_node = None;
+        let mut node_ptr = &self.head;
+        for _ in 0..node_count {
+            if let Some(node) = unsafe { BorrowNodeRef::<D>::new(node_ptr.load(Acquire)) } {
+                node_ptr = node_field!(node.next);
+            } else {
+                let new_node =
+                    allocated_node.get_or_insert_with(|| BorrowNodeRef::<D>::allocate(false));
+                match node_ptr.compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Acquire) {
+                    Ok(_) => {
+                        node_ptr = node_field!(new_node.next);
+                        allocated_node.take();
+                    }
+                    Err(n) => node_ptr = unsafe { &(*n).next },
+                }
+            };
+        }
+        if let Some(node) = allocated_node {
+            unsafe { node.deallocate() };
+        }
+    }
+
     pub fn insert_node(&self) -> BorrowNodeRef<D> {
         let mut node_ptr = &self.head;
         // Cannot use `Self::nodes` because the final node pointer is needed for chaining
@@ -99,14 +122,17 @@ impl<D: Domain> BorrowList<D> {
             }
             node_ptr = node_field!(node.next);
         }
-        let new_node = BorrowNodeRef::allocate();
-        while let Err(next) = node_ptr
-            .compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Acquire)
-            .map_err(|err| unsafe { &(*err).next })
+        let new_node = BorrowNodeRef::allocate(true);
+        while let Err(n) =
+            node_ptr.compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Acquire)
         {
-            // No need to check free, because it's highly improbable
-            // that a node is freed just after being added
-            node_ptr = next;
+            let node = unsafe { BorrowNodeRef::new(n) }.unwrap();
+            if node.try_acquire() {
+                unsafe { new_node.release() };
+                unsafe { new_node.deallocate() };
+                return node;
+            }
+            node_ptr = node_field!(node.next);
         }
         new_node
     }
@@ -193,7 +219,7 @@ impl<D: Domain> BorrowNodeRef<D> {
         layout
     }
 
-    fn allocate() -> BorrowNodeRef<D> {
+    fn allocate(in_use: bool) -> BorrowNodeRef<D> {
         let layout = Self::layout();
         // SAFETY: layout has non-zero size
         let ptr = unsafe { alloc_zeroed(layout) }.cast::<BorrowNode>();
@@ -201,7 +227,9 @@ impl<D: Domain> BorrowNodeRef<D> {
             node: NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout)),
             _domain: PhantomData,
         };
-        *unsafe { node.node.as_mut() }.in_use.get_mut() = IN_USE;
+        if in_use {
+            *unsafe { node.node.as_mut() }.in_use.get_mut() = IN_USE;
+        }
         node
     }
 
@@ -441,6 +469,22 @@ mod tests {
             let node2 = thread2.join().unwrap();
             let node3 = thread3.join().unwrap();
             assert!(node1 == node2 || node1 == node3);
+        });
+    }
+
+    #[test]
+    fn reserve() {
+        #[cfg(feature = "pthread-domain")]
+        pthread_domain!(TestDomain(2));
+        #[cfg(not(feature = "pthread-domain"))]
+        domain!(TestDomain(2));
+        std::thread::scope(|s| {
+            let thread = s.spawn(|| {
+                TestDomain::get_or_insert_thread_local_node();
+            });
+            TestDomain::static_list().reserve(4);
+            thread.join().unwrap();
+            assert_eq!(TestDomain::static_list().nodes().count(), 4);
         });
     }
 
