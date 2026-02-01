@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use core::{
-    fmt,
+    fmt, hint,
     marker::PhantomData,
     mem,
     mem::ManuallyDrop,
@@ -56,7 +56,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         }
         debug_assert!(!ptr.is_null());
         let node = D::get_or_insert_thread_local_node();
-        let slot_idx = node.next_borrow_slot_idx();
+        let slot_idx = node.next_borrow_slot_idx().get();
         let slot = unsafe { node.borrow_slots().get_unchecked(slot_idx) };
         if slot.load(Relaxed).is_null() {
             self.load_with_slot(ptr, node, slot, slot_idx)
@@ -69,7 +69,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     fn load_with_slot(
         &self,
         ptr: *mut (),
-        node: BorrowNodeRef,
+        node: BorrowNodeRef<D>,
         slot: &'static BorrowSlot,
         slot_idx: usize,
     ) -> ArcPtrBorrow<A> {
@@ -78,13 +78,20 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         if ptr != ptr_checked {
             return self.load_outdated(node, ptr, ptr_checked, slot);
         }
-        node.set_next_borrow_slot_idx(slot_idx + 1);
+        // The assertion is already known by compiler in `load_impl` with `get_unchecked`,
+        // but it has to be repeated here to be taken in account for the modulo when borrow
+        // slot count is not a multiple of 2
+        if slot_idx >= D::BORROW_SLOT_COUNT {
+            unsafe { hint::unreachable_unchecked() };
+        }
+        node.next_borrow_slot_idx()
+            .set((slot_idx + 1) % D::BORROW_SLOT_COUNT);
         ArcPtrBorrow::new(ptr_checked, Some(slot))
     }
 
     #[cold]
     #[inline(never)]
-    fn load_find_available_slot(&self, ptr: *mut (), node: BorrowNodeRef) -> ArcPtrBorrow<A> {
+    fn load_find_available_slot(&self, ptr: *mut (), node: BorrowNodeRef<D>) -> ArcPtrBorrow<A> {
         match (node.borrow_slots().iter().enumerate())
             .find(|(_, slot)| slot.load(Relaxed).is_null())
         {
@@ -97,7 +104,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     #[inline(never)]
     fn load_outdated(
         &self,
-        node: BorrowNodeRef,
+        node: BorrowNodeRef<D>,
         ptr: *mut (),
         ptr_checked: *mut (),
         slot: &'static BorrowSlot,
@@ -117,7 +124,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     }
 
     #[allow(unstable_name_collisions)]
-    fn load_clone(&self, node: BorrowNodeRef) -> ArcPtrBorrow<A> {
+    fn load_clone(&self, node: BorrowNodeRef<D>) -> ArcPtrBorrow<A> {
         let clone_slot = node.clone_slot();
         let self_ptr = ptr::from_ref(&self.ptr).cast_mut().cast();
         let prepare_ptr = if W::CONCURRENT {
@@ -264,7 +271,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     }
 
     #[allow(unstable_name_collisions)]
-    fn is_same_atomic_arc(&self, node: BorrowNodeRef, clone_ptr: &mut *mut ()) -> bool {
+    fn is_same_atomic_arc(&self, node: BorrowNodeRef<D>, clone_ptr: &mut *mut ()) -> bool {
         let self_ptr = ptr::from_ref(&self.ptr).cast_mut().cast();
         if W::CONCURRENT {
             node.atomic_arc_slot().load(Relaxed) == self_ptr && {
