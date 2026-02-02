@@ -1,3 +1,5 @@
+//! Globally allocated helper for the `AtomicArc` algorithm.
+
 use alloc::{
     alloc::{alloc_zeroed, dealloc, handle_alloc_error},
     vec::Vec,
@@ -37,43 +39,65 @@ macro_rules! node_field_getter {
     };
 }
 
-#[allow(clippy::missing_safety_doc)]
+/// TODO
+///
+/// # Safety
+///
+/// - [`static_list`](Self::static_list) must return a single static list.
+/// - [`get_thread_local_node`](Self::get_thread_local_node) must return the node set with
+///   [`set_thread_local_node`](Self::set_thread_local_node).
+/// - [`get_or_acquire_thread_local_node`](Self::get_or_acquire_thread_local_node) and
+///   [`release_thread_local_node`](Self::release_thread_local_node) should not be overwritten.
 pub unsafe trait Domain: Sized + Send + Sync + 'static {
+    /// Number of borrow slots of a thread-local node.
     const BORROW_SLOT_COUNT: usize;
-    fn static_list() -> &'static BorrowList<Self>;
-    fn get_thread_local_node() -> Option<BorrowNodeRef<Self>>;
-    #[allow(clippy::missing_safety_doc)]
-    unsafe fn set_thread_local_node(node: Option<BorrowNodeRef<Self>>);
-    fn get_or_insert_thread_local_node() -> BorrowNodeRef<Self> {
+    /// Returns the domain's static list.
+    fn static_list() -> &'static DomainList<Self>;
+    /// Returns the domain's thread-local node.
+    fn get_thread_local_node() -> Option<DomainNodeRef<Self>>;
+    /// Sets the domain's thread-local node.
+    ///
+    /// # Safety
+    ///
+    /// If not `None`, the node must have been acquired from the domain's static list,
+    /// and must not have been released.
+    unsafe fn set_thread_local_node(node: Option<DomainNodeRef<Self>>);
+    /// Gets the domain's thread-local node, or acquires one from the static list and cache it.
+    fn get_or_acquire_thread_local_node() -> DomainNodeRef<Self> {
         #[cold]
         #[inline(never)]
-        fn insert_node<D: Domain>() -> BorrowNodeRef<D> {
-            let node = D::static_list().insert_node();
+        fn acquire_node<D: Domain>() -> DomainNodeRef<D> {
+            let node = D::static_list().acquire_node();
             unsafe { D::set_thread_local_node(Some(node)) };
             node
         }
-        Self::get_thread_local_node().unwrap_or_else(insert_node::<Self>)
+        Self::get_thread_local_node().unwrap_or_else(acquire_node::<Self>)
     }
-    fn reset_thread_local_node() {
+    /// Releases the domain's thread-local node, if there is one stored.
+    fn release_thread_local_node() {
         if let Some(node) = Self::get_thread_local_node() {
             unsafe { Self::set_thread_local_node(None) };
-            unsafe { Self::static_list().remove_node(node) };
+            Self::static_list().release_node(node);
         }
     }
 }
 
-pub struct BorrowList<D> {
-    head: AtomicPtr<BorrowNode>,
+/// The domain's list.
+///
+/// See [`Domain`] documentation.
+pub struct DomainList<D> {
+    head: AtomicPtr<DomainNode>,
     _domain: PhantomData<D>,
 }
 
-impl<D: Domain> Default for BorrowList<D> {
+impl<D: Domain> Default for DomainList<D> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<D: Domain> BorrowList<D> {
+impl<D: Domain> DomainList<D> {
+    /// Constructs a new, empty `DomainList`.
     pub const fn new() -> Self {
         Self {
             head: AtomicPtr::new(NULL.cast()),
@@ -81,24 +105,28 @@ impl<D: Domain> BorrowList<D> {
         }
     }
 
-    pub(crate) fn nodes(&self) -> impl Iterator<Item = BorrowNodeRef<D>> + '_ {
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = DomainNodeRef<D>> + '_ {
         let mut node_ptr = &self.head;
         iter::from_fn(move || {
-            let node = unsafe { BorrowNodeRef::new(node_ptr.load(SeqCst))? };
+            let node = unsafe { DomainNodeRef::new(node_ptr.load(SeqCst))? };
             node_ptr = node_field!(node.next);
             Some(node)
         })
     }
 
+    /// Reserve `node_count` nodes in the list.
+    ///
+    /// This method doesn't take in account if the nodes are acquired or not, it just makes sure
+    /// there are at least `node_count` nodes allocated.
     pub fn reserve(&self, node_count: usize) {
         let mut allocated_node = None;
         let mut node_ptr = &self.head;
         for _ in 0..node_count {
-            if let Some(node) = unsafe { BorrowNodeRef::<D>::new(node_ptr.load(Acquire)) } {
+            if let Some(node) = unsafe { DomainNodeRef::<D>::new(node_ptr.load(Acquire)) } {
                 node_ptr = node_field!(node.next);
             } else {
                 let new_node =
-                    allocated_node.get_or_insert_with(|| BorrowNodeRef::<D>::allocate(false));
+                    allocated_node.get_or_insert_with(|| DomainNodeRef::<D>::allocate(false));
                 match node_ptr.compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Acquire) {
                     Ok(_) => {
                         node_ptr = node_field!(new_node.next);
@@ -113,20 +141,23 @@ impl<D: Domain> BorrowList<D> {
         }
     }
 
-    pub fn insert_node(&self) -> BorrowNodeRef<D> {
+    /// Acquire a node from the list.
+    ///
+    /// If no node has been reserved or released, a new node is allocated.
+    pub fn acquire_node(&self) -> DomainNodeRef<D> {
         let mut node_ptr = &self.head;
         // Cannot use `Self::nodes` because the final node pointer is needed for chaining
-        while let Some(node) = unsafe { BorrowNodeRef::new(node_ptr.load(Acquire)) } {
+        while let Some(node) = unsafe { DomainNodeRef::new(node_ptr.load(Acquire)) } {
             if node.try_acquire() {
                 return node;
             }
             node_ptr = node_field!(node.next);
         }
-        let new_node = BorrowNodeRef::allocate(true);
+        let new_node = DomainNodeRef::allocate(true);
         while let Err(n) =
             node_ptr.compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Acquire)
         {
-            let node = unsafe { BorrowNodeRef::new(n) }.unwrap();
+            let node = unsafe { DomainNodeRef::new(n) }.unwrap();
             if node.try_acquire() {
                 unsafe { new_node.release() };
                 unsafe { new_node.deallocate() };
@@ -137,27 +168,31 @@ impl<D: Domain> BorrowList<D> {
         new_node
     }
 
-    #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn remove_node(&self, node: BorrowNodeRef<D>) {
+    /// Release the node, keeping it in the list for another thread to acquire it.
+    pub fn release_node(&self, node: DomainNodeRef<D>) {
         // SAFETY: same contract
         unsafe { node.release() };
     }
 
-    #[allow(clippy::missing_safety_doc)]
+    /// Deallocates the list.
+    ///
+    /// # Safety
+    ///
+    /// All list's nodes must have been released.
     pub unsafe fn deallocate(&self) {
-        let mut head = unsafe { BorrowNodeRef::<D>::new(self.head.swap(NULL.cast(), SeqCst)) };
+        let mut head = unsafe { DomainNodeRef::<D>::new(self.head.swap(NULL.cast(), SeqCst)) };
         while let Some(node) = head {
             #[allow(unused_unsafe)]
-            let next = unsafe { BorrowNodeRef::new(node_field!(node.next).load(Acquire)) };
+            let next = unsafe { DomainNodeRef::new(node_field!(node.next).load(Acquire)) };
             unsafe { node.deallocate() };
             head = next;
         }
     }
 }
 
-impl<D: Domain> fmt::Debug for BorrowList<D> {
+impl<D: Domain> fmt::Debug for DomainList<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BorrowList")
+        f.debug_struct("DomainList")
             .field("domain", &core::any::type_name::<D>())
             .field("nodes", &self.nodes().collect::<Vec<_>>())
             .finish()
@@ -167,9 +202,9 @@ impl<D: Domain> fmt::Debug for BorrowList<D> {
 pub(crate) type BorrowSlot = AtomicPtr<()>;
 
 #[repr(C)]
-pub(crate) struct BorrowNode {
+pub(crate) struct DomainNode {
     _align: CachePadded<()>,
-    next: AtomicPtr<BorrowNode>,
+    next: AtomicPtr<DomainNode>,
     in_use: AtomicUsize,
     clone_slot: AtomicPtr<()>,
     atomic_arc_slot: AtomicPtr<()>,
@@ -178,22 +213,26 @@ pub(crate) struct BorrowNode {
     borrow_slots: [BorrowSlot; 0],
 }
 
-pub struct BorrowNodeRef<D> {
-    node: NonNull<BorrowNode>,
+/// A static reference to a domain's node.
+///
+/// It is guaranteed that `size_of::<Option<DomainNodeRef<D>>() == size_of::<usize>()`.
+///
+/// See [`Domain`] documentation.
+pub struct DomainNodeRef<D> {
+    node: NonNull<DomainNode>,
     _domain: PhantomData<D>,
 }
 
-impl<D> Clone for BorrowNodeRef<D> {
+impl<D> Clone for DomainNodeRef<D> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<D> Copy for BorrowNodeRef<D> {}
+impl<D> Copy for DomainNodeRef<D> {}
 
-impl<D: Domain> BorrowNodeRef<D> {
-    #[allow(unstable_name_collisions)]
-    unsafe fn new(ptr: *const BorrowNode) -> Option<Self> {
+impl<D: Domain> DomainNodeRef<D> {
+    unsafe fn new(ptr: *const DomainNode) -> Option<Self> {
         Some(Self {
             node: NonNull::new(ptr.cast_mut())?,
             _domain: PhantomData,
@@ -213,17 +252,17 @@ impl<D: Domain> BorrowNodeRef<D> {
     }
 
     fn layout() -> Layout {
-        let (layout, _) = Layout::new::<BorrowNode>()
+        let (layout, _) = Layout::new::<DomainNode>()
             .extend(Layout::array::<AtomicPtr<()>>(D::BORROW_SLOT_COUNT).unwrap())
             .unwrap();
         layout
     }
 
-    fn allocate(in_use: bool) -> BorrowNodeRef<D> {
+    fn allocate(in_use: bool) -> DomainNodeRef<D> {
         let layout = Self::layout();
         // SAFETY: layout has non-zero size
-        let ptr = unsafe { alloc_zeroed(layout) }.cast::<BorrowNode>();
-        let mut node = BorrowNodeRef {
+        let ptr = unsafe { alloc_zeroed(layout) }.cast::<DomainNode>();
+        let mut node = DomainNodeRef {
             node: NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout)),
             _domain: PhantomData,
         };
@@ -275,7 +314,7 @@ impl<D: Domain> BorrowNodeRef<D> {
         WriterGuard(self)
     }
 
-    fn as_ptr(self) -> *mut BorrowNode {
+    fn as_ptr(self) -> *mut DomainNode {
         self.node.as_ptr()
     }
 
@@ -293,10 +332,10 @@ impl<D: Domain> BorrowNodeRef<D> {
     node_field_getter!(clone_generation: Cell<usize>);
 }
 
-impl<D: Domain> fmt::Debug for BorrowNodeRef<D> {
+impl<D: Domain> fmt::Debug for DomainNodeRef<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let in_use = node_field!(self.in_use).load(Relaxed);
-        f.debug_struct("BorrowNodeRef")
+        f.debug_struct("DomainNodeRef")
             .field("domain", &core::any::type_name::<D>())
             .field("in_use", &(in_use & IN_USE == IN_USE))
             .field("active_writers", &(in_use >> WRITER_SHIFT))
@@ -310,7 +349,7 @@ impl<D: Domain> fmt::Debug for BorrowNodeRef<D> {
     not(target_pointer_width = "64"),
     hazarc_force_active_writer_count_64bit
 ))]
-pub(crate) struct WriterGuard<D>(BorrowNodeRef<D>);
+pub(crate) struct WriterGuard<D>(DomainNodeRef<D>);
 
 #[cfg(any(
     not(target_pointer_width = "64"),
@@ -323,6 +362,13 @@ impl<D> Drop for WriterGuard<D> {
     }
 }
 
+/// Declare a domain using standard thread-local storage.
+///
+/// # Examples
+///
+/// ```rust
+/// hazarc::domain!(pub(crate) MyDomain(2)); // 2 borrow slots
+/// ```
 #[macro_export]
 macro_rules! domain {
     ($(#[$attrs:meta])* $vis:vis $name:ident($borrow_slot_count:expr)) => {
@@ -332,9 +378,9 @@ macro_rules! domain {
         impl $name {
             #[doc(hidden)]
             #[inline(always)]
-            fn local_key() -> &'static ::std::thread::LocalKey<::std::cell::Cell<::std::option::Option<$crate::domain::BorrowNodeRef<Self>>>> {
+            fn local_key() -> &'static ::std::thread::LocalKey<::std::cell::Cell<::std::option::Option<$crate::domain::DomainNodeRef<Self>>>> {
                 ::std::thread_local! {
-                    static LOCAL: ::std::cell::Cell<::std::option::Option<$crate::domain::BorrowNodeRef<$name>>> = const { ::std::cell::Cell::new(None) };
+                    static LOCAL: ::std::cell::Cell<::std::option::Option<$crate::domain::DomainNodeRef<$name>>> = const { ::std::cell::Cell::new(None) };
                 }
                 &LOCAL
             }
@@ -342,19 +388,19 @@ macro_rules! domain {
         unsafe impl $crate::domain::Domain for $name {
             const BORROW_SLOT_COUNT: usize = $borrow_slot_count;
             #[inline(always)]
-            fn static_list() -> &'static $crate::domain::BorrowList<Self> {
-                static LIST: $crate::domain::BorrowList<$name> = $crate::domain::BorrowList::new();
+            fn static_list() -> &'static $crate::domain::DomainList<Self> {
+                static LIST: $crate::domain::DomainList<$name> = $crate::domain::DomainList::new();
                 &LIST
             }
             #[inline(always)]
-            fn get_thread_local_node() -> ::std::option::Option<$crate::domain::BorrowNodeRef<Self>> {
+            fn get_thread_local_node() -> ::std::option::Option<$crate::domain::DomainNodeRef<Self>> {
                 $name::local_key().with(::std::cell::Cell::get)
             }
-            unsafe fn set_thread_local_node(node: Option<$crate::domain::BorrowNodeRef<Self>>) {
+            unsafe fn set_thread_local_node(node: Option<$crate::domain::DomainNodeRef<Self>>) {
                 struct NodeGuard;
                 impl Drop for NodeGuard {
                     fn drop(&mut self) {
-                        <$name as $crate::domain::Domain>::reset_thread_local_node();
+                        <$name as $crate::domain::Domain>::release_thread_local_node();
                     }
                 }
                 ::std::thread_local! {
@@ -367,6 +413,32 @@ macro_rules! domain {
     };
 }
 
+/// Declare a domain using POSIX pthread API.
+///
+/// # Examples
+///
+/// ```rust
+/// hazarc::pthread_domain!(pub(crate) MyDomain(2)); // 2 borrow slots
+/// ```
+///
+/// # Unsafe use
+///
+/// Pthread thread-local key requires an initial call to `pthread_key_create`, often synchronized
+/// with `pthread_once`. This is done in every `Domain` method of the generated domain, with a
+/// runtime cost.
+///
+/// It is possible to declare an unsafe domain skipping this call. However, it requires to call
+/// the generated `pthread_key_create` before any use of it.
+///
+/// ```rust
+/// // Requires to call `MyUnsafeDomain::pthread_key_create` before any use of it.
+/// hazarc::pthread_domain!(pub(crate) MyUnsafeDomain(2); unsafe { Self::pthread_key_already_created() });
+/// ```
+///
+/// *This convoluted syntax purpose is to trigger unsafe-related lints,
+/// like `clippy::undocumented_unsafe_blocks`. Any other expression than
+/// `Self::Self::pthread_key_create()` and `Self::pthread_key_already_created()`
+/// will trigger a runtime panic.*
 #[cfg(feature = "pthread-domain")]
 #[macro_export]
 macro_rules! pthread_domain {
@@ -392,13 +464,13 @@ macro_rules! pthread_domain {
             #[inline]
             pub fn pthread_key_create() -> impl ::core::any::Any {
                 unsafe extern "C" fn make_key() {
-                    unsafe extern "C" fn remove_node(ptr: *mut $crate::libc::c_void) {
+                    unsafe extern "C" fn release_node(ptr: *mut $crate::libc::c_void) {
                         if let Some(ptr) = ::core::ptr::NonNull::new(ptr) {
-                            let node = unsafe { $crate::domain::BorrowNodeRef::from_raw(ptr.cast()) };
-                            unsafe { <$name as $crate::domain::Domain>::static_list().remove_node(node) };
+                            let node = unsafe { $crate::domain::DomainNodeRef::from_raw(ptr.cast()) };
+                            <$name as $crate::domain::Domain>::static_list().release_node(node);
                         }
                     }
-                    unsafe { $crate::libc::pthread_key_create($name::key(), Some(remove_node)) };
+                    unsafe { $crate::libc::pthread_key_create($name::key(), Some(release_node)) };
                 }
                 static mut KEY_ONCE: $crate::libc::pthread_once_t = $crate::libc::PTHREAD_ONCE_INIT;
                 #[allow(clippy::missing_transmute_annotations)] // signature is different across platforms
@@ -409,20 +481,20 @@ macro_rules! pthread_domain {
         unsafe impl $crate::domain::Domain for $name {
             const BORROW_SLOT_COUNT: usize = $borrow_slot_count;
             #[inline(always)]
-            fn static_list() -> &'static $crate::domain::BorrowList<Self> {
-                static LIST: $crate::domain::BorrowList<$name> = $crate::domain::BorrowList::new();
+            fn static_list() -> &'static $crate::domain::DomainList<Self> {
+                static LIST: $crate::domain::DomainList<$name> = $crate::domain::DomainList::new();
                 &LIST
             }
             #[inline(always)]
-            fn get_thread_local_node() -> ::core::option::Option<$crate::domain::BorrowNodeRef<Self>> {
+            fn get_thread_local_node() -> ::core::option::Option<$crate::domain::DomainNodeRef<Self>> {
                 fn type_id<T: ::core::any::Any>(_: T) -> ::core::any::TypeId {
                     ::core::any::TypeId::of::<T>()
                 }
                 assert_eq!(type_id($init), type_id(unsafe { Self::pthread_key_already_created() }));
                 let ptr = unsafe { ::core::ptr::NonNull::new($crate::libc::pthread_getspecific(*Self::key())) }?;
-                Some(unsafe { $crate::domain::BorrowNodeRef::from_raw(ptr.cast()) })
+                Some(unsafe { $crate::domain::DomainNodeRef::from_raw(ptr.cast()) })
             }
-            unsafe fn set_thread_local_node(node: Option<$crate::domain::BorrowNodeRef<Self>>) {
+            unsafe fn set_thread_local_node(node: Option<$crate::domain::DomainNodeRef<Self>>) {
                 fn type_id<T: ::core::any::Any>(_: T) -> ::core::any::TypeId {
                     ::core::any::TypeId::of::<T>()
                 }
@@ -445,12 +517,12 @@ mod tests {
         #[cfg(not(feature = "pthread-domain"))]
         domain!(TestDomain(2));
         let thread = std::thread::spawn(|| {
-            let node = TestDomain::get_or_insert_thread_local_node();
+            let node = TestDomain::get_or_acquire_thread_local_node();
             node_field!(node.clone_generation).set(1);
             node.into_raw().addr()
         });
         let node1_addr = thread.join().unwrap();
-        let node2 = TestDomain::get_or_insert_thread_local_node();
+        let node2 = TestDomain::get_or_acquire_thread_local_node();
         assert_eq!(node1_addr, node2.into_raw().addr());
         assert_eq!(node_field!(node2.clone_generation).get(), 1);
     }
@@ -461,7 +533,7 @@ mod tests {
         pthread_domain!(TestDomain(2));
         #[cfg(not(feature = "pthread-domain"))]
         domain!(TestDomain(2));
-        let node_addr = || (TestDomain::get_or_insert_thread_local_node().into_raw()).addr();
+        let node_addr = || (TestDomain::get_or_acquire_thread_local_node().into_raw()).addr();
         std::thread::scope(|s| {
             let node1 = s.spawn(node_addr).join().unwrap();
             let thread2 = s.spawn(node_addr);
@@ -480,7 +552,7 @@ mod tests {
         domain!(TestDomain(2));
         std::thread::scope(|s| {
             let thread = s.spawn(|| {
-                TestDomain::get_or_insert_thread_local_node();
+                TestDomain::get_or_acquire_thread_local_node();
             });
             TestDomain::static_list().reserve(4);
             thread.join().unwrap();
@@ -497,15 +569,15 @@ mod tests {
         let barrier = std::sync::Barrier::new(2);
         std::thread::scope(|s| {
             s.spawn(|| {
-                TestDomain::get_or_insert_thread_local_node();
+                TestDomain::get_or_acquire_thread_local_node();
                 barrier.wait();
                 // It seems TLS can be destroyed after the thread has been joined...
-                TestDomain::reset_thread_local_node();
+                TestDomain::release_thread_local_node();
             });
             s.spawn(|| {
-                TestDomain::get_or_insert_thread_local_node();
+                TestDomain::get_or_acquire_thread_local_node();
                 barrier.wait();
-                TestDomain::reset_thread_local_node();
+                TestDomain::release_thread_local_node();
             });
         });
         assert_eq!(TestDomain::static_list().nodes().count(), 2);

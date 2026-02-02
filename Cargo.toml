@@ -7,7 +7,7 @@ repository = "https://github.com/wyfo/hazarc"
 readme = "README.md"
 keywords = ["atomic", "arc", "cache", "no_std"]
 categories = ["concurrency", "data-structures", "memory-management", "caching", "no-std"]
-description = "Wait-free AtomicArc"
+description = "A wait-free AtomicArc optimized for read-intensive use cases."
 rust-version = "1.65"
 
 [features]
@@ -34,6 +34,7 @@ harness = false
 required-features = ["default-domain"]
 
 [lints.rust]
+#missing_docs = "warn"
 missing_debug_implementations = "forbid"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hazarc_force_active_writer_count_64bit)'] }
 unsafe_op_in_unsafe_fn = "deny"
@@ -42,3 +43,6 @@ unsafe_op_in_unsafe_fn = "deny"
 dbg_macro = "forbid"
 incompatible_msrv = "allow"
 semicolon_if_nothing_returned = "forbid"
+
+[package.metadata.docs.rs]
+all-features = true

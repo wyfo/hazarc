@@ -1,7 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    arc::{ArcPtr, NonNullPtr},
+    arc::{ArcPtr, NonNullArcPtr},
     atomic::{ArcPtrBorrow, AtomicArcPtr, AtomicOptionArcPtr},
     cache::AtomicArcRef,
     domain::Domain,
@@ -15,7 +15,7 @@ impl<A: ArcPtr + Serialize, D: Domain, W: WritePolicy> Serialize for AtomicArcPt
     }
 }
 
-impl<A: ArcPtr + NonNullPtr + Serialize, D: Domain, W: WritePolicy> Serialize
+impl<A: NonNullArcPtr + Serialize, D: Domain, W: WritePolicy> Serialize
     for AtomicOptionArcPtr<A, D, W>
 {
     fn serialize<Ser: Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
@@ -43,7 +43,7 @@ impl<'de, A: ArcPtr + Deserialize<'de>, D: Domain, W: WritePolicy> Deserialize<'
     }
 }
 
-impl<'de, A: ArcPtr + NonNullPtr + Deserialize<'de>, D: Domain, W: WritePolicy> Deserialize<'de>
+impl<'de, A: NonNullArcPtr + Deserialize<'de>, D: Domain, W: WritePolicy> Deserialize<'de>
     for AtomicOptionArcPtr<A, D, W>
 {
     fn deserialize<De: Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {

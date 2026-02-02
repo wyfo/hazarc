@@ -1,3 +1,5 @@
+//! Generic atomic storage for `Arc`-like pointers.
+
 use alloc::sync::Arc;
 use core::{
     fmt, hint,
@@ -14,8 +16,8 @@ use core::{
 #[allow(unused_imports)]
 use crate::msrv::{OptionExt, StrictProvenance};
 use crate::{
-    arc::{ArcPtr, ArcRef, NonNullPtr},
-    domain::{BorrowNodeRef, BorrowSlot, Domain},
+    arc::{ArcPtr, ArcRef, NonNullArcPtr},
+    domain::{BorrowSlot, Domain, DomainNodeRef},
     msrv::ptr,
     write_policy::{Concurrent, WritePolicy},
     NULL,
@@ -26,6 +28,7 @@ const CONFIRM_CLONE_FLAG: usize = 0b10;
 const GENERATION_INCR: usize = PREPARE_CLONE_FLAG + 1;
 const MAX_GENERATION: usize = !PREPARE_CLONE_FLAG;
 
+/// An atomic storage for generic `Arc`-like pointers.
 pub struct AtomicArcPtr<A: ArcPtr, D: Domain, W: WritePolicy> {
     ptr: AtomicPtr<()>,
     _arc: PhantomData<A>,
@@ -60,7 +63,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
             return ArcPtrBorrow::new(NULL, None);
         }
         debug_assert!(!ptr.is_null());
-        let node = D::get_or_insert_thread_local_node();
+        let node = D::get_or_acquire_thread_local_node();
         let slot_idx = match D::BORROW_SLOT_COUNT {
             0 => return self.load_clone(node),
             1 => 0,
@@ -78,7 +81,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     fn load_with_slot(
         &self,
         ptr: *mut (),
-        node: BorrowNodeRef<D>,
+        node: DomainNodeRef<D>,
         slot: &'static BorrowSlot,
         slot_idx: usize,
     ) -> ArcPtrBorrow<A> {
@@ -102,7 +105,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
 
     #[cold]
     #[inline(never)]
-    fn load_find_available_slot(&self, ptr: *mut (), node: BorrowNodeRef<D>) -> ArcPtrBorrow<A> {
+    fn load_find_available_slot(&self, ptr: *mut (), node: DomainNodeRef<D>) -> ArcPtrBorrow<A> {
         if D::BORROW_SLOT_COUNT == 1 {
             return self.load_clone(node);
         }
@@ -119,7 +122,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     fn load_outdated(
         &self,
         ptr: *mut (),
-        node: BorrowNodeRef<D>,
+        node: DomainNodeRef<D>,
         ptr_checked: *mut (),
         slot: &'static BorrowSlot,
     ) -> ArcPtrBorrow<A> {
@@ -138,7 +141,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     }
 
     #[allow(unstable_name_collisions)]
-    fn load_clone(&self, node: BorrowNodeRef<D>) -> ArcPtrBorrow<A> {
+    fn load_clone(&self, node: DomainNodeRef<D>) -> ArcPtrBorrow<A> {
         let clone_slot = node.clone_slot();
         let self_ptr = ptr::from_ref(&self.ptr).cast_mut().cast();
         let prepare_ptr = if W::CONCURRENT {
@@ -147,7 +150,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
             node.clone_generation()
                 .set(generation.wrapping_add(GENERATION_INCR));
             if generation == MAX_GENERATION {
-                D::reset_thread_local_node();
+                D::release_thread_local_node();
             }
             ptr::without_provenance_mut(generation | PREPARE_CLONE_FLAG)
         } else {
@@ -285,7 +288,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     }
 
     #[allow(unstable_name_collisions)]
-    fn is_same_atomic_arc(&self, node: BorrowNodeRef<D>, clone_ptr: &mut *mut ()) -> bool {
+    fn is_same_atomic_arc(&self, node: DomainNodeRef<D>, clone_ptr: &mut *mut ()) -> bool {
         let self_ptr = ptr::from_ref(&self.ptr).cast_mut().cast();
         if W::CONCURRENT {
             node.atomic_arc_slot().load(Relaxed) == self_ptr && {
@@ -349,7 +352,7 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D, Concurrent> {
     }
 }
 
-impl<A: ArcPtr + NonNullPtr, D: Domain, W: WritePolicy> AtomicArcPtr<Option<A>, D, W> {
+impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<Option<A>, D, W> {
     #[inline]
     pub const fn none() -> Self {
         Self {
@@ -391,7 +394,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> From<A> for AtomicArcPtr<A, D, W> {
     }
 }
 
-impl<A: ArcPtr + NonNullPtr, D: Domain, W: WritePolicy> From<A> for AtomicArcPtr<Option<A>, D, W> {
+impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> From<A> for AtomicArcPtr<Option<A>, D, W> {
     fn from(value: A) -> Self {
         Some(value).into()
     }
@@ -438,7 +441,7 @@ impl<A: ArcPtr> ArcPtrBorrow<A> {
     }
 }
 
-impl<A: ArcPtr + NonNullPtr> ArcPtrBorrow<Option<A>> {
+impl<A: NonNullArcPtr> ArcPtrBorrow<Option<A>> {
     #[inline(always)]
     pub fn transpose(self) -> Option<ArcPtrBorrow<A>> {
         let this = ManuallyDrop::new(self);
@@ -471,7 +474,7 @@ impl<A: ArcPtr> Deref for ArcPtrBorrow<A> {
 }
 
 // NonNullPtr bound to avoid collision with `Option::as_ref`
-impl<A: ArcPtr + NonNullPtr> AsRef<A> for ArcPtrBorrow<A> {
+impl<A: NonNullArcPtr> AsRef<A> for ArcPtrBorrow<A> {
     #[inline]
     fn as_ref(&self) -> &A {
         self
@@ -494,7 +497,7 @@ impl<A: ArcPtr> From<A> for ArcPtrBorrow<A> {
     }
 }
 
-impl<A: ArcPtr + NonNullPtr> From<Option<ArcPtrBorrow<A>>> for ArcPtrBorrow<Option<A>> {
+impl<A: NonNullArcPtr> From<Option<ArcPtrBorrow<A>>> for ArcPtrBorrow<Option<A>> {
     #[inline]
     fn from(value: Option<ArcPtrBorrow<A>>) -> Self {
         match value.map(ManuallyDrop::new) {
@@ -505,11 +508,11 @@ impl<A: ArcPtr + NonNullPtr> From<Option<ArcPtrBorrow<A>>> for ArcPtrBorrow<Opti
 }
 
 #[repr(transparent)]
-pub struct AtomicOptionArcPtr<A: ArcPtr + NonNullPtr, D: Domain, W: WritePolicy>(
+pub struct AtomicOptionArcPtr<A: NonNullArcPtr, D: Domain, W: WritePolicy>(
     AtomicArcPtr<Option<A>, D, W>,
 );
 
-impl<A: ArcPtr + NonNullPtr, D: Domain, W: WritePolicy> AtomicOptionArcPtr<A, D, W> {
+impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicOptionArcPtr<A, D, W> {
     #[inline]
     pub fn new(arc: Option<A>) -> Self {
         Self(AtomicArcPtr::new(arc))
@@ -574,7 +577,7 @@ impl<A: ArcPtr + NonNullPtr, D: Domain, W: WritePolicy> AtomicOptionArcPtr<A, D,
     }
 }
 
-impl<A: ArcPtr + NonNullPtr, D: Domain> AtomicOptionArcPtr<A, D, Concurrent> {
+impl<A: NonNullArcPtr, D: Domain> AtomicOptionArcPtr<A, D, Concurrent> {
     pub fn compare_exchange<C: ArcRef<Option<A>>>(
         &self,
         current: C,
@@ -594,13 +597,13 @@ impl<A: ArcPtr + NonNullPtr, D: Domain> AtomicOptionArcPtr<A, D, Concurrent> {
             .map_err(ArcPtrBorrow::transpose)
     }
 }
-impl<A: ArcPtr + NonNullPtr, D: Domain, W: WritePolicy> Default for AtomicOptionArcPtr<A, D, W> {
+impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> Default for AtomicOptionArcPtr<A, D, W> {
     fn default() -> Self {
         Self::none()
     }
 }
 
-impl<A: ArcPtr + NonNullPtr + fmt::Debug, D: Domain, W: WritePolicy> fmt::Debug
+impl<A: NonNullArcPtr + fmt::Debug, D: Domain, W: WritePolicy> fmt::Debug
     for AtomicOptionArcPtr<A, D, W>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -608,7 +611,7 @@ impl<A: ArcPtr + NonNullPtr + fmt::Debug, D: Domain, W: WritePolicy> fmt::Debug
     }
 }
 
-impl<T, A: ArcPtr + NonNullPtr, D: Domain, W: WritePolicy> From<T> for AtomicOptionArcPtr<A, D, W>
+impl<T, A: NonNullArcPtr, D: Domain, W: WritePolicy> From<T> for AtomicOptionArcPtr<A, D, W>
 where
     AtomicArcPtr<Option<A>, D, W>: From<T>,
 {
@@ -617,7 +620,7 @@ where
     }
 }
 
-impl<'a, A: ArcPtr + NonNullPtr, D: Domain, W: WritePolicy> From<&'a AtomicArcPtr<Option<A>, D, W>>
+impl<'a, A: NonNullArcPtr, D: Domain, W: WritePolicy> From<&'a AtomicArcPtr<Option<A>, D, W>>
     for &'a AtomicOptionArcPtr<A, D, W>
 {
     fn from(value: &'a AtomicArcPtr<Option<A>, D, W>) -> Self {

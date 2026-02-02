@@ -142,7 +142,12 @@ impl<D: Domain> LoadBench for AtomicOptionArc<usize, D> {
 #[cfg(feature = "pthread-domain")]
 hazarc::pthread_domain!(PthreadDomain(8));
 #[cfg(feature = "pthread-domain")]
-hazarc::pthread_domain!(UnsafePthreadDomain(8); unsafe { Self::pthread_key_already_created() });
+hazarc::pthread_domain! {
+    UnsafePthreadDomain(8);
+    // SAFETY: `UnsafePthreadDomain::pthread_key_create` is called
+    // before using the domain in `hazarc_load_pthread_unsafe`
+    unsafe { Self::pthread_key_already_created() }
+}
 
 impl LoadBench for RwLock<Arc<usize>> {
     type Guard<'a> = RwLockReadGuard<'a, Arc<usize>>;

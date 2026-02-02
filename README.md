@@ -82,7 +82,7 @@ fn task(shared_cfg: &AtomicArc<Config, NoStdDomain>) {
 ## Write policy
 
 `AtomicArc` has a generic `WritePolicy` parameter with the following variants:
-- `Serialized`: writes on a given `AtomicArc` should be serialized — with a mutex, a MPSC task, etc. Concurrent writes are still safe with it, but can provoke non-monotonic reads, i.e. a subsequent read may observe an older value than a previous read.
+- `Serialized`: writes on a given `AtomicArc` should be serialized — with a mutex, a MPSC task, etc. Concurrent writes are still safe with this policy, but can provoke non-monotonic reads, i.e. a subsequent load may observe an older value than a previous load.
 - `Concurrent` (the default): writes on a given `AtomicArc` can be concurrent. This adds a small overhead to the non-critical path of reads, and a larger overhead to writes on 32-bit platforms.
 
 ## Wait-freedom
