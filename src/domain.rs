@@ -1,4 +1,29 @@
 //! Globally allocated helper for the `AtomicArc` algorithm.
+//!
+//! A domain maintains a global list [`DomainList`] of per-thread nodes. Each thread participating
+//! in the domain usually cache a node reference [`DomainNodeRef`] into a thread-local storage.
+//! The [`Domain`] trait gives an interface to access the domain's list and nodes.
+//!
+//! Each domain's node owns a number of borrow slots, which allows
+//! [`AtomicArc::load`](crate::AtomicArc::load) to "borrow" an `Arc` reference without having to
+//! increment its reference count. If no slot is available, a slower fallback mechanism allows to
+//! clone the `Arc`, making `AtomicArc::load` not limited by the number of slots.
+//!
+//! Domains are isolated from each other, removing contention between `AtomicArc` using
+//! different domains.
+//!
+//! The name "domain" comes from hazarc pointer's domain terminology from which it is inspired.
+//!
+//! # Examples
+//!
+//! Domains are usually declared using [`domain`](crate::domain!) macro.
+//!
+//! ```rust
+//! # use hazarc::AtomicArc;
+//! hazarc::domain!(MyDomain(2)); // 2 borrow slots.
+//!
+//! type MyAtomicArc<T> = AtomicArc<T, MyDomain>;
+//! ```
 
 use alloc::{
     alloc::{alloc_zeroed, dealloc, handle_alloc_error},
@@ -43,7 +68,11 @@ macro_rules! node_field_getter {
     };
 }
 
-/// TODO
+/// Accessors for the domain's static list and thread-local nodes.
+///
+/// The trait is usually implemented using [`domain`](crate::domain!) macro.
+///
+/// See [`module`](self) documentation.
 ///
 /// # Safety
 ///
@@ -88,7 +117,7 @@ pub unsafe trait Domain: Sized + Send + Sync + 'static {
 
 /// The domain's list.
 ///
-/// See [`Domain`] documentation.
+/// See [`module`](self) documentation.
 pub struct DomainList<D> {
     head: AtomicPtr<DomainNode>,
     #[cfg(feature = "domain-gc")]
@@ -281,7 +310,7 @@ pub(crate) struct DomainNode {
 ///
 /// It is guaranteed that `size_of::<Option<DomainNodeRef<D>>() == size_of::<usize>()`.
 ///
-/// See [`Domain`] documentation.
+/// See [`module`](self) documentation.
 pub struct DomainNodeRef<D> {
     node: NonNull<DomainNode>,
     _domain: PhantomData<D>,
@@ -306,11 +335,16 @@ impl<D: Domain> DomainNodeRef<D> {
         })
     }
 
+    /// Converts the node reference to a raw pointer.
     pub fn into_raw(self) -> NonNull<()> {
         self.node.cast()
     }
 
-    #[allow(clippy::missing_safety_doc)]
+    /// Reconstructs a node reference from a raw pointer.
+    ///
+    /// # Safety
+    ///
+    /// The pointer must have been obtained from [`into_raw`](Self::into_raw).
     pub unsafe fn from_raw(ptr: NonNull<()>) -> Self {
         Self {
             node: ptr.cast(),

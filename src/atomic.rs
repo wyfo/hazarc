@@ -418,6 +418,9 @@ impl<T, D: Domain, W: WritePolicy> From<Option<T>> for AtomicArcPtr<Option<Arc<T
     }
 }
 
+/// A borrow of an `Arc`-like pointer.
+///
+/// In most cases, the borrowed `Arc` doesn't need to be cloned, hence the name.
 #[must_use]
 #[derive(Debug)]
 pub struct ArcPtrBorrow<A: ArcPtr> {
@@ -432,6 +435,9 @@ impl<A: ArcPtr> ArcPtrBorrow<A> {
         Self { arc, slot }
     }
 
+    /// Convert the borrow into an owned `Arc`.
+    ///
+    /// The `Arc` may be cloned if it was not already the case.
     #[inline]
     pub fn into_owned(self) -> A {
         if self.slot.is_none() {
@@ -442,6 +448,9 @@ impl<A: ArcPtr> ArcPtrBorrow<A> {
 }
 
 impl<A: NonNullArcPtr> ArcPtrBorrow<Option<A>> {
+    /// Transpose a `ArcPtrBorrow<Option<A>>` into an `Option<ArcPtrBorrow<A>>`.
+    ///
+    /// This operation should be optimized out in release build.
     #[inline(always)]
     pub fn transpose(self) -> Option<ArcPtrBorrow<A>> {
         let this = ManuallyDrop::new(self);
@@ -507,6 +516,10 @@ impl<A: NonNullArcPtr> From<Option<ArcPtrBorrow<A>>> for ArcPtrBorrow<Option<A>>
     }
 }
 
+/// A wrapper around `AtomicArcPtr<Option<A>>` with a more ergonomic API.
+///
+/// For example, [`AtomicOptionArcPtr::load`] returns an `Option<ArcPtrBorrow<A>>` instead of
+/// `ArcPtrBorrow<Option<A>>`.
 #[repr(transparent)]
 pub struct AtomicOptionArcPtr<A: NonNullArcPtr, D: Domain, W: WritePolicy>(
     AtomicArcPtr<Option<A>, D, W>,
