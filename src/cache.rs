@@ -97,7 +97,8 @@ where
 ///
 /// ```rust
 /// # use std::sync::Arc;
-/// # use hazarc::AtomicArc;
+/// # hazarc::domain!(Domain(8));
+/// # type AtomicArc<T> = hazarc::AtomicArc<T, Domain>;
 /// let atomic_arc = Arc::new(AtomicArc::<usize>::from(0));
 /// let mut cache = hazarc::Cache::new(atomic_arc);
 /// assert_eq!(**cache.load(), 0);
@@ -107,7 +108,8 @@ where
 ///
 /// ```rust
 /// # use std::sync::Arc;
-/// # use hazarc::AtomicOptionArc;
+/// # hazarc::domain!(Domain(8));
+/// # type AtomicOptionArc<T> = hazarc::AtomicOptionArc<T, Domain>;
 /// let atomic_arc = Arc::new(AtomicOptionArc::<usize>::none());
 /// let mut cache = hazarc::Cache::new(atomic_arc);
 /// assert_eq!(cache.load(), None);
