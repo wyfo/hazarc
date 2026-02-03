@@ -144,10 +144,9 @@ impl<D: Domain> DomainList<D> {
 
     pub(crate) fn nodes(&self) -> impl Iterator<Item = DomainNodeRef<D>> + '_ {
         let guard = ListAccessGuard::new(self);
-        let mut node = None::<DomainNodeRef<D>>;
-        iter::from_fn(move || {
-            node = node.map_or_else(|| guard.head(), |n| n.next());
-            node
+        iter::successors(guard.head(), move |&node| {
+            let _ = &guard; // capture guard
+            node.next()
         })
     }
 
@@ -258,6 +257,7 @@ impl<'a, D: Domain> ListAccessGuard<'a, D> {
                 Ok(_) => head = new_head,
                 Err(h) => head = h,
             }
+            debug_assert!(head.addr() & GC_FLAG == 0);
         }
         unsafe { DomainNodeRef::new(head) }
     }
@@ -273,15 +273,19 @@ impl<D: Domain> Drop for ListAccessGuard<'_, D> {
             {
                 return;
             }
-            let head = self.0.head.fetch_or(GC_FLAG, SeqCst);
-            let flagged_head = head.map_addr(|addr| addr | GC_FLAG);
-            if !head.is_null()
+            let head_ptr = self.0.head.fetch_or(GC_FLAG, SeqCst);
+            let gc_head_ptr = head_ptr.map_addr(|addr| addr | GC_FLAG);
+            let head = unsafe { DomainNodeRef::<D>::new(head_ptr) };
+            if head.is_some()
                 && self.0.active_nodes_and_writers.load(SeqCst) == GC_FLAG
+                && iter::successors(head, |&node| node.next())
+                    .flat_map(|n| n.borrow_slots())
+                    .all(|s| s.load(Relaxed).is_null())
                 && (self.0.head)
-                    .compare_exchange(flagged_head, NULL.cast(), SeqCst, Relaxed)
+                    .compare_exchange(gc_head_ptr, NULL.cast(), SeqCst, Relaxed)
                     .is_ok()
             {
-                let mut head = unsafe { DomainNodeRef::<D>::new(head) };
+                let mut head = unsafe { DomainNodeRef::<D>::new(head_ptr) };
                 while let Some(node) = head {
                     head = node.next();
                     unsafe { node.deallocate() };
