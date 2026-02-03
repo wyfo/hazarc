@@ -151,31 +151,43 @@ impl<D: Domain> DomainList<D> {
     }
 
     pub(crate) fn nodes_or_allocate(&self) -> impl Iterator<Item = DomainNodeRef<D>> + '_ {
-        struct AllocatedNode<D: Domain>(Option<DomainNodeRef<D>>);
-        impl<D: Domain> Drop for AllocatedNode<D> {
+        struct Iter<'a, D: Domain> {
+            list: &'a DomainList<D>,
+            guard: ListAccessGuard<'a, D>,
+            node: Option<DomainNodeRef<D>>,
+            allocated_node: Option<DomainNodeRef<D>>,
+        }
+        impl<D: Domain> Drop for Iter<'_, D> {
             fn drop(&mut self) {
-                if let Some(node) = self.0.take() {
+                if let Some(node) = self.allocated_node {
                     unsafe { node.deallocate() }
                 }
             }
         }
-        let guard = ListAccessGuard::new(self);
-        let mut node = None::<DomainNodeRef<D>>;
-        let mut allocated_node = AllocatedNode(None);
-        iter::from_fn(move || {
-            let node_ptr = node.map_or(&self.head, |n| node_field!(n.next));
-            node = node.map_or_else(|| guard.head(), |n| n.next());
-            if node.is_none() {
-                let new_node =
-                    (allocated_node.0).get_or_insert_with(|| DomainNodeRef::<D>::allocate());
-                match node_ptr.compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Acquire) {
-                    Ok(_) => node = allocated_node.0.take(),
-                    Err(n) => node = unsafe { DomainNodeRef::new(n) },
+        impl<D: Domain> Iterator for Iter<'_, D> {
+            type Item = DomainNodeRef<D>;
+            fn next(&mut self) -> Option<DomainNodeRef<D>> {
+                let node_ptr = self.node.map_or(&self.list.head, |n| node_field!(n.next));
+                self.node = self.node.map_or_else(|| self.guard.head(), |n| n.next());
+                if self.node.is_none() {
+                    let new_node =
+                        (self.allocated_node).get_or_insert_with(DomainNodeRef::<D>::allocate);
+                    match node_ptr.compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Acquire)
+                    {
+                        Ok(_) => self.node = self.allocated_node.take(),
+                        Err(n) => self.node = unsafe { DomainNodeRef::new(n) },
+                    }
                 }
+                debug_assert!(self.node.is_some());
+                self.node
             }
-            debug_assert!(node.is_some());
-            node
-        })
+        }
+        Iter {
+            list: self,
+            guard: ListAccessGuard::new(self),
+            node: None,
+            allocated_node: None,
+        }
     }
 
     /// Reserve `node_count` nodes in the list.
