@@ -112,6 +112,7 @@ This library uses unsafe code to deal with `AtomicPtr` manipulation and DST allo
 ## Differences with `arc-swap`
 
 - Custom domains to reduce contention and add `no_std` support
+- Manual/automatic domain deallocation
 - Wait-free `AtomicArc::swap` — `ArcSwap::swap` is only lock-free
 - Optimized `Serialized` write policy
 - Less atomic RMW instructions

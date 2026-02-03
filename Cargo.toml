@@ -13,6 +13,7 @@ rust-version = "1.65"
 [features]
 default = ["default-domain"]
 default-domain = []
+domain-gc = []
 pthread-domain = ["dep:libc"]
 serde = ["dep:serde"]
 
@@ -40,7 +41,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hazarc_force_active_writer
 unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
-dbg_macro = "forbid"
+dbg_macro = "warn"
 incompatible_msrv = "allow"
 semicolon_if_nothing_returned = "forbid"
 

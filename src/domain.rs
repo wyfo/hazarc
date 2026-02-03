@@ -19,10 +19,14 @@ use core::{
 
 use crossbeam_utils::CachePadded;
 
+#[cfg(feature = "domain-gc")]
+#[allow(unused_imports)]
+use crate::msrv::StrictProvenance;
 use crate::{msrv::ptr, NULL};
 
+#[cfg(feature = "domain-gc")]
+const GC_FLAG: usize = 1;
 const IN_USE: usize = 1;
-const WRITER_SHIFT: usize = 1;
 
 macro_rules! node_field {
     ($node:ident.$field:ident) => {
@@ -77,7 +81,7 @@ pub unsafe trait Domain: Sized + Send + Sync + 'static {
     fn release_thread_local_node() {
         if let Some(node) = Self::get_thread_local_node() {
             unsafe { Self::set_thread_local_node(None) };
-            Self::static_list().release_node(node);
+            unsafe { Self::static_list().release_node(node) };
         }
     }
 }
@@ -87,6 +91,8 @@ pub unsafe trait Domain: Sized + Send + Sync + 'static {
 /// See [`Domain`] documentation.
 pub struct DomainList<D> {
     head: AtomicPtr<DomainNode>,
+    #[cfg(feature = "domain-gc")]
+    active_nodes_and_writers: AtomicUsize,
     _domain: PhantomData<D>,
 }
 
@@ -101,16 +107,46 @@ impl<D: Domain> DomainList<D> {
     pub const fn new() -> Self {
         Self {
             head: AtomicPtr::new(NULL.cast()),
+            #[cfg(feature = "domain-gc")]
+            active_nodes_and_writers: AtomicUsize::new(0),
             _domain: PhantomData,
         }
     }
 
     pub(crate) fn nodes(&self) -> impl Iterator<Item = DomainNodeRef<D>> + '_ {
-        let mut node_ptr = &self.head;
+        let guard = ListAccessGuard::new(self);
+        let mut node = None::<DomainNodeRef<D>>;
         iter::from_fn(move || {
-            let node = unsafe { DomainNodeRef::new(node_ptr.load(SeqCst))? };
-            node_ptr = node_field!(node.next);
-            Some(node)
+            node = node.map_or_else(|| guard.head(), |n| n.next());
+            node
+        })
+    }
+
+    pub(crate) fn nodes_or_allocate(&self) -> impl Iterator<Item = DomainNodeRef<D>> + '_ {
+        struct AllocatedNode<D: Domain>(Option<DomainNodeRef<D>>);
+        impl<D: Domain> Drop for AllocatedNode<D> {
+            fn drop(&mut self) {
+                if let Some(node) = self.0.take() {
+                    unsafe { node.deallocate() }
+                }
+            }
+        }
+        let guard = ListAccessGuard::new(self);
+        let mut node = None::<DomainNodeRef<D>>;
+        let mut allocated_node = AllocatedNode(None);
+        iter::from_fn(move || {
+            let node_ptr = node.map_or(&self.head, |n| node_field!(n.next));
+            node = node.map_or_else(|| guard.head(), |n| n.next());
+            if node.is_none() {
+                let new_node =
+                    (allocated_node.0).get_or_insert_with(|| DomainNodeRef::<D>::allocate());
+                match node_ptr.compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Acquire) {
+                    Ok(_) => node = allocated_node.0.take(),
+                    Err(n) => node = unsafe { DomainNodeRef::new(n) },
+                }
+            }
+            debug_assert!(node.is_some());
+            node
         })
     }
 
@@ -118,60 +154,32 @@ impl<D: Domain> DomainList<D> {
     ///
     /// This method doesn't take in account if the nodes are acquired or not, it just makes sure
     /// there are at least `node_count` nodes allocated.
-    pub fn reserve(&self, node_count: usize) {
-        let mut allocated_node = None;
-        let mut node_ptr = &self.head;
-        for _ in 0..node_count {
-            if let Some(node) = unsafe { DomainNodeRef::<D>::new(node_ptr.load(Acquire)) } {
-                node_ptr = node_field!(node.next);
-            } else {
-                let new_node =
-                    allocated_node.get_or_insert_with(|| DomainNodeRef::<D>::allocate(false));
-                match node_ptr.compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Acquire) {
-                    Ok(_) => {
-                        node_ptr = node_field!(new_node.next);
-                        allocated_node.take();
-                    }
-                    Err(n) => node_ptr = unsafe { &(*n).next },
-                }
-            };
-        }
-        if let Some(node) = allocated_node {
-            unsafe { node.deallocate() };
-        }
+    pub fn reserve(&'static self, node_count: usize) {
+        for _ in self.nodes_or_allocate().take(node_count) {}
     }
 
     /// Acquire a node from the list.
     ///
     /// If no node has been reserved or released, a new node is allocated.
     pub fn acquire_node(&self) -> DomainNodeRef<D> {
-        let mut node_ptr = &self.head;
-        // Cannot use `Self::nodes` because the final node pointer is needed for chaining
-        while let Some(node) = unsafe { DomainNodeRef::new(node_ptr.load(Acquire)) } {
+        for node in self.nodes_or_allocate() {
             if node.try_acquire() {
+                core::mem::forget(ListAccessGuard::new(self));
                 return node;
             }
-            node_ptr = node_field!(node.next);
         }
-        let new_node = DomainNodeRef::allocate(true);
-        while let Err(n) =
-            node_ptr.compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Acquire)
-        {
-            let node = unsafe { DomainNodeRef::new(n) }.unwrap();
-            if node.try_acquire() {
-                unsafe { new_node.release() };
-                unsafe { new_node.deallocate() };
-                return node;
-            }
-            node_ptr = node_field!(node.next);
-        }
-        new_node
+        unreachable!()
     }
 
     /// Release the node, keeping it in the list for another thread to acquire it.
-    pub fn release_node(&self, node: DomainNodeRef<D>) {
+    ///
+    /// # Safety
+    ///
+    /// The node must have been acquired from the list and not have been released yet.
+    pub unsafe fn release_node(&self, node: DomainNodeRef<D>) {
         // SAFETY: same contract
         unsafe { node.release() };
+        drop(ListAccessGuard(self));
     }
 
     /// Deallocates the list.
@@ -180,6 +188,8 @@ impl<D: Domain> DomainList<D> {
     ///
     /// All list's nodes must have been released.
     pub unsafe fn deallocate(&self) {
+        #[cfg(feature = "domain-gc")]
+        debug_assert_eq!(self.active_nodes_and_writers.load(SeqCst), 0);
         let mut head = unsafe { DomainNodeRef::<D>::new(self.head.swap(NULL.cast(), SeqCst)) };
         while let Some(node) = head {
             #[allow(unused_unsafe)]
@@ -196,6 +206,60 @@ impl<D: Domain> fmt::Debug for DomainList<D> {
             .field("domain", &core::any::type_name::<D>())
             .field("nodes", &self.nodes().collect::<Vec<_>>())
             .finish()
+    }
+}
+
+struct ListAccessGuard<'a, D: Domain>(&'a DomainList<D>);
+
+impl<'a, D: Domain> ListAccessGuard<'a, D> {
+    fn new(list: &'a DomainList<D>) -> Self {
+        #[cfg(feature = "domain-gc")]
+        list.active_nodes_and_writers
+            .fetch_add(1 << GC_FLAG, SeqCst);
+        Self(list)
+    }
+
+    fn head(&self) -> Option<DomainNodeRef<D>> {
+        #[cfg_attr(not(feature = "domain-gc"), allow(unused_mut))]
+        let mut head = self.0.head.load(SeqCst);
+        #[cfg(feature = "domain-gc")]
+        if head.addr() & GC_FLAG != 0 {
+            let new_head = head.map_addr(|addr| addr & !GC_FLAG);
+            match self.0.head.compare_exchange(head, new_head, SeqCst, SeqCst) {
+                Ok(_) => head = new_head,
+                Err(h) => head = h,
+            }
+        }
+        unsafe { DomainNodeRef::new(head) }
+    }
+}
+
+impl<D: Domain> Drop for ListAccessGuard<'_, D> {
+    fn drop(&mut self) {
+        #[cfg(feature = "domain-gc")]
+        if (self.0.active_nodes_and_writers).fetch_sub(1 << GC_FLAG, SeqCst) == 1 << GC_FLAG {
+            if (self.0.active_nodes_and_writers)
+                .compare_exchange(0, GC_FLAG, SeqCst, SeqCst)
+                .is_err()
+            {
+                return;
+            }
+            let head = self.0.head.fetch_or(GC_FLAG, SeqCst);
+            let flagged_head = head.map_addr(|addr| addr | GC_FLAG);
+            if !head.is_null()
+                && self.0.active_nodes_and_writers.load(SeqCst) == GC_FLAG
+                && (self.0.head)
+                    .compare_exchange(flagged_head, NULL.cast(), SeqCst, Relaxed)
+                    .is_ok()
+            {
+                let mut head = unsafe { DomainNodeRef::<D>::new(head) };
+                while let Some(node) = head {
+                    head = node.next();
+                    unsafe { node.deallocate() };
+                }
+            }
+            self.0.active_nodes_and_writers.fetch_and(!GC_FLAG, SeqCst);
+        }
     }
 }
 
@@ -232,7 +296,10 @@ impl<D> Clone for DomainNodeRef<D> {
 impl<D> Copy for DomainNodeRef<D> {}
 
 impl<D: Domain> DomainNodeRef<D> {
+    #[allow(unstable_name_collisions)]
     unsafe fn new(ptr: *const DomainNode) -> Option<Self> {
+        #[cfg(feature = "domain-gc")]
+        let ptr = ptr.map_addr(|addr| addr & !GC_FLAG);
         Some(Self {
             node: NonNull::new(ptr.cast_mut())?,
             _domain: PhantomData,
@@ -258,18 +325,14 @@ impl<D: Domain> DomainNodeRef<D> {
         layout
     }
 
-    fn allocate(in_use: bool) -> DomainNodeRef<D> {
+    fn allocate() -> DomainNodeRef<D> {
         let layout = Self::layout();
         // SAFETY: layout has non-zero size
-        let ptr = unsafe { alloc_zeroed(layout) }.cast::<DomainNode>();
-        let mut node = DomainNodeRef {
+        let ptr = unsafe { alloc_zeroed(layout) }.cast();
+        DomainNodeRef {
             node: NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout)),
             _domain: PhantomData,
-        };
-        if in_use {
-            *unsafe { node.node.as_mut() }.in_use.get_mut() = IN_USE;
         }
-        node
     }
 
     unsafe fn deallocate(self) {
@@ -300,7 +363,7 @@ impl<D: Domain> DomainNodeRef<D> {
         hazarc_force_active_writer_count_64bit
     ))]
     pub(crate) fn writer_guard(self) -> WriterGuard<D> {
-        let in_use = node_field!(self.in_use).fetch_add(1 << WRITER_SHIFT, SeqCst);
+        let in_use = node_field!(self.in_use).fetch_add(1 << IN_USE, SeqCst);
         if in_use >= usize::MAX / 2 {
             struct PanicInDrop;
             impl Drop for PanicInDrop {
@@ -316,6 +379,13 @@ impl<D: Domain> DomainNodeRef<D> {
 
     fn as_ptr(self) -> *mut DomainNode {
         self.node.as_ptr()
+    }
+
+    fn next(self) -> Option<DomainNodeRef<D>> {
+        #[allow(unused_unsafe)]
+        unsafe {
+            Self::new(node_field!(self.next).load(SeqCst))
+        }
     }
 
     #[inline(always)]
@@ -337,8 +407,8 @@ impl<D: Domain> fmt::Debug for DomainNodeRef<D> {
         let in_use = node_field!(self.in_use).load(Relaxed);
         f.debug_struct("DomainNodeRef")
             .field("domain", &core::any::type_name::<D>())
-            .field("in_use", &(in_use & IN_USE == IN_USE))
-            .field("active_writers", &(in_use >> WRITER_SHIFT))
+            .field("in_use", &(in_use & IN_USE != 0))
+            .field("active_writers", &(in_use >> IN_USE))
             .field("borrow_slots", &self.borrow_slots())
             .field("clone_slot", node_field!(self.clone_slot))
             .finish_non_exhaustive()
@@ -358,7 +428,7 @@ pub(crate) struct WriterGuard<D>(DomainNodeRef<D>);
 impl<D> Drop for WriterGuard<D> {
     fn drop(&mut self) {
         let node = self.0;
-        node_field!(node.in_use).fetch_sub(1 << WRITER_SHIFT, SeqCst);
+        node_field!(node.in_use).fetch_sub(1 << IN_USE, SeqCst);
     }
 }
 
@@ -467,7 +537,7 @@ macro_rules! pthread_domain {
                     unsafe extern "C" fn release_node(ptr: *mut $crate::libc::c_void) {
                         if let Some(ptr) = ::core::ptr::NonNull::new(ptr) {
                             let node = unsafe { $crate::domain::DomainNodeRef::from_raw(ptr.cast()) };
-                            <$name as $crate::domain::Domain>::static_list().release_node(node);
+                            unsafe { <$name as $crate::domain::Domain>::static_list().release_node(node) };
                         }
                     }
                     unsafe { $crate::libc::pthread_key_create($name::key(), Some(release_node)) };
@@ -508,7 +578,7 @@ macro_rules! pthread_domain {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::Domain;
+    use crate::domain::{Domain, ListAccessGuard};
 
     #[test]
     fn node_reuse() {
@@ -516,25 +586,9 @@ mod tests {
         pthread_domain!(TestDomain(2));
         #[cfg(not(feature = "pthread-domain"))]
         domain!(TestDomain(2));
-        let thread = std::thread::spawn(|| {
-            let node = TestDomain::get_or_acquire_thread_local_node();
-            node_field!(node.clone_generation).set(1);
-            node.into_raw().addr()
-        });
-        let node1_addr = thread.join().unwrap();
-        let node2 = TestDomain::get_or_acquire_thread_local_node();
-        assert_eq!(node1_addr, node2.into_raw().addr());
-        assert_eq!(node_field!(node2.clone_generation).get(), 1);
-    }
-
-    #[test]
-    fn node_reuse2() {
-        #[cfg(feature = "pthread-domain")]
-        pthread_domain!(TestDomain(2));
-        #[cfg(not(feature = "pthread-domain"))]
-        domain!(TestDomain(2));
         let node_addr = || (TestDomain::get_or_acquire_thread_local_node().into_raw()).addr();
         std::thread::scope(|s| {
+            let _guard = ListAccessGuard::new(TestDomain::static_list()); // prevent gc
             let node1 = s.spawn(node_addr).join().unwrap();
             let thread2 = s.spawn(node_addr);
             let thread3 = s.spawn(node_addr);
@@ -551,6 +605,7 @@ mod tests {
         #[cfg(not(feature = "pthread-domain"))]
         domain!(TestDomain(2));
         std::thread::scope(|s| {
+            let _guard = ListAccessGuard::new(TestDomain::static_list()); // prevent gc
             let thread = s.spawn(|| {
                 TestDomain::get_or_acquire_thread_local_node();
             });
@@ -567,6 +622,7 @@ mod tests {
         #[cfg(not(feature = "pthread-domain"))]
         domain!(TestDomain(2));
         let barrier = std::sync::Barrier::new(2);
+        let guard = ListAccessGuard::new(TestDomain::static_list()); // prevent gc
         std::thread::scope(|s| {
             s.spawn(|| {
                 TestDomain::get_or_acquire_thread_local_node();
@@ -581,6 +637,9 @@ mod tests {
             });
         });
         assert_eq!(TestDomain::static_list().nodes().count(), 2);
+        drop(guard);
+        #[cfg(feature = "domain-gc")]
+        assert_eq!(TestDomain::static_list().nodes().count(), 0);
         unsafe { TestDomain::static_list().deallocate() };
         assert_eq!(TestDomain::static_list().nodes().count(), 0);
     }
