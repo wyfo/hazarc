@@ -151,43 +151,33 @@ impl<D: Domain> DomainList<D> {
     }
 
     pub(crate) fn nodes_or_allocate(&self) -> impl Iterator<Item = DomainNodeRef<D>> + '_ {
-        struct Iter<'a, D: Domain> {
-            list: &'a DomainList<D>,
-            guard: ListAccessGuard<'a, D>,
-            node: Option<DomainNodeRef<D>>,
-            allocated_node: Option<DomainNodeRef<D>>,
-        }
-        impl<D: Domain> Drop for Iter<'_, D> {
+        struct AllocatedNode<D: Domain>(Option<DomainNodeRef<D>>);
+        impl<D: Domain> Drop for AllocatedNode<D> {
             fn drop(&mut self) {
-                if let Some(node) = self.allocated_node {
+                if let Some(node) = self.0 {
                     unsafe { node.deallocate() }
                 }
             }
         }
-        impl<D: Domain> Iterator for Iter<'_, D> {
-            type Item = DomainNodeRef<D>;
-            fn next(&mut self) -> Option<DomainNodeRef<D>> {
-                let node_ptr = self.node.map_or(&self.list.head, |n| node_field!(n.next));
-                self.node = self.node.map_or_else(|| self.guard.head(), |n| n.next());
-                if self.node.is_none() {
-                    let new_node =
-                        (self.allocated_node).get_or_insert_with(DomainNodeRef::<D>::allocate);
-                    match node_ptr.compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Acquire)
-                    {
-                        Ok(_) => self.node = self.allocated_node.take(),
-                        Err(n) => self.node = unsafe { DomainNodeRef::new(n) },
-                    }
+        let guard = ListAccessGuard::new(self);
+        let mut node = None::<DomainNodeRef<D>>;
+        let mut allocated_node = AllocatedNode(None);
+        iter::from_fn(move || {
+            // https://github.com/rust-lang/rust/issues/108808#issuecomment-3844459281
+            let _ = &allocated_node; // CAPTURE THE FULL STRUCT!
+            let node_ptr = node.map_or(&self.head, |n| node_field!(n.next));
+            node = node.map_or_else(|| guard.head(), |n| n.next());
+            if node.is_none() {
+                let new_node =
+                    (allocated_node.0).get_or_insert_with(|| DomainNodeRef::<D>::allocate());
+                match node_ptr.compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Acquire) {
+                    Ok(_) => node = allocated_node.0.take(),
+                    Err(n) => node = unsafe { DomainNodeRef::new(n) },
                 }
-                debug_assert!(self.node.is_some());
-                self.node
             }
-        }
-        Iter {
-            list: self,
-            guard: ListAccessGuard::new(self),
-            node: None,
-            allocated_node: None,
-        }
+            debug_assert!(node.is_some());
+            node
+        })
     }
 
     /// Reserve `node_count` nodes in the list.
@@ -646,6 +636,7 @@ mod tests {
             let node3 = thread3.join().unwrap();
             assert!(node1 == node2 || node1 == node3);
         });
+        TestDomain::get_or_acquire_thread_local_node();
     }
 
     #[test]
