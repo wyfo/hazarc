@@ -75,6 +75,15 @@
 //! }
 //! ```
 //!
+//! # Features
+//!
+//! - `default-domain` *(enabled by default)*: provides a default domain parameter to [`AtomicArc`]
+//!   using standard thread-local storage.
+//! - `domain-gc`: enables automatic domain deallocation.
+//! - `pthread-domain`: enables the `pthread_domain!` macro for `no_std` environments using
+//!   POSIX pthread thread-local storage.
+//! - `serde`: enables `serde` support.
+//!
 //! # Write policy
 //!
 //! `AtomicArc` has a generic `WritePolicy` parameter with the following variants:
@@ -84,6 +93,7 @@
 //! - `Concurrent` (the default): writes on a given `AtomicArc` can be concurrent. This adds a
 //!   small overhead to the non-critical path of reads, and a larger overhead to writes on 32-bit
 //!   platforms.
+//!
 //! # Wait-freedom
 //!
 //! ### Load

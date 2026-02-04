@@ -1,7 +1,7 @@
 //! Globally allocated helper for the `AtomicArc` algorithm.
 //!
 //! A domain maintains a global list [`DomainList`] of per-thread nodes. Each thread participating
-//! in the domain usually cache a node reference [`DomainNodeRef`] into a thread-local storage.
+//! in the domain usually caches a node reference [`DomainNodeRef`] into a thread-local storage.
 //! The [`Domain`] trait gives an interface to access the domain's list and nodes.
 //!
 //! Each domain's node owns a number of borrow slots, which allows
@@ -12,7 +12,7 @@
 //! Domains are isolated from each other, removing contention between `AtomicArc` using different
 //! domains.
 //!
-//! The name "domain" comes from hazarc pointer's domain terminology from which it is inspired.
+//! The name "domain" comes from hazard pointer's domain terminology from which it is inspired.
 //!
 //! # Examples
 //!
@@ -30,7 +30,7 @@
 //! Nodes allocated in a domain are never freed, and are reused as much as possible if their
 //! associated thread is terminated. Rust doesn't provide destructors for static data, so the nodes
 //! will be reported as "still reachable" by tools like Valgrind. It should not be considered as a
-//! memory leak, as the number of thread is normally bounded, and the memory allocations are indeed
+//! memory leak, as the number of threads is normally bounded, and the memory allocations are indeed
 //! still reachable.
 //!
 //! However, if memory reclamation matters, an experimental `domain-gc` feature can be enabled to
@@ -195,7 +195,7 @@ impl<D: Domain> DomainList<D> {
 
     /// Reserve `node_count` nodes in the list.
     ///
-    /// This method doesn't take in account if the nodes are acquired or not, it just makes sure
+    /// This method doesn't take into account if the nodes are acquired or not, it just makes sure
     /// there are at least `node_count` nodes allocated.
     pub fn reserve(&'static self, node_count: usize) {
         for _ in self.nodes_or_allocate().take(node_count) {}
@@ -554,7 +554,7 @@ macro_rules! domain {
 ///
 /// *This convoluted syntax purpose is to trigger unsafe-related lints,
 /// like `clippy::undocumented_unsafe_blocks`. Any other expression than
-/// `Self::Self::pthread_key_create()` and `Self::pthread_key_already_created()`
+/// `Self::pthread_key_create()` and `Self::pthread_key_already_created()`
 /// will trigger a runtime panic.*
 #[cfg(feature = "pthread-domain")]
 #[macro_export]

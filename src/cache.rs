@@ -138,7 +138,7 @@ impl<A: AtomicArcRef> Cache<A> {
         self.inner
     }
 
-    /// Returns the cached `Arc` if it up-to-date, or loads and caches the latest `Arc`.
+    /// Returns the cached `Arc` if it is up-to-date, or loads and caches the latest `Arc`.
     #[inline]
     pub fn load(&mut self) -> A::LoadCached<'_> {
         self.inner.load_cached(&mut self.cached)

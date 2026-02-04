@@ -97,7 +97,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         }
         if D::BORROW_SLOT_COUNT > 1 {
             // The assertion is already known by compiler in `load_impl` with `get_unchecked`,
-            // but it has to be repeated here to be taken in account for the modulo when borrow
+            // but it has to be repeated here to be taken into account for the modulo when borrow
             // slot count is not a multiple of 2
             if slot_idx >= D::BORROW_SLOT_COUNT {
                 unsafe { hint::unreachable_unchecked() }; // MSRV 1.81
@@ -343,7 +343,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         self.swap_impl(ptr, None)
     }
 
-    /// Consumes the `AtomicArcPtr` and returns the stored Arc.
+    /// Consumes the atomic storage and returns the stored Arc.
     #[inline]
     pub fn into_owned(self) -> A {
         // SAFETY: self is not reused after
@@ -354,7 +354,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
 impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D, Concurrent> {
     /// Stores the new Arc if the current one matches the argument.
     ///
-    /// Returns the previous Arc if store succeeds, or load the current Arc otherwise.
+    /// Returns the previous Arc if store succeeds, or loads the current Arc otherwise.
     pub fn compare_exchange<C: ArcRef<A>>(&self, current: C, new: A) -> Result<A, ArcPtrBorrow<A>> {
         // store a clone in order to keep an owned arc, in case its ownership must be transferred
         let new_clone = A::into_ptr(new.clone());
@@ -367,10 +367,10 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D, Concurrent> {
         }
     }
 
-    /// Fetch the current Arc, applies a function on it and try to store the result if
+    /// Fetches the current Arc, applies a function on it and tries to store the result if
     /// the current Arc has not changed.
     ///
-    /// Returns the current Arc if the function returns `None`.
+    /// Returns `Err` with the current Arc if the function returns `None`.
     pub fn fetch_update<F: FnMut(&A) -> Option<R>, R: Into<A>>(
         &self,
         mut f: F,
@@ -610,9 +610,7 @@ impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicOptionArcPtr<A, D, W> {
         self.0.load_owned()
     }
 
-    /// Convert the borrow into an owned Arc.
-    ///
-    /// The Arc may be cloned if it was not already the case.
+    /// Consumes the atomic storage and returns the stored Arc.
     #[inline]
     pub fn into_owned(self) -> Option<A> {
         self.0.into_owned()
@@ -655,7 +653,7 @@ impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicOptionArcPtr<A, D, W> {
 impl<A: NonNullArcPtr, D: Domain> AtomicOptionArcPtr<A, D, Concurrent> {
     /// Stores the new Arc if the current one matches the argument.
     ///
-    /// Returns the previous Arc if store succeeds, or load the current Arc otherwise.
+    /// Returns the previous Arc if store succeeds, or loads the current Arc otherwise.
     pub fn compare_exchange<C: ArcRef<Option<A>>>(
         &self,
         current: C,
@@ -666,10 +664,10 @@ impl<A: NonNullArcPtr, D: Domain> AtomicOptionArcPtr<A, D, Concurrent> {
             .map_err(ArcPtrBorrow::transpose)
     }
 
-    /// Fetch the current Arc, applies a function on it and try to store the result if
+    /// Fetches the current Arc, applies a function on it and tries to store the result if
     /// the current Arc has not changed.
     ///
-    /// Returns the current Arc if the function returns `None`.
+    /// Returns `Err` with the current Arc if the function returns `None`.
     pub fn fetch_update<F: FnMut(Option<&A>) -> Option<R>, R: Into<Option<A>>>(
         &self,
         mut f: F,
