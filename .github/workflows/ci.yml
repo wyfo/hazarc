@@ -38,7 +38,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        features: [""]
+        features: ["", --features=domain-gc]
         seeds: [0..256, 256..512, 512..768, 768..1024, 1024..1280, 1280..1536, 1536..1792, 1792..2048]
     steps:
       - uses: actions/checkout@v6

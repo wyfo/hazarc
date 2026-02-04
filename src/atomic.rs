@@ -244,8 +244,12 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
                 for slot in node.borrow_slots().iter() {
                     if slot.load(SeqCst) == old_ptr {
                         let _ = transfer_ownership::<A>(old_ptr, || {
+                            #[cfg(feature = "domain-gc")]
+                            let reset = ptr::without_provenance_mut(1);
+                            #[cfg(not(feature = "domain-gc"))]
+                            let reset = NULL;
                             // Acquire failure so borrow happens before
-                            slot.compare_exchange(old_ptr, NULL, SeqCst, Acquire)
+                            slot.compare_exchange(old_ptr, reset, SeqCst, Acquire)
                         });
                     }
                 }
@@ -468,8 +472,15 @@ impl<A: ArcPtr> Drop for ArcPtrBorrow<A> {
         {
             #[cold]
             #[inline(never)]
-            fn drop_arc<A>(_: A) {}
-            drop_arc(unsafe { ManuallyDrop::take(&mut self.arc) });
+            fn drop_arc<A>(_: A, _slot: Option<&'static BorrowSlot>) {
+                #[cfg(feature = "domain-gc")]
+                if let Some(slot) = _slot {
+                    #[cfg(feature = "domain-gc")]
+                    debug_assert!(slot.load(Relaxed).addr() == 1);
+                    slot.store(NULL, SeqCst);
+                }
+            }
+            drop_arc(unsafe { ManuallyDrop::take(&mut self.arc) }, self.slot);
         }
     }
 }
