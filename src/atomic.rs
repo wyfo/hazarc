@@ -57,8 +57,6 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     }
 
     /// Loads a borrowed Arc.
-    ///
-    /// If there is an available borrow slot in the [domain](crate::domain).
     #[inline]
     pub fn load(&self) -> ArcPtrBorrow<A> {
         self.load_impl(self.first_load())
@@ -600,6 +598,7 @@ impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicOptionArcPtr<A, D, W> {
         self.0.is_none()
     }
 
+    /// Loads a borrowed Arc.
     #[inline]
     pub fn load(&self) -> Option<ArcPtrBorrow<A>> {
         self.0.load().transpose()

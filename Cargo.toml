@@ -35,7 +35,6 @@ harness = false
 required-features = ["default-domain"]
 
 [lints.rust]
-#missing_docs = "warn"
 missing_debug_implementations = "forbid"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hazarc_force_active_writer_count_64bit)'] }
 unsafe_op_in_unsafe_fn = "deny"

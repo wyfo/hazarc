@@ -33,6 +33,7 @@
 //!
 //! [access the thread-local node]: domain::Domain::get_or_acquire_thread_local_node
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![warn(missing_docs)]
 #![no_std]
 extern crate alloc;
 #[cfg(any(feature = "default-domain", test))]
