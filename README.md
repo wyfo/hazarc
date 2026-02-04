@@ -1,5 +1,10 @@
 # hazarc
 
+[![Crates.io](https://img.shields.io/crates/v/hazarc.svg)](https://crates.io/crates/hazarc)
+[![Documentation](https://docs.rs/hazarc/badge.svg)](https://docs.rs/hazarc)
+[![CI](https://github.com/wyfo/hazarc/actions/workflows/ci.yml/badge.svg)](https://github.com/wyfo/hazarc/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue.svg)](https://github.com/wyfo/hazarc#license)
+
 A wait-free `AtomicArc` optimized for read-intensive use cases.
 
 ## Acknowledgement
@@ -120,3 +125,12 @@ This library uses unsafe code to deal with `AtomicPtr` manipulation and DST allo
 - [Better performance](benches/README.md), especially on ARM architecture
 - Null pointer/`None` load optimized
 - Ergonomic API for `Option`, `AtomicOptionArc<T>::load` returns `Option<ArcBorrow<T>>`
+
+## License
+
+Licensed under either of
+
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT license](LICENSE-MIT)
+
+at your option.
