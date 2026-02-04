@@ -29,6 +29,9 @@ const GENERATION_INCR: usize = PREPARE_CLONE_FLAG + 1;
 const MAX_GENERATION: usize = !PREPARE_CLONE_FLAG;
 
 /// An atomic storage for generic `Arc`-like pointers.
+///
+/// All atomic operations are [sequentially consistent](SeqCst) and
+/// [pseudo wait-free](crate#wait-freedom).
 pub struct AtomicArcPtr<A: ArcPtr, D: Domain, W: WritePolicy> {
     ptr: AtomicPtr<()>,
     _arc: PhantomData<A>,
@@ -37,6 +40,7 @@ pub struct AtomicArcPtr<A: ArcPtr, D: Domain, W: WritePolicy> {
 }
 
 impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
+    /// Constructs a new Arc atomic storage.
     #[inline]
     pub fn new(arc: A) -> Self {
         Self {
@@ -52,6 +56,9 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         self.ptr.load(if A::NULLABLE { SeqCst } else { Relaxed })
     }
 
+    /// Loads a borrowed Arc.
+    ///
+    /// If there is an available borrow slot in the [domain](crate::domain).
     #[inline]
     pub fn load(&self) -> ArcPtrBorrow<A> {
         self.load_impl(self.first_load())
@@ -128,11 +135,17 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     ) -> ArcPtrBorrow<A> {
         if A::NULLABLE && ptr_checked.is_null() {
             if let Err(p) = slot.compare_exchange(ptr, NULL, SeqCst, Relaxed) {
+                #[cfg(feature = "domain-gc")]
+                debug_assert_eq!(p.addr(), 1);
+                #[cfg(not(feature = "domain-gc"))]
                 debug_assert!(p.is_null());
                 unsafe { A::decr_rc(ptr) };
             }
             ArcPtrBorrow::new(NULL, None)
         } else if let Err(p) = slot.compare_exchange(ptr, NULL, SeqCst, Relaxed) {
+            #[cfg(feature = "domain-gc")]
+            debug_assert_eq!(p.addr(), 1);
+            #[cfg(not(feature = "domain-gc"))]
             debug_assert!(p.is_null());
             ArcPtrBorrow::new(ptr, None)
         } else {
@@ -179,6 +192,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         ArcPtrBorrow::new(ptr_checked, None)
     }
 
+    /// Loads an owned Arc.
     #[inline]
     pub fn load_owned(&self) -> A {
         self.load().into_owned()
@@ -189,6 +203,11 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         self.load_impl(ptr)
     }
 
+    /// Returns Arc reference passed if it is up-to-date, or load a borrowed Arc.
+    ///
+    /// This method can be used in workflows where the atomic Arc is not expected to
+    /// be updated. Contrary to [`load_cached`](Self::load_cached), it doesn't require
+    /// a mutable reference.
     #[inline]
     pub fn load_if_outdated<'a>(&self, arc: &'a A) -> Result<&'a A, ArcPtrBorrow<A>> {
         let ptr = self.first_load();
@@ -205,6 +224,9 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         *cached = self.load_impl(ptr).into_owned();
     }
 
+    /// Returns a reference to the cached Arc, updating it when it is outdated.
+    ///
+    /// See [`Cache`](crate::Cache) for a convenient wrapper around this method.
     #[inline]
     pub fn load_cached<'a>(&self, cached: &'a mut A) -> &'a A {
         let ptr = self.first_load();
@@ -214,6 +236,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         cached
     }
 
+    /// Stores the Arc and returns the previous one.
     pub fn swap(&self, arc: A) -> A {
         // store a clone in order to keep an owned arc, in case its ownership must be transferred
         let old_ptr = self.ptr.swap(A::into_ptr(arc.clone()), SeqCst);
@@ -305,6 +328,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         }
     }
 
+    /// Stores the Arc, dropping the previous one.
     pub fn store(&self, arc: A) {
         drop(self.swap(arc));
     }
@@ -321,6 +345,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         self.swap_impl(ptr, None)
     }
 
+    /// Consumes the `AtomicArcPtr` and returns the stored Arc.
     #[inline]
     pub fn into_owned(self) -> A {
         // SAFETY: self is not reused after
@@ -329,6 +354,9 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
 }
 
 impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D, Concurrent> {
+    /// Stores the new Arc if the current one matches the argument.
+    ///
+    /// Returns the previous Arc if store succeeds, or load the current Arc otherwise.
     pub fn compare_exchange<C: ArcRef<A>>(&self, current: C, new: A) -> Result<A, ArcPtrBorrow<A>> {
         // store a clone in order to keep an owned arc, in case its ownership must be transferred
         let new_clone = A::into_ptr(new.clone());
@@ -341,6 +369,10 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D, Concurrent> {
         }
     }
 
+    /// Fetch the current Arc, applies a function on it and try to store the result if
+    /// the current Arc has not changed.
+    ///
+    /// Returns the current Arc if the function returns `None`.
     pub fn fetch_update<F: FnMut(&A) -> Option<R>, R: Into<A>>(
         &self,
         mut f: F,
@@ -357,6 +389,7 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D, Concurrent> {
 }
 
 impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<Option<A>, D, W> {
+    /// Constructs a new Arc atomic storage with `None`.
     #[inline]
     pub const fn none() -> Self {
         Self {
@@ -367,6 +400,7 @@ impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<Option<A>, D, W> 
         }
     }
 
+    /// Returns `true` if the stored Arc is `None`.
     #[inline]
     pub fn is_none(&self) -> bool {
         self.ptr.load(SeqCst).is_null()
@@ -424,7 +458,7 @@ impl<T, D: Domain, W: WritePolicy> From<Option<T>> for AtomicArcPtr<Option<Arc<T
 
 /// A borrow of an `Arc`-like pointer.
 ///
-/// In most cases, the borrowed `Arc` doesn't need to be cloned, hence the name.
+/// In most cases, the borrowed Arc doesn't need to be cloned, hence the name.
 #[must_use]
 #[derive(Debug)]
 pub struct ArcPtrBorrow<A: ArcPtr> {
@@ -439,9 +473,9 @@ impl<A: ArcPtr> ArcPtrBorrow<A> {
         Self { arc, slot }
     }
 
-    /// Convert the borrow into an owned `Arc`.
+    /// Convert the borrow into an owned Arc.
     ///
-    /// The `Arc` may be cloned if it was not already the case.
+    /// The Arc may be cloned if it was not already the case.
     #[inline]
     pub fn into_owned(self) -> A {
         if self.slot.is_none() {
@@ -475,8 +509,7 @@ impl<A: ArcPtr> Drop for ArcPtrBorrow<A> {
             fn drop_arc<A>(_: A, _slot: Option<&'static BorrowSlot>) {
                 #[cfg(feature = "domain-gc")]
                 if let Some(slot) = _slot {
-                    #[cfg(feature = "domain-gc")]
-                    debug_assert!(slot.load(Relaxed).addr() == 1);
+                    debug_assert_eq!(slot.load(Relaxed).addr(), 1);
                     slot.store(NULL, SeqCst);
                 }
             }
@@ -537,26 +570,31 @@ pub struct AtomicOptionArcPtr<A: NonNullArcPtr, D: Domain, W: WritePolicy>(
 );
 
 impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicOptionArcPtr<A, D, W> {
+    /// Constructs a new Arc atomic storage.
     #[inline]
     pub fn new(arc: Option<A>) -> Self {
         Self(AtomicArcPtr::new(arc))
     }
 
+    /// Returns a reference to the inner `AtomicArcPtr`.
     #[inline]
     pub fn inner(&self) -> &AtomicArcPtr<Option<A>, D, W> {
         &self.0
     }
 
+    /// Returns the inner `AtomicArcPtr`.
     #[inline]
     pub fn into_inner(self) -> AtomicArcPtr<Option<A>, D, W> {
         self.0
     }
 
+    /// Constructs a new Arc atomic storage with `None`.
     #[inline]
     pub const fn none() -> Self {
         Self(AtomicArcPtr::none())
     }
 
+    /// Returns `true` if the stored Arc is `None`.
     #[inline]
     pub fn is_none(&self) -> bool {
         self.0.is_none()
@@ -567,16 +605,25 @@ impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicOptionArcPtr<A, D, W> {
         self.0.load().transpose()
     }
 
+    /// Loads an owned Arc.
     #[inline]
     pub fn load_owned(&self) -> Option<A> {
         self.0.load_owned()
     }
 
+    /// Convert the borrow into an owned Arc.
+    ///
+    /// The Arc may be cloned if it was not already the case.
     #[inline]
     pub fn into_owned(self) -> Option<A> {
         self.0.into_owned()
     }
 
+    /// Returns Arc reference passed if it is up-to-date, or load a borrowed Arc.
+    ///
+    /// This method can be used in workflows where the atomic Arc is not expected to
+    /// be updated. Contrary to [`load_cached`](Self::load_cached), it doesn't require
+    /// a mutable reference.
     #[inline]
     pub fn load_if_outdated<'a>(
         &self,
@@ -587,21 +634,29 @@ impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicOptionArcPtr<A, D, W> {
             .map_err(ArcPtrBorrow::transpose)
     }
 
+    /// Returns a reference to the cached Arc, updating it when it is outdated.
+    ///
+    /// See [`Cache`](crate::Cache) for a convenient wrapper around this method.
     #[inline]
     pub fn load_cached<'a>(&self, cached: &'a mut Option<A>) -> Option<&'a A> {
         self.0.load_cached(cached).as_ref()
     }
 
+    /// Stores the Arc and returns the previous one.
     pub fn swap(&self, new: Option<A>) -> Option<A> {
         self.0.swap(new)
     }
 
+    /// Stores the Arc, dropping the previous one.
     pub fn store(&self, new: Option<A>) {
         self.0.store(new);
     }
 }
 
 impl<A: NonNullArcPtr, D: Domain> AtomicOptionArcPtr<A, D, Concurrent> {
+    /// Stores the new Arc if the current one matches the argument.
+    ///
+    /// Returns the previous Arc if store succeeds, or load the current Arc otherwise.
     pub fn compare_exchange<C: ArcRef<Option<A>>>(
         &self,
         current: C,
@@ -612,6 +667,10 @@ impl<A: NonNullArcPtr, D: Domain> AtomicOptionArcPtr<A, D, Concurrent> {
             .map_err(ArcPtrBorrow::transpose)
     }
 
+    /// Fetch the current Arc, applies a function on it and try to store the result if
+    /// the current Arc has not changed.
+    ///
+    /// Returns the current Arc if the function returns `None`.
     pub fn fetch_update<F: FnMut(Option<&A>) -> Option<R>, R: Into<Option<A>>>(
         &self,
         mut f: F,
