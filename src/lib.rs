@@ -1,5 +1,89 @@
 //! A wait-free [`AtomicArc`] optimized for read-intensive use cases.
 //!
+//! # Examples
+//!
+//! ```ignore
+//! use hazarc::AtomicArc;
+//!
+//! struct Config {/* ... */}
+//!
+//! fn update_config(shared_cfg: &AtomicArc<Config> /* ... */) {
+//!     shared_cfg.store(/* ... */);
+//! }
+//!
+//! fn task(shared_cfg: &AtomicArc<Config>) {
+//!     loop {
+//!         let cfg = shared_cfg.load();
+//!         /* ... */
+//!     }
+//! }
+//! ```
+//!
+//! `AtomicArc::load` is already very fast, but `Cache::load` is blazingly fast.
+//!
+//! ```ignore
+//! use std::sync::Arc;
+//!
+//! use hazarc::AtomicArc;
+//!
+//! struct Config {/* ... */}
+//!
+//! fn update_config(shared_cfg: &AtomicArc<Config> /* ... */) {
+//!     shared_cfg.store(/* ... */);
+//! }
+//!
+//! fn spawn_task(shared_cfg: Arc<AtomicArc<Config>>) {
+//!     thread::spawn(move || {
+//!         let mut cache = hazarc::Cache::new(shared_cfg);
+//!         loop {
+//!             let cfg = cache.load();
+//!             /* ... */
+//!         }
+//!     });
+//! }
+//! ```
+//!
+//! With custom domains, it can be used in a `no_std` environment.
+//!
+//! ```ignore
+//! #![no_std]
+//! extern crate alloc;
+//!
+//! use alloc::sync::Arc;
+//!
+//! use hazarc::{domain::Domain, AtomicArc};
+//!
+//! hazarc::pthread_domain!(NoStdDomain(2)); // 2 hazard pointer slots
+//! fn register_domain_cleanup() {
+//!     extern "C" fn deallocate_domain() {
+//!         unsafe { NoStdDomain::static_list().deallocate() };
+//!     }
+//!     unsafe { libc::atexit(deallocate_domain) };
+//! }
+//!
+//! struct Config {/* ... */}
+//!
+//! fn update_config(shared_cfg: &AtomicArc<Config, NoStdDomain> /* ... */) {
+//!     shared_cfg.store(/* ... */);
+//! }
+//!
+//! fn task(shared_cfg: &AtomicArc<Config, NoStdDomain>) {
+//!     loop {
+//!         let cfg = shared_cfg.load();
+//!         /* ... */
+//!     }
+//! }
+//! ```
+//!
+//! # Write policy
+//!
+//! `AtomicArc` has a generic `WritePolicy` parameter with the following variants:
+//! - `Serialized`: writes on a given `AtomicArc` should be serialized — with a mutex, a MPSC task,
+//!   etc. Concurrent writes are still safe with this policy, but can provoke non-monotonic reads,
+//!   i.e. a subsequent load may observe an older value than a previous load.
+//! - `Concurrent` (the default): writes on a given `AtomicArc` can be concurrent. This adds a
+//!   small overhead to the non-critical path of reads, and a larger overhead to writes on 32-bit
+//!   platforms.
 //! # Wait-freedom
 //!
 //! ### Load
@@ -32,6 +116,12 @@
 //! internally, with the same consequences on wait-freedom.
 //!
 //! [access the thread-local node]: domain::Domain::get_or_acquire_thread_local_node
+//!
+//! # Safety
+//!
+//! This library uses unsafe code to deal with `AtomicPtr` manipulation and DST allocations.
+//! It is extensively tested with [`miri`](https://github.com/rust-lang/miri) to ensure its
+//! soundness, including over multiple weak memory model permutations.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 #![no_std]

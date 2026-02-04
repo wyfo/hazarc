@@ -9,8 +9,8 @@
 //! increment its reference count. If no slot is available, a slower fallback mechanism allows to
 //! clone the `Arc`, making `AtomicArc::load` not limited by the number of slots.
 //!
-//! Domains are isolated from each other, removing contention between `AtomicArc` using
-//! different domains.
+//! Domains are isolated from each other, removing contention between `AtomicArc` using different
+//! domains.
 //!
 //! The name "domain" comes from hazarc pointer's domain terminology from which it is inspired.
 //!
@@ -24,6 +24,19 @@
 //!
 //! type MyAtomicArc<T> = AtomicArc<T, MyDomain>;
 //! ```
+//!
+//! # Static memory allocation
+//!
+//! Nodes allocated in a domain are never freed, and are reused as much as possible if their
+//! associated thread is terminated. Rust doesn't provide destructors for static data, so the nodes
+//! will be reported as "still reachable" by tools like Valgrind. It should not be considered as a
+//! memory leak, as the number of thread is normally bounded, and the memory allocations are indeed
+//! still reachable.
+//!
+//! However, if memory reclamation matters, an experimental `domain-gc` feature can be enabled to
+//! provide automatic domain deallocation, at the cost of some overhead in `AtomicArc` write
+//! operations. The deallocation is best-effort; it should happen in normal cases but some
+//! non-trivial concurrent workflows can theoretically prevent it.
 
 use alloc::{
     alloc::{alloc_zeroed, dealloc, handle_alloc_error},
