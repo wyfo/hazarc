@@ -275,10 +275,14 @@ impl<D: Domain> Drop for ListAccessGuard<'_, D> {
             {
                 return;
             }
-            let head_ptr = self.0.head.fetch_or(GC_FLAG, SeqCst);
+            let head_ptr = self.0.head.load(SeqCst);
             let gc_head_ptr = head_ptr.map_addr(|addr| addr | GC_FLAG);
             let head = unsafe { DomainNodeRef::<D>::new(head_ptr) };
             if head.is_some()
+                && {
+                    self.0.head.store(gc_head_ptr, SeqCst);
+                    true
+                }
                 && self.0.active_nodes_and_writers.load(SeqCst) == GC_FLAG
                 && iter::successors(head, |&node| node.next())
                     .flat_map(|n| n.borrow_slots())
@@ -333,8 +337,6 @@ impl<D> Copy for DomainNodeRef<D> {}
 impl<D: Domain> DomainNodeRef<D> {
     #[allow(unstable_name_collisions)]
     unsafe fn new(ptr: *const DomainNode) -> Option<Self> {
-        #[cfg(feature = "domain-gc")]
-        let ptr = ptr.map_addr(|addr| addr & !GC_FLAG);
         Some(Self {
             node: NonNull::new(ptr.cast_mut())?,
             _domain: PhantomData,
