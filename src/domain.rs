@@ -283,7 +283,7 @@ impl<D: Domain> Drop for ListAccessGuard<'_, D> {
                 if self.0.active_nodes_and_writers.load(SeqCst) == GC_FLAG
                     && iter::successors(head, |&node| node.next())
                         .flat_map(|n| n.borrow_slots())
-                        .all(|s| s.load(Relaxed).is_null())
+                        .all(|s| s.load(Acquire).is_null())
                     && (self.0.head)
                         .compare_exchange(gc_head_ptr, NULL.cast(), SeqCst, Relaxed)
                         .is_ok()
