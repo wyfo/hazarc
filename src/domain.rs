@@ -244,8 +244,9 @@ struct ListAccessGuard<'a, D: Domain>(&'a DomainList<D>);
 impl<'a, D: Domain> ListAccessGuard<'a, D> {
     fn new(list: &'a DomainList<D>) -> Self {
         #[cfg(feature = "domain-gc")]
-        list.active_nodes_and_writers
-            .fetch_add(1 << GC_FLAG, SeqCst);
+        let active = (list.active_nodes_and_writers).fetch_add(1 << GC_FLAG, SeqCst);
+        #[cfg(feature = "domain-gc")]
+        abort_before_overflow(active, "too many active nodes and writers");
         Self(list)
     }
 
@@ -406,16 +407,7 @@ impl<D: Domain> DomainNodeRef<D> {
     ))]
     pub(crate) fn writer_guard(self) -> WriterGuard<D> {
         let in_use = node_field!(self.in_use).fetch_add(1 << IN_USE, SeqCst);
-        if in_use >= usize::MAX / 2 {
-            struct PanicInDrop;
-            impl Drop for PanicInDrop {
-                fn drop(&mut self) {
-                    panic!("panic in drop");
-                }
-            }
-            let _guard = PanicInDrop;
-            panic!("too many concurrent writers; abort");
-        }
+        abort_before_overflow(in_use, "too many concurrent writers");
         WriterGuard(self)
     }
 
@@ -616,6 +608,24 @@ macro_rules! pthread_domain {
             }
         }
     };
+}
+
+#[cfg(any(
+    feature = "domain-gc",
+    not(target_pointer_width = "64"),
+    hazarc_force_active_writer_count_64bit
+))]
+fn abort_before_overflow(n: usize, msg: &str) {
+    if n >= usize::MAX / 2 {
+        struct PanicInDrop;
+        impl Drop for PanicInDrop {
+            fn drop(&mut self) {
+                panic!("panic in drop");
+            }
+        }
+        let _guard = PanicInDrop;
+        panic!("{msg}; abort");
+    }
 }
 
 #[cfg(test)]
