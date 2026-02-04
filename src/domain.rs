@@ -278,23 +278,23 @@ impl<D: Domain> Drop for ListAccessGuard<'_, D> {
             let head_ptr = self.0.head.load(SeqCst);
             let gc_head_ptr = head_ptr.map_addr(|addr| addr | GC_FLAG);
             let head = unsafe { DomainNodeRef::<D>::new(head_ptr) };
-            if head.is_some()
-                && {
-                    self.0.head.store(gc_head_ptr, SeqCst);
-                    true
-                }
-                && self.0.active_nodes_and_writers.load(SeqCst) == GC_FLAG
-                && iter::successors(head, |&node| node.next())
-                    .flat_map(|n| n.borrow_slots())
-                    .all(|s| s.load(Relaxed).is_null())
-                && (self.0.head)
-                    .compare_exchange(gc_head_ptr, NULL.cast(), SeqCst, Relaxed)
-                    .is_ok()
-            {
-                let mut head = unsafe { DomainNodeRef::<D>::new(head_ptr) };
-                while let Some(node) = head {
-                    head = node.next();
-                    unsafe { node.deallocate() };
+            if head.is_some() {
+                self.0.head.store(gc_head_ptr, SeqCst);
+                if self.0.active_nodes_and_writers.load(SeqCst) == GC_FLAG
+                    && iter::successors(head, |&node| node.next())
+                        .flat_map(|n| n.borrow_slots())
+                        .all(|s| s.load(Relaxed).is_null())
+                    && (self.0.head)
+                        .compare_exchange(gc_head_ptr, NULL.cast(), SeqCst, Relaxed)
+                        .is_ok()
+                {
+                    let mut head = unsafe { DomainNodeRef::<D>::new(head_ptr) };
+                    while let Some(node) = head {
+                        head = node.next();
+                        unsafe { node.deallocate() };
+                    }
+                } else {
+                    self.0.head.store(head_ptr, SeqCst);
                 }
             }
             self.0.active_nodes_and_writers.fetch_and(!GC_FLAG, SeqCst);
