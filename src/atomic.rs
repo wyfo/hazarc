@@ -51,15 +51,10 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         }
     }
 
-    #[inline(always)]
-    fn first_load(&self) -> *mut () {
-        self.ptr.load(if A::NULLABLE { SeqCst } else { Relaxed })
-    }
-
     /// Loads a borrowed Arc.
     #[inline]
     pub fn load(&self) -> ArcPtrBorrow<A> {
-        self.load_impl(self.first_load())
+        self.load_impl(self.ptr.load(if A::NULLABLE { SeqCst } else { Relaxed }))
     }
 
     #[inline(always)]
@@ -201,25 +196,21 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         self.load_impl(ptr)
     }
 
-    /// Returns Arc reference passed if it is up-to-date, or load a borrowed Arc.
-    ///
-    /// This method can be used in workflows where the atomic Arc is not expected to
-    /// be updated. Contrary to [`load_cached`](Self::load_cached), it doesn't require
-    /// a mutable reference.
+    /// Returns a reference to the cached Arc if it is up-to-date, or loads the latest Arc.
     #[inline]
-    pub fn load_if_outdated<'a>(&self, arc: &'a A) -> Result<&'a A, ArcPtrBorrow<A>> {
-        let ptr = self.first_load();
-        if ptr == A::as_ptr(arc) {
-            Ok(arc)
+    pub fn load_cached_or_reload<'a>(&self, cached: &'a A) -> CachedOrReloaded<'a, A> {
+        let ptr = self.ptr.load(SeqCst);
+        if ptr == A::as_ptr(cached) {
+            CachedOrReloaded::Cached(cached)
         } else {
-            Err(self.load_impl_cold(ptr))
+            CachedOrReloaded::Reloaded(self.load_impl_cold(ptr))
         }
     }
 
     #[cold]
     #[inline(never)]
-    fn reload_cache(&self, ptr: *mut (), cached: &mut A) {
-        *cached = self.load_impl(ptr).into_owned();
+    fn reload_cache(&self, ptr: *mut ()) -> A {
+        self.load_impl(ptr).into_owned()
     }
 
     /// Returns a reference to the cached Arc, updating it when it is outdated.
@@ -227,9 +218,9 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     /// See [`Cache`](crate::Cache) for a convenient wrapper around this method.
     #[inline]
     pub fn load_cached<'a>(&self, cached: &'a mut A) -> &'a A {
-        let ptr = self.first_load();
+        let ptr = self.ptr.load(SeqCst);
         if ptr != A::as_ptr(cached) {
-            self.reload_cache(ptr, cached);
+            *cached = self.reload_cache(ptr);
         }
         cached
     }
@@ -558,6 +549,35 @@ impl<A: NonNullArcPtr> From<Option<ArcPtrBorrow<A>>> for ArcPtrBorrow<Option<A>>
     }
 }
 
+/// Result of [`AtomicArcPtr::load_cached_or_reload`].
+#[derive(Debug)]
+pub enum CachedOrReloaded<'a, A: ArcPtr> {
+    /// Cache Arc.
+    Cached(&'a A),
+    /// Reloaded Arc.
+    Reloaded(ArcPtrBorrow<A>),
+}
+
+impl<'a, A: NonNullArcPtr> CachedOrReloaded<'a, Option<A>> {
+    /// Transpose a `CachedOrReloaded<Option<A>>` into an `Option<CacheReloaded<A>>`.
+    pub fn transpose(self) -> Option<CachedOrReloaded<'a, A>> {
+        match self {
+            Self::Cached(arc) => arc.as_ref().map(CachedOrReloaded::Cached),
+            Self::Reloaded(arc) => arc.transpose().map(CachedOrReloaded::Reloaded),
+        }
+    }
+}
+
+impl<A: ArcPtr> Deref for CachedOrReloaded<'_, A> {
+    type Target = A;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Cached(arc) => arc,
+            Self::Reloaded(arc) => arc,
+        }
+    }
+}
+
 /// A wrapper around `AtomicArcPtr<Option<A>>` with a more ergonomic API.
 ///
 /// For example, [`AtomicOptionArcPtr::load`] returns an `Option<ArcPtrBorrow<A>>` instead of
@@ -616,27 +636,18 @@ impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicOptionArcPtr<A, D, W> {
         self.0.into_owned()
     }
 
-    /// Returns Arc reference passed if it is up-to-date, or load a borrowed Arc.
-    ///
-    /// This method can be used in workflows where the atomic Arc is not expected to
-    /// be updated. Contrary to [`load_cached`](Self::load_cached), it doesn't require
-    /// a mutable reference.
-    #[inline]
-    pub fn load_if_outdated<'a>(
-        &self,
-        arc: &'a Option<A>,
-    ) -> Result<&'a Option<A>, Option<ArcPtrBorrow<A>>> {
-        self.0
-            .load_if_outdated(arc)
-            .map_err(ArcPtrBorrow::transpose)
-    }
-
     /// Returns a reference to the cached Arc, updating it when it is outdated.
     ///
     /// See [`Cache`](crate::Cache) for a convenient wrapper around this method.
     #[inline]
     pub fn load_cached<'a>(&self, cached: &'a mut Option<A>) -> Option<&'a A> {
         self.0.load_cached(cached).as_ref()
+    }
+
+    /// Returns a reference to the cached Arc if it is up-to-date, or loads the latest Arc.
+    #[inline]
+    pub fn load_cached_or_reload<'a>(&self, arc: &'a Option<A>) -> Option<CachedOrReloaded<'a, A>> {
+        self.0.load_cached_or_reload(arc).transpose()
     }
 
     /// Stores the Arc and returns the previous one.
@@ -706,4 +717,9 @@ impl<'a, A: NonNullArcPtr, D: Domain, W: WritePolicy> From<&'a AtomicArcPtr<Opti
     fn from(value: &'a AtomicArcPtr<Option<A>, D, W>) -> Self {
         unsafe { mem::transmute::<&'a AtomicArcPtr<Option<A>, D, W>, Self>(value) }
     }
+}
+
+#[unsafe(no_mangle)]
+fn plop(a: CachedOrReloaded<Option<Arc<usize>>>) -> Option<CachedOrReloaded<Arc<usize>>> {
+    a.transpose()
 }
