@@ -4,7 +4,7 @@ use core::ops::Deref;
 
 use crate::{
     arc::{ArcPtr, NonNullArcPtr},
-    atomic::{AtomicArcPtr, AtomicOptionArcPtr},
+    atomic::{AtomicArcPtr, AtomicOptionArcPtr, CachedOrReloaded},
     domain::Domain,
     write_policy::WritePolicy,
 };
@@ -21,6 +21,11 @@ pub trait AtomicArcRef {
     type LoadCached<'a>
     where
         Self::Arc: 'a;
+    /// The value returned by
+    /// [`AtomicArc::load_cached_or_reload`](AtomicArcPtr::load_cached_or_reload).
+    type LoadCachedOrReload<'a>
+    where
+        Self::Arc: 'a;
     /// Load an owned Arc pointer.
     ///
     /// See [`AtomicArc::load_owned`](AtomicArcPtr::load_owned).
@@ -29,6 +34,10 @@ pub trait AtomicArcRef {
     ///
     /// See [`AtomicArc::load_cached`](AtomicArcPtr::load_cached).
     fn load_cached<'a>(&self, cached: &'a mut Self::Owned) -> Self::LoadCached<'a>;
+    /// Load an Arc pointer using a given cached value, updating it if necessary.
+    ///
+    /// See [`AtomicArc::load_cached`](AtomicArcPtr::load_cached).
+    fn load_cached_or_reload<'a>(&self, cached: &'a Self::Owned) -> Self::LoadCachedOrReload<'a>;
 }
 
 impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcRef for AtomicArcPtr<A, D, W> {
@@ -38,6 +47,10 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcRef for AtomicArcPtr<A, D, W
         = &'a A
     where
         Self::Arc: 'a;
+    type LoadCachedOrReload<'a>
+        = CachedOrReloaded<'a, A>
+    where
+        Self::Arc: 'a;
     #[inline]
     fn load_owned(&self) -> Self::Owned {
         self.load_owned()
@@ -45,6 +58,10 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcRef for AtomicArcPtr<A, D, W
     #[inline(always)]
     fn load_cached<'a>(&self, cached: &'a mut Self::Owned) -> Self::LoadCached<'a> {
         self.load_cached(cached)
+    }
+    #[inline(always)]
+    fn load_cached_or_reload<'a>(&self, cached: &'a Self::Owned) -> Self::LoadCachedOrReload<'a> {
+        self.load_cached_or_reload(cached)
     }
 }
 
@@ -55,6 +72,10 @@ impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicArcRef for AtomicOptionA
         = Option<&'a A>
     where
         Self::Arc: 'a;
+    type LoadCachedOrReload<'a>
+        = Option<CachedOrReloaded<'a, A>>
+    where
+        Self::Arc: 'a;
     #[inline]
     fn load_owned(&self) -> Self::Owned {
         self.load_owned()
@@ -62,6 +83,9 @@ impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicArcRef for AtomicOptionA
     #[inline(always)]
     fn load_cached<'a>(&self, cached: &'a mut Self::Owned) -> Self::LoadCached<'a> {
         self.load_cached(cached)
+    }
+    fn load_cached_or_reload<'a>(&self, cached: &'a Self::Owned) -> Self::LoadCachedOrReload<'a> {
+        self.load_cached_or_reload(cached)
     }
 }
 
@@ -75,6 +99,10 @@ where
         = <T::Target as AtomicArcRef>::LoadCached<'a>
     where
         Self::Arc: 'a;
+    type LoadCachedOrReload<'a>
+        = <T::Target as AtomicArcRef>::LoadCachedOrReload<'a>
+    where
+        Self::Arc: 'a;
     #[inline]
     fn load_owned(&self) -> Self::Owned {
         (**self).load_owned()
@@ -83,14 +111,18 @@ where
     fn load_cached<'a>(&self, cached: &'a mut Self::Owned) -> Self::LoadCached<'a> {
         (**self).load_cached(cached)
     }
+    #[inline]
+    fn load_cached_or_reload<'a>(&self, cached: &'a Self::Owned) -> Self::LoadCachedOrReload<'a> {
+        (**self).load_cached_or_reload(cached)
+    }
 }
 
 /// A cache for a shared [`AtomicArc`](AtomicArcPtr).
 ///
 /// Built as a wrapper around [`AtomicArc::load_cached`](AtomicArcPtr::load_cached),
-/// it essentially makes loads of up-to-date `Arc`s free, but requires a mutable reference.
+/// it essentially makes loads of up-to-date Arcs free, but requires a mutable reference.
 ///
-/// As the cache stores the latest loaded `Arc`, it can delay its reclamation until a new `Arc`
+/// As the cache stores the latest loaded Arc, it can delay its reclamation until a new Arc
 /// is loaded.
 ///
 /// # Examples
@@ -121,7 +153,7 @@ pub struct Cache<A: AtomicArcRef> {
 }
 
 impl<A: AtomicArcRef> Cache<A> {
-    /// Constructs a new `Cache`, loading and storing the up-to-date `Arc`.
+    /// Constructs a new `Cache`, loading and storing the up-to-date Arc.
     #[inline]
     pub fn new(inner: A) -> Self {
         let cached = inner.load_owned();
@@ -138,10 +170,22 @@ impl<A: AtomicArcRef> Cache<A> {
         self.inner
     }
 
-    /// Returns the cached `Arc` if it is up-to-date, or loads and caches the latest `Arc`.
+    /// Returns a reference the cached Arc, updating it when it is outdated.
     #[inline]
     pub fn load(&mut self) -> A::LoadCached<'_> {
         self.inner.load_cached(&mut self.cached)
+    }
+
+    /// Returns a reference to the cached Arc if it is up-to-date, or loads the latest Arc.
+    ///
+    /// Contrary to [`load`](Self::load), it doesn't require a mutable reference; as a consequence,
+    /// the cached Arc is not updated when the latest Arc is loaded.
+    ///
+    /// This method is intended for workflows where the atomic Arc is unlikely to be updated after
+    /// the cache construction.
+    #[inline]
+    pub fn load_shared(&self) -> A::LoadCachedOrReload<'_> {
+        self.inner.load_cached_or_reload(&self.cached)
     }
 }
 
