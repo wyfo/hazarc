@@ -718,8 +718,3 @@ impl<'a, A: NonNullArcPtr, D: Domain, W: WritePolicy> From<&'a AtomicArcPtr<Opti
         unsafe { mem::transmute::<&'a AtomicArcPtr<Option<A>, D, W>, Self>(value) }
     }
 }
-
-#[unsafe(no_mangle)]
-fn plop(a: CachedOrReloaded<Option<Arc<usize>>>) -> Option<CachedOrReloaded<Arc<usize>>> {
-    a.transpose()
-}
