@@ -1,4 +1,4 @@
-use std::{sync::Arc, thread};
+use std::thread;
 
 use hazarc::{
     domain::Domain,
