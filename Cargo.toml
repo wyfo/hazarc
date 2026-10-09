@@ -25,6 +25,7 @@ serde = { version = "1", optional = true }
 [dev-dependencies]
 arc-swap = "1.8.0"
 divan = "0.1.21"
+rstest = "0.27.0"
 
 [lib]
 bench = false
