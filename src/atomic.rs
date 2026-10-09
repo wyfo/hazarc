@@ -359,10 +359,11 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D, Concurrent> {
     }
 
     /// Fetches the current Arc, applies a function on it and tries to store the result if
-    /// the current Arc has not changed.
+    /// the current Arc has not changed, retrying otherwise.
     ///
-    /// Returns `Err` with the current Arc if the function returns `None`.
-    pub fn fetch_update<F: FnMut(&A) -> Option<R>, R: Into<A>>(
+    /// Returns `Ok` with the previous Arc if the store succeeds, or `Err` with the current Arc
+    /// if the function returns `None`.
+    pub fn try_update<F: FnMut(&A) -> Option<R>, R: Into<A>>(
         &self,
         mut f: F,
     ) -> Result<A, ArcPtrBorrow<A>> {
@@ -374,6 +375,23 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D, Concurrent> {
             }
         }
         Err(current)
+    }
+
+    /// Fetches the current Arc, applies a function on it and tries to store the result if
+    /// the current Arc has not changed, retrying otherwise.
+    ///
+    /// Returns the previous Arc.
+    pub fn update<F: FnMut(&A) -> R, R: Into<A>>(&self, mut f: F) -> A {
+        self.try_update(|arc| Some(f(arc))).ok().unwrap()
+    }
+
+    #[doc(hidden)]
+    #[deprecated(note = "use `try_update` instead")]
+    pub fn fetch_update<F: FnMut(&A) -> Option<R>, R: Into<A>>(
+        &self,
+        f: F,
+    ) -> Result<A, ArcPtrBorrow<A>> {
+        self.try_update(f)
     }
 }
 
@@ -676,16 +694,34 @@ impl<A: NonNullArcPtr, D: Domain> AtomicOptionArcPtr<A, D, Concurrent> {
     }
 
     /// Fetches the current Arc, applies a function on it and tries to store the result if
-    /// the current Arc has not changed.
+    /// the current Arc has not changed, retrying otherwise.
     ///
-    /// Returns `Err` with the current Arc if the function returns `None`.
-    pub fn fetch_update<F: FnMut(Option<&A>) -> Option<R>, R: Into<Option<A>>>(
+    /// Returns `Ok` with the previous Arc if the store succeeds, or `Err` with the current Arc
+    /// if the function returns `None`.
+    pub fn try_update<F: FnMut(Option<&A>) -> Option<R>, R: Into<Option<A>>>(
         &self,
         mut f: F,
     ) -> Result<Option<A>, Option<ArcPtrBorrow<A>>> {
         self.0
-            .fetch_update(|arc| f(arc.as_ref()))
+            .try_update(|arc| f(arc.as_ref()))
             .map_err(ArcPtrBorrow::transpose)
+    }
+
+    /// Fetches the current Arc, applies a function on it and tries to store the result if
+    /// the current Arc has not changed, retrying otherwise.
+    ///
+    /// Returns the previous Arc.
+    pub fn update<F: FnMut(Option<&A>) -> R, R: Into<Option<A>>>(&self, mut f: F) -> Option<A> {
+        self.0.update(|arc| f(arc.as_ref()))
+    }
+
+    #[doc(hidden)]
+    #[deprecated(note = "use `try_update` instead")]
+    pub fn fetch_update<F: FnMut(Option<&A>) -> Option<R>, R: Into<Option<A>>>(
+        &self,
+        f: F,
+    ) -> Result<Option<A>, Option<ArcPtrBorrow<A>>> {
+        self.try_update(f)
     }
 }
 impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> Default for AtomicOptionArcPtr<A, D, W> {

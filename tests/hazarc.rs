@@ -155,8 +155,8 @@ fn fetch_and_add<D: Domain>(
 ) {
     let atomic_arc = AtomicArc::<usize, D, Concurrent>::from(0);
     thread::scope(|s| {
-        s.spawn(|| atomic_arc.fetch_update(|i| Some(**i + 1)));
-        s.spawn(|| atomic_arc.fetch_update(|i| Some(**i + 1)));
+        s.spawn(|| atomic_arc.update(|i| **i + 1));
+        s.spawn(|| atomic_arc.update(|i| **i + 1));
     });
     assert_eq!(**atomic_arc.load(), 2);
 }
