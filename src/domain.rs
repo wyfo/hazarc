@@ -6,8 +6,8 @@
 //!
 //! Each domain's node owns a number of borrow slots, which allows
 //! [`AtomicArc::load`](crate::AtomicArc::load) to "borrow" an `Arc` reference without having to
-//! increment its reference count. If no slot is available, a slower fallback mechanism allows to
-//! clone the `Arc`, making `AtomicArc::load` not limited by the number of slots.
+//! increment its reference count. If all slots are in use, `AtomicArc::load` falls back to cloning
+//! the `Arc`, so it is not limited by the number of slots.
 //!
 //! Domains are isolated from each other, removing contention between `AtomicArc` using different
 //! domains.
@@ -318,15 +318,16 @@ impl<D: Domain> Drop for ListAccessGuard<'_, D> {
 
 pub(crate) type BorrowSlot = AtomicPtr<()>;
 
-#[repr(C)]
+#[repr(C)] // borrow_slots must be the last field
 pub(crate) struct DomainNode {
     _align: CachePadded<()>,
     next: AtomicPtr<DomainNode>,
     in_use: AtomicUsize,
-    clone_slot: AtomicPtr<()>,
     atomic_arc_slot: AtomicPtr<()>,
-    clone_generation: Cell<usize>,
+    load_generation: Cell<usize>,
+    // Wrapping around BORROW_SLOT_COUNT
     next_borrow_slot_idx: Cell<usize>,
+    // `BORROW_SLOT_COUNT` borrow slots followed by the extra slot
     borrow_slots: [BorrowSlot; 0],
 }
 
@@ -349,7 +350,6 @@ impl<D> Clone for DomainNodeRef<D> {
 impl<D> Copy for DomainNodeRef<D> {}
 
 impl<D: Domain> DomainNodeRef<D> {
-    #[allow(unstable_name_collisions)]
     unsafe fn new(ptr: *const DomainNode) -> Option<Self> {
         Some(Self {
             node: NonNull::new(ptr.cast_mut())?,
@@ -376,7 +376,7 @@ impl<D: Domain> DomainNodeRef<D> {
 
     fn layout() -> Layout {
         let (layout, _) = Layout::new::<DomainNode>()
-            .extend(Layout::array::<AtomicPtr<()>>(D::BORROW_SLOT_COUNT).unwrap())
+            .extend(Layout::array::<BorrowSlot>(D::BORROW_SLOT_COUNT + 1).unwrap())
             .unwrap();
         layout
     }
@@ -396,7 +396,6 @@ impl<D: Domain> DomainNodeRef<D> {
         let in_use = node_field!(self.in_use).load(SeqCst);
         debug_assert_eq!(in_use, 0);
         debug_assert!((self.borrow_slots().iter()).all(|s| s.load(Relaxed).is_null()));
-        debug_assert!(self.clone_slot().load(Relaxed).is_null());
         let layout = Self::layout();
         unsafe { dealloc(self.as_ptr().cast(), layout) }
     }
@@ -439,14 +438,13 @@ impl<D: Domain> DomainNodeRef<D> {
     pub(crate) fn borrow_slots(self) -> &'static [BorrowSlot] {
         unsafe {
             let slots = ptr::addr_of!((*self.as_ptr()).borrow_slots);
-            slice::from_raw_parts(slots as _, D::BORROW_SLOT_COUNT)
+            slice::from_raw_parts(slots as _, D::BORROW_SLOT_COUNT + 1)
         }
     }
 
     node_field_getter!(next_borrow_slot_idx: Cell<usize>);
-    node_field_getter!(clone_slot: AtomicPtr<()>);
     node_field_getter!(atomic_arc_slot: AtomicPtr<()>);
-    node_field_getter!(clone_generation: Cell<usize>);
+    node_field_getter!(load_generation: Cell<usize>);
 }
 
 impl<D: Domain> fmt::Debug for DomainNodeRef<D> {
@@ -456,8 +454,11 @@ impl<D: Domain> fmt::Debug for DomainNodeRef<D> {
             .field("domain", &core::any::type_name::<D>())
             .field("in_use", &(in_use & IN_USE != 0))
             .field("active_writers", &(in_use >> IN_USE))
-            .field("borrow_slots", &self.borrow_slots())
-            .field("clone_slot", node_field!(self.clone_slot))
+            .field(
+                "borrow_slots",
+                &&self.borrow_slots()[..D::BORROW_SLOT_COUNT],
+            )
+            .field("extra_slot", &self.borrow_slots()[D::BORROW_SLOT_COUNT])
             .finish_non_exhaustive()
     }
 }

@@ -86,13 +86,17 @@
 //!
 //! # Write policy
 //!
-//! `AtomicArc` has a generic `WritePolicy` parameter with the following variants:
-//! - `Serialized`: writes on a given `AtomicArc` should be serialized — with a mutex, a MPSC task,
-//!   etc. Concurrent writes are still safe with this policy, but can provoke non-monotonic reads,
-//!   i.e. a subsequent load may observe an older value than a previous load.
-//! - `Concurrent` (the default): writes on a given `AtomicArc` can be concurrent. This adds a
+//! `AtomicArc` has a generic [`WritePolicy`] parameter with the following variants:
+//! - [`Serialized`]: writes on a given `AtomicArc` should be serialized — with a mutex, a MPSC
+//!   task, etc. Concurrent writes are still safe with this policy, but can provoke non-monotonic
+//!   reads, i.e. a subsequent load may observe an older value than a previous load.
+//! - [`Concurrent`] (the default): writes on a given `AtomicArc` can be concurrent. This adds a
 //!   small overhead to the non-critical path of reads, and a larger overhead to writes on 32-bit
 //!   platforms.
+//!
+//! [`WritePolicy`]: write_policy::WritePolicy
+//! [`Concurrent`]: write_policy::Concurrent
+//! [`Serialized`]: write_policy::Serialized
 //!
 //! # Wait-freedom
 //!
@@ -109,9 +113,18 @@
 //! nodes required by the program. In that case, insertion into the domain's global list is bounded
 //! by the number of allocated nodes, and thread-local accesses are wait-free.
 //!
+//! ### `Arc` deallocation
+//!
+//! In case of a concurrent write, a loaded [`ArcBorrow`] might contain the last reference to the
+//! underlying `Arc`, which is thus deallocated on drop. In some edge cases, an `Arc` can also be
+//! de allocated during `AtomicArc::load`.
+//!
+//! Those deallocations are not part of the algorithm itself, which only drop the [`ArcPtr`]
+//! instances.
+//!
 //! #### Concurrent writes on 32-bit platforms
 //!
-//! Concurrent writes require handling the ABA problem with a generation counter, which can
+//! `Concurrent` writes require handling the ABA problem with a generation counter, which can
 //! overflow on 32-bit platforms. On overflow, the thread-local node has to be released, and
 //! subsequent `AtomicArc::load` call may allocate a new node. As a consequence, wait-freedom is
 //! only guaranteed for at least 2^31 consecutive loads.
@@ -126,6 +139,7 @@
 //! internally, with the same consequences on wait-freedom.
 //!
 //! [access the thread-local node]: domain::Domain::get_or_acquire_thread_local_node
+//! [`ArcPtr`]: arc::ArcPtr
 //!
 //! # Safety
 //!

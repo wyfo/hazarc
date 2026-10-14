@@ -8,25 +8,59 @@ use core::{
     mem::ManuallyDrop,
     ops::Deref,
     sync::atomic::{
-        AtomicPtr,
-        Ordering::{Acquire, Relaxed, SeqCst},
+        fence, AtomicPtr,
+        Ordering::{Acquire, Relaxed, Release, SeqCst},
     },
 };
 
 #[allow(unused_imports)]
 use crate::msrv::{OptionExt, StrictProvenance};
 use crate::{
-    arc::{ArcPtr, ArcRef, NonNullArcPtr},
+    arc::{ArcPtr, ArcPtrExt, ArcRef, DropVTable, NonNullArcPtr},
     domain::{BorrowSlot, Domain, DomainNodeRef},
     msrv::ptr,
     write_policy::{Concurrent, WritePolicy},
     NULL,
 };
 
-const PREPARE_CLONE_FLAG: usize = 0b01;
-const CONFIRM_CLONE_FLAG: usize = 0b10;
-const GENERATION_INCR: usize = PREPARE_CLONE_FLAG + 1;
-const MAX_GENERATION: usize = !PREPARE_CLONE_FLAG;
+// Slot tags, stored in the 2 LSBs (`ArcPtr` pointers are aligned to 4).
+const TAG_MASK: usize = 0b11;
+/// A borrowed (validated or not) Arc pointer.
+#[allow(dead_code)]
+const BORROWED: usize = 0b00;
+/// The ownership of a borrowed pointer has been transferred by a writer, with its [`DropVTable`].
+const UPGRADED: usize = 0b01;
+/// A slow-path load is pending, with the loaded `AtomicArc` address (`Serialized`)
+/// or a generation (`Concurrent`).
+const LOADING: usize = 0b10;
+/// An owned Arc pointer provided by a helping writer to a concurrent loading.
+const OWNED: usize = 0b11;
+/// `LOADING` generations (i.e. ABA counter) for `Concurrent`, are stored above the tag bits.
+const GENERATION_INCR: usize = TAG_MASK + 1;
+/// Generation can overflow on 32-bit
+const MAX_GENERATION: usize = !TAG_MASK;
+
+trait TaggedPtr: Sized {
+    fn tag(self) -> usize;
+    fn with_tag(self, tag: usize) -> Self;
+    fn without_tag(self, tag: usize) -> Self;
+}
+impl TaggedPtr for *mut () {
+    #[inline(always)]
+    fn tag(self) -> usize {
+        self.addr() & TAG_MASK
+    }
+    #[inline(always)]
+    fn with_tag(self, tag: usize) -> Self {
+        debug_assert_eq!(self.tag(), 0);
+        self.map_addr(|addr| addr + tag)
+    }
+    #[inline(always)]
+    fn without_tag(self, tag: usize) -> Self {
+        debug_assert_eq!(self.tag(), tag);
+        self.map_addr(|addr| addr - tag)
+    }
+}
 
 /// An atomic storage for generic `Arc`-like pointers.
 ///
@@ -63,15 +97,17 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
             return ArcPtrBorrow::new(NULL, None);
         }
         debug_assert!(!ptr.is_null());
+        debug_assert_eq!(ptr.tag(), 0, "`ArcPtr` pointers must be aligned to 4");
         let node = D::get_or_acquire_thread_local_node();
         let slot_idx = match D::BORROW_SLOT_COUNT {
-            0 => return self.load_clone(node),
-            1 => 0,
+            // with no borrow slot, slot 0 is the extra slot, which is always available
+            0 | 1 => 0,
             _ => node.next_borrow_slot_idx().get(),
         };
         let slot = unsafe { node.borrow_slots().get_unchecked(slot_idx) };
-        if slot.load(Relaxed).is_null() {
-            self.load_with_slot(ptr, node, slot, slot_idx)
+        let into_owned = D::BORROW_SLOT_COUNT == 0;
+        if into_owned || slot.load(Relaxed).is_null() {
+            self.load_with_slot(ptr, node, slot, slot_idx, into_owned)
         } else {
             self.load_find_available_slot(ptr, node)
         }
@@ -84,19 +120,26 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         node: DomainNodeRef<D>,
         slot: &'static BorrowSlot,
         slot_idx: usize,
+        into_owned: bool,
     ) -> ArcPtrBorrow<A> {
         slot.store(ptr, SeqCst);
         let ptr_checked = self.ptr.load(SeqCst);
         if ptr != ptr_checked {
-            return self.load_outdated(ptr, node, ptr_checked, slot);
+            return self.load_slow(node, slot, ptr);
+        }
+        if into_owned {
+            debug_assert_eq!(slot_idx, D::BORROW_SLOT_COUNT);
+            return ArcPtrBorrow::<A>::new(ptr_checked, Some(slot))
+                .clone()
+                .into();
+        }
+        // The assertion is already known by compiler in `load_impl` with `get_unchecked`,
+        // but it has to be repeated here to be taken into account for the modulo when borrow
+        // slot count is not a multiple of 2
+        if slot_idx >= D::BORROW_SLOT_COUNT {
+            unsafe { hint::unreachable_unchecked() }; // MSRV 1.81
         }
         if D::BORROW_SLOT_COUNT > 1 {
-            // The assertion is already known by compiler in `load_impl` with `get_unchecked`,
-            // but it has to be repeated here to be taken into account for the modulo when borrow
-            // slot count is not a multiple of 2
-            if slot_idx >= D::BORROW_SLOT_COUNT {
-                unsafe { hint::unreachable_unchecked() }; // MSRV 1.81
-            }
             node.next_borrow_slot_idx()
                 .set((slot_idx + 1) % D::BORROW_SLOT_COUNT);
         }
@@ -106,83 +149,72 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     #[cold]
     #[inline(never)]
     fn load_find_available_slot(&self, ptr: *mut (), node: DomainNodeRef<D>) -> ArcPtrBorrow<A> {
-        if D::BORROW_SLOT_COUNT == 1 {
-            return self.load_clone(node);
-        }
-        match (node.borrow_slots().iter().enumerate())
+        let (slot_idx, slot) = (node.borrow_slots().iter().enumerate())
             .find(|(_, slot)| slot.load(Relaxed).is_null())
-        {
-            Some((slot_idx, slot)) => self.load_with_slot(ptr, node, slot, slot_idx),
-            None => self.load_clone(node),
-        }
+            .expect("the last slot should always be available");
+        self.load_with_slot(ptr, node, slot, slot_idx, slot_idx == D::BORROW_SLOT_COUNT)
     }
 
     #[cold]
     #[inline(never)]
-    fn load_outdated(
+    fn load_slow(
         &self,
-        ptr: *mut (),
         node: DomainNodeRef<D>,
-        ptr_checked: *mut (),
         slot: &'static BorrowSlot,
+        outdated_ptr: *mut (),
     ) -> ArcPtrBorrow<A> {
-        if A::NULLABLE && ptr_checked.is_null() {
-            if let Err(p) = slot.compare_exchange(ptr, NULL, SeqCst, Relaxed) {
-                #[cfg(feature = "domain-gc")]
-                debug_assert_eq!(p.addr(), 1);
-                #[cfg(not(feature = "domain-gc"))]
-                debug_assert!(p.is_null());
-                unsafe { A::decr_rc(ptr) };
-            }
-            ArcPtrBorrow::new(NULL, None)
-        } else if let Err(p) = slot.compare_exchange(ptr, NULL, SeqCst, Relaxed) {
-            #[cfg(feature = "domain-gc")]
-            debug_assert_eq!(p.addr(), 1);
-            #[cfg(not(feature = "domain-gc"))]
-            debug_assert!(p.is_null());
-            ArcPtrBorrow::new(ptr, None)
-        } else {
-            self.load_clone(node)
-        }
-    }
-
-    #[allow(unstable_name_collisions)]
-    fn load_clone(&self, node: DomainNodeRef<D>) -> ArcPtrBorrow<A> {
-        let clone_slot = node.clone_slot();
         let self_ptr = ptr::from_ref(&self.ptr).cast_mut().cast();
-        let prepare_ptr = if W::CONCURRENT {
-            node.atomic_arc_slot().store(self_ptr, Relaxed);
-            let generation = node.clone_generation().get();
-            node.clone_generation()
+        let loading_ptr = if W::CONCURRENT {
+            // Release store, so the slot load following the acquire load in
+            // `is_same_atomic_arc` cannot be stale.
+            node.atomic_arc_slot().store(self_ptr, Release);
+            let generation = node.load_generation().get();
+            node.load_generation()
                 .set(generation.wrapping_add(GENERATION_INCR));
             if generation == MAX_GENERATION {
                 D::release_thread_local_node();
             }
-            ptr::without_provenance_mut(generation | PREPARE_CLONE_FLAG)
+            ptr::without_provenance_mut::<()>(generation).with_tag(LOADING)
         } else {
-            self_ptr.map_addr(|addr| addr | PREPARE_CLONE_FLAG)
+            self_ptr.with_tag(LOADING)
         };
-        clone_slot.store(prepare_ptr, SeqCst);
-        let ptr_checked = self.ptr.load(SeqCst);
-        if A::NULLABLE && ptr_checked.is_null() {
-            let ptr = clone_slot.swap(NULL, SeqCst);
-            if ptr != prepare_ptr {
-                unsafe { A::decr_rc(ptr) };
-            }
-            return ArcPtrBorrow::new(NULL, None);
-        }
-        let confirm_ptr = (ptr_checked).map_addr(|addr| addr | CONFIRM_CLONE_FLAG);
+        // An outdated borrow may have been upgraded, but it was never validated, so the writer
+        // may come from another `AtomicArc` reusing the same allocation, possibly with another
+        // pointer type. It must not be used, only released with the provided vtable.
+        // The slot can only contain the outdated borrow, or its upgrade, so it can be swapped.
+        // SeqCst also acquires the ownership transfer, so it happens before the release.
+        let outdated_or_upgraded = slot.swap(loading_ptr, SeqCst);
+        let ptr = self.ptr.load(SeqCst);
         // Failure ordering must be SeqCst for load to have a full SeqCst semantic
-        if let Err(ptr) = clone_slot.compare_exchange(prepare_ptr, confirm_ptr, SeqCst, SeqCst) {
-            clone_slot.store(NULL, SeqCst);
-            return ArcPtrBorrow::new(ptr, None);
+        let borrow = match slot.compare_exchange(loading_ptr, ptr, SeqCst, SeqCst) {
+            // the slot is released if the pointer is null
+            Ok(_) if A::NULLABLE && ptr.is_null() => ArcPtrBorrow::<A>::new(NULL, None),
+            Ok(_) => {
+                let mut borrow = ArcPtrBorrow::<A>::new(ptr, Some(slot));
+                // The extra slot must be released before releasing the upgraded pointer,
+                // as the latter may reenter `load`.
+                let extra_slot = unsafe { node.borrow_slots().get_unchecked(D::BORROW_SLOT_COUNT) };
+                if ptr::eq(slot, extra_slot) {
+                    borrow = borrow.clone().into();
+                }
+                borrow
+            }
+            Err(owned_ptr) => {
+                debug_assert_eq!(owned_ptr.tag(), OWNED);
+                // A writer thread never modifies an `OWNED` slot,
+                // so it can be released with a store.
+                slot.store(NULL, Release);
+                ArcPtrBorrow::new(owned_ptr.without_tag(OWNED), None)
+            }
+        };
+        if outdated_or_upgraded != outdated_ptr {
+            let vtable = outdated_or_upgraded
+                .without_tag(UPGRADED)
+                .cast::<DropVTable>();
+            // SAFETY: an upgraded slot contains a static vtable
+            unsafe { ((*vtable).drop)(outdated_ptr) };
         }
-        unsafe { A::incr_rc(ptr_checked) };
-        if let Err(p) = (node.clone_slot()).compare_exchange(confirm_ptr, NULL, SeqCst, Acquire) {
-            debug_assert!(p.is_null());
-            unsafe { A::decr_rc(ptr_checked) };
-        }
-        ArcPtrBorrow::new(ptr_checked, None)
+        borrow
     }
 
     /// Loads an owned Arc.
@@ -227,93 +259,75 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
 
     /// Stores the Arc and returns the previous one.
     pub fn swap(&self, arc: A) -> A {
-        // store a clone in order to keep an owned arc, in case its ownership must be transferred
-        let old_ptr = self.ptr.swap(A::into_ptr(arc.clone()), SeqCst);
-        self.swap_impl(old_ptr, Some(arc))
+        let old_ptr = self.ptr.swap(A::into_ptr(arc), SeqCst);
+        self.swap_impl(old_ptr)
     }
 
-    #[allow(unstable_name_collisions)]
-    fn swap_impl(&self, old_ptr: *mut (), mut new: Option<A>) -> A {
-        fn transfer_ownership<A: ArcPtr>(
-            ptr: *mut (),
-            op: impl FnOnce() -> Result<*mut (), *mut ()>,
-        ) -> Result<*mut (), *mut ()> {
-            unsafe { A::incr_rc(ptr) };
-            let res = op();
-            if res.is_err() {
-                unsafe { A::decr_rc(ptr) };
-            }
-            res
-        }
+    /// Scans all the domain's slots, providing an owned pointer to pending slow-path loads of
+    /// this `AtomicArc`, and transferring the ownership of the old pointer to its borrows.
+    fn swap_impl(&self, old_ptr: *mut ()) -> A {
         let old_arc = unsafe { A::from_ptr(old_ptr) };
+        let mut owned_cache: Option<ArcPtrBorrow<A>> = None;
         for node in D::static_list().nodes() {
             #[cfg(any(
                 not(target_pointer_width = "64"),
                 hazarc_force_active_writer_count_64bit
             ))]
             let _guard = W::CONCURRENT.then(|| node.writer_guard());
-            if !A::NULLABLE || !old_ptr.is_null() {
-                for slot in node.borrow_slots().iter() {
-                    if slot.load(SeqCst) == old_ptr {
-                        let _ = transfer_ownership::<A>(old_ptr, || {
-                            #[cfg(feature = "domain-gc")]
-                            let reset = ptr::without_provenance_mut(1);
-                            #[cfg(not(feature = "domain-gc"))]
-                            let reset = NULL;
-                            // Acquire failure so borrow happens before
-                            slot.compare_exchange(old_ptr, reset, SeqCst, Acquire)
-                        });
+            for slot in node.borrow_slots() {
+                let mut slot_ptr = slot.load(SeqCst);
+                if slot_ptr.is_null() {
+                    continue;
+                }
+                if slot_ptr.tag() == LOADING && self.is_same_atomic_arc(node, slot, &mut slot_ptr) {
+                    let owned = match owned_cache.as_mut() {
+                        Some(cached) if W::CONCURRENT => cached.reload(self),
+                        _ => owned_cache.get_or_insert_with(|| self.load()),
+                    };
+                    if let Err(ptr) = owned.transfer_ownership(|owned_ptr| {
+                        // Acquire failure, so the borrow release happens before the old pointer
+                        // is returned (and possibly dropped)
+                        slot.compare_exchange(slot_ptr, owned_ptr.with_tag(OWNED), SeqCst, Acquire)
+                    }) {
+                        // the slow-path load may have borrowed the old pointer in the meantime
+                        slot_ptr = ptr;
                     }
                 }
-            }
-            let Some(mut new_ptr) = new.as_ref().map(A::as_ptr) else {
-                continue;
-            };
-            let clone_slot = node.clone_slot();
-            let mut clone_ptr = clone_slot.load(SeqCst);
-            if clone_ptr.addr() & (PREPARE_CLONE_FLAG | CONFIRM_CLONE_FLAG) == 0 {
-                continue;
-            }
-            if clone_ptr.addr() & PREPARE_CLONE_FLAG != 0
-                && self.is_same_atomic_arc(node, &mut clone_ptr)
-            {
-                if W::CONCURRENT {
-                    // Reload the arc if it is outdated to avoid non-monotonic loads,
-                    // as this swap execution could be late, and a previous load of
-                    // this node's thread could have loaded the value arc of a subsequent swap
-                    let ptr_checked = self.ptr.load(SeqCst);
-                    if ptr_checked != new_ptr {
-                        let arc = self.load_impl(ptr_checked).into_owned();
-                        new_ptr = A::as_ptr(&arc);
-                        new = Some(arc);
-                    }
+                // The slot may have been released after a `LOADING` value, so it can be null
+                if slot_ptr == old_ptr && (!A::NULLABLE || !old_ptr.is_null()) {
+                    let _ = old_arc.transfer_ownership(|old_ptr| {
+                        let vtable = ptr::from_ref(A::DROP_VTABLE).cast_mut().cast::<()>();
+                        // Acquire failure, so the borrow release happens before the old pointer
+                        // is returned (and possibly dropped)
+                        slot.compare_exchange(old_ptr, vtable.with_tag(UPGRADED), SeqCst, Acquire)
+                    });
                 }
-                if let Err(p) = transfer_ownership::<A>(new_ptr, || {
-                    clone_slot.compare_exchange(clone_ptr, new_ptr, SeqCst, Relaxed)
-                }) {
-                    clone_ptr = p;
-                }
-            }
-            if clone_ptr.addr() == old_ptr.addr() | CONFIRM_CLONE_FLAG {
-                let _ = transfer_ownership::<A>(old_ptr, || {
-                    clone_slot.compare_exchange(clone_ptr, NULL, SeqCst, Relaxed)
-                });
             }
         }
         old_arc
     }
 
-    #[allow(unstable_name_collisions)]
-    fn is_same_atomic_arc(&self, node: DomainNodeRef<D>, clone_ptr: &mut *mut ()) -> bool {
+    fn is_same_atomic_arc(
+        &self,
+        node: DomainNodeRef<D>,
+        slot: &BorrowSlot,
+        slot_ptr: &mut *mut (),
+    ) -> bool {
         let self_ptr = ptr::from_ref(&self.ptr).cast_mut().cast();
         if W::CONCURRENT {
-            node.atomic_arc_slot().load(Relaxed) == self_ptr && {
-                let prev_clone_ptr = *clone_ptr;
-                *clone_ptr = node.clone_slot().load(SeqCst);
-                *clone_ptr == prev_clone_ptr
-            }
+            // Acquire load synchronizes with the release store in `load_slow`,
+            // so the following slot load cannot be stale.
+            // Without the synchronization, it would be possible to reload the
+            // same generation while the atomic_arc_slot would come from a future
+            // load of another `AtomicArc`, so the slot would be ignored.
+            let same_atomic_arc = node.atomic_arc_slot().load(Acquire) == self_ptr;
+            let prev_slot_ptr = *slot_ptr;
+            // The slot is always reloaded, as a pending load may have completed by a borrow
+            // of the swapped out arc.
+            *slot_ptr = slot.load(SeqCst);
+            same_atomic_arc && *slot_ptr == prev_slot_ptr
         } else {
-            clone_ptr.addr() == self_ptr.addr() | PREPARE_CLONE_FLAG
+            *slot_ptr == self_ptr.with_tag(LOADING)
         }
     }
 
@@ -331,7 +345,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         if A::NULLABLE && ptr.is_null() {
             return unsafe { A::from_ptr(NULL) };
         }
-        self.swap_impl(ptr, None)
+        self.swap_impl(ptr)
     }
 
     /// Consumes the atomic storage and returns the stored Arc.
@@ -347,12 +361,11 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D, Concurrent> {
     ///
     /// Returns the previous Arc if store succeeds, or loads the current Arc otherwise.
     pub fn compare_exchange<C: ArcRef<A>>(&self, current: C, new: A) -> Result<A, ArcPtrBorrow<A>> {
-        // store a clone in order to keep an owned arc, in case its ownership must be transferred
-        let new_clone = A::into_ptr(new.clone());
-        match (self.ptr).compare_exchange(C::as_ptr(current), new_clone, SeqCst, Acquire) {
-            Ok(old_ptr) => Ok(self.swap_impl(old_ptr, Some(new))),
+        let new = ManuallyDrop::new(new);
+        match (self.ptr).compare_exchange(C::as_ptr(current), A::as_ptr(&new), SeqCst, Acquire) {
+            Ok(old_ptr) => Ok(self.swap_impl(old_ptr)),
             Err(old_ptr) => {
-                unsafe { A::decr_rc(new_clone) };
+                drop(ManuallyDrop::into_inner(new));
                 Err(self.load_impl(old_ptr))
             }
         }
@@ -463,7 +476,7 @@ impl<T, D: Domain, W: WritePolicy> From<Option<T>> for AtomicArcPtr<Option<Arc<T
     }
 }
 
-/// A borrow of an `Arc`-like pointer.
+/// A borrow of an `Arc`-like pointer, returned by [`AtomicArcPtr::load`].
 ///
 /// In most cases, the borrowed Arc doesn't need to be cloned, hence the name.
 #[must_use]
@@ -490,6 +503,19 @@ impl<A: ArcPtr> ArcPtrBorrow<A> {
         }
         self.clone()
     }
+
+    /// Reload the borrow if it is outdated.
+    #[inline]
+    pub fn reload<D: Domain, W: WritePolicy>(
+        &mut self,
+        atomic: &AtomicArcPtr<A, D, W>,
+    ) -> &mut Self {
+        let ptr = atomic.ptr.load(SeqCst);
+        if ptr != ArcPtr::as_ptr(&*self.arc) {
+            *self = atomic.load_impl_cold(ptr);
+        }
+        self
+    }
 }
 
 impl<A: NonNullArcPtr> ArcPtrBorrow<Option<A>> {
@@ -507,21 +533,20 @@ impl<A: ArcPtr> Drop for ArcPtrBorrow<A> {
     #[inline]
     fn drop(&mut self) {
         let ptr = A::as_ptr(&self.arc);
-        // Acquire failure so other successfully released borrow which happens before the release
-        // in swap happens before this one
-        if (self.slot).is_none_or(|slot| slot.compare_exchange(ptr, NULL, SeqCst, Acquire).is_err())
-        {
-            #[cold]
-            #[inline(never)]
-            fn drop_arc<A>(_: A, _slot: Option<&'static BorrowSlot>) {
-                #[cfg(feature = "domain-gc")]
-                if let Some(slot) = _slot {
-                    debug_assert_eq!(slot.load(Relaxed).addr(), 1);
-                    slot.store(NULL, SeqCst);
-                }
+        // Reset the borrow slot to NULL with Release so the use of the Arc happens before its
+        // release, as slots are loaded with SeqCst (Acquire) in `swap_impl`.
+        if let Some(slot_ptr) = self.slot.map(|slot| slot.swap(NULL, Release)) {
+            if slot_ptr == ptr {
+                return;
             }
-            drop_arc(unsafe { ManuallyDrop::take(&mut self.arc) }, self.slot);
+            debug_assert_eq!(slot_ptr.tag(), UPGRADED);
+            // Acquire fence so the Arc clone in `swap_impl` happens before the following Arc drop.
+            fence(Acquire);
         }
+        #[cold]
+        #[inline(never)]
+        fn drop_arc<A>(_: A) {}
+        drop_arc(unsafe { ManuallyDrop::take(&mut self.arc) });
     }
 }
 
