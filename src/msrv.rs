@@ -15,6 +15,21 @@ impl<T> OptionExt<T> for Option<T> {
     }
 }
 
+// 1.76: `Result::inspect`
+#[allow(dead_code)]
+pub(crate) trait ResultExt<T, E>: Sized {
+    fn inspect<F: FnOnce(&T)>(self, f: F) -> Self;
+}
+
+impl<T, E> ResultExt<T, E> for Result<T, E> {
+    fn inspect<F: FnOnce(&T)>(self, f: F) -> Self {
+        if let Ok(ref t) = self {
+            f(t);
+        }
+        self
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) trait StrictProvenance<T>: Sized + Copy {
     type Addr;
@@ -43,7 +58,6 @@ impl<T> StrictProvenance<T> for *mut T {
     fn addr(self) -> Self::Addr {
         self as usize
     }
-    #[allow(unstable_name_collisions)]
     fn with_addr(self, addr: Self::Addr) -> Self {
         self.cast_const().with_addr(addr).cast_mut()
     }

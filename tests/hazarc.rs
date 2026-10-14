@@ -1,6 +1,8 @@
-use std::thread;
+use std::{mem::ManuallyDrop, ptr, sync::Arc, thread};
 
 use hazarc::{
+    arc::ArcPtr,
+    atomic::AtomicArcPtr,
     domain::Domain,
     write_policy::{Concurrent, Serialized, WritePolicy},
     ArcBorrow, AtomicArc, AtomicOptionArc,
@@ -161,6 +163,7 @@ fn fetch_and_add<D: Domain>(
     assert_eq!(**atomic_arc.load(), 2);
 }
 
+/// Consecutive loads must be monotonic with `Concurrent`.
 #[rstest]
 fn consecutive_loads<D: Domain>(
     #[values(test_domain!(0), test_domain!(1), test_domain!(8))] _domain: D,
@@ -176,5 +179,72 @@ fn consecutive_loads<D: Domain>(
                 assert_eq!(**a2, **atomic_arc.load());
             }
         });
+    });
+}
+
+/// An `Arc<usize>` whose value must always be `TAG`, emulating a distinct pointer type per tag.
+///
+/// Panics in drop if the value doesn't match (because of unsafe manipulation).
+#[derive(Clone)]
+struct Tagged<const TAG: usize>(Arc<usize>);
+
+impl<const TAG: usize> Tagged<TAG> {
+    fn new() -> Self {
+        Self(Arc::new(TAG))
+    }
+
+    fn try_retag<const NEW_TAG: usize>(self) -> Result<Tagged<NEW_TAG>, Self> {
+        let mut arc = unsafe { ptr::read(&ManuallyDrop::new(self).0) };
+        match Arc::get_mut(&mut arc) {
+            Some(value) => {
+                *value = NEW_TAG;
+                Ok(Tagged(arc))
+            }
+            None => Err(Self(arc)),
+        }
+    }
+}
+
+impl<const TAG: usize> Drop for Tagged<TAG> {
+    fn drop(&mut self) {
+        assert_eq!(*self.0, TAG, "dropped with the wrong tag");
+    }
+}
+
+unsafe impl<const TAG: usize> ArcPtr for Tagged<TAG> {
+    unsafe fn from_ptr(ptr: *mut ()) -> Self {
+        Self(unsafe { Arc::from_raw(ptr.cast()) })
+    }
+    fn into_ptr(arc: Self) -> *mut () {
+        let arc = unsafe { ptr::read(&ManuallyDrop::new(arc).0) };
+        Arc::into_raw(arc).cast_mut().cast()
+    }
+    fn as_ptr(arc: &Self) -> *mut () {
+        Arc::as_ptr(&arc.0).cast_mut().cast()
+    }
+}
+
+/// An unvalidated borrow (the pointer has changed after slot write) can be upgraded by another
+/// `AtomicArc` reusing the same Arc (same address, not necessarily the same type). In that case,
+/// this borrow should not be used, and the upgrade should be dropped with the appropriate
+/// destructor.
+///
+/// This is obvious as written, but a previous version didn't consider such interleaving, and
+/// assumed the borrow was upgraded by the same `AtomicArc` and was thus valid.
+#[rstest]
+fn unvalidated_transferred_borrow<D: Domain, W: WritePolicy>(
+    #[values(test_domain!(0), test_domain!(1), test_domain!(8))] _domain: D,
+    #[values(Concurrent, Serialized)] _policy: W,
+) {
+    let a = AtomicArcPtr::<Tagged<0>, D, W>::new(Tagged::new());
+    let b = AtomicArcPtr::<Tagged<1>, D, W>::new(Tagged::new());
+    thread::scope(|s| {
+        s.spawn(|| {
+            if let Ok(arc) = a.swap(Tagged::new()).try_retag() {
+                b.store(arc);
+                b.store(Tagged::new());
+            }
+        });
+        s.spawn(|| drop(a.load()));
     });
 }

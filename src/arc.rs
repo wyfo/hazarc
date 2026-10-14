@@ -1,18 +1,19 @@
 //! Generic traits for `Arc`-like pointer types
 
 use alloc::sync::{Arc, Weak};
-use core::{mem::ManuallyDrop, ops::Deref, pin::Pin, ptr};
+use core::{mem, mem::ManuallyDrop, ops::Deref, pin::Pin, ptr};
 
 #[allow(unused_imports)]
-use crate::msrv::StrictProvenance;
+use crate::msrv::{ResultExt, StrictProvenance};
 use crate::{atomic::ArcPtrBorrow, NULL};
 
 /// An `Arc`-like pointer.
 ///
 /// # Safety
 ///
-/// Implementors must have the same semantics as [`Arc`]. The pointer
-/// returned by [`into_ptr`](Self::into_ptr) **must be aligned to 4**.
+/// Implementors must have the same semantics as [`Arc`]. The pointer returned by
+/// [`into_ptr`](Self::into_ptr)/[`as_ptr`](Self::as_ptr) must be aligned to 4 and not be null
+/// unless [`NULLABLE`](Self::NULLABLE) is set to true.
 pub unsafe trait ArcPtr: Clone {
     /// Whether this pointer type may be null.
     const NULLABLE: bool = false;
@@ -30,25 +31,39 @@ pub unsafe trait ArcPtr: Clone {
     /// Returns the wrapped pointer without consuming the Arc pointer.
     #[allow(clippy::wrong_self_convention)]
     fn as_ptr(arc: &Self) -> *mut ();
-    /// Increments the reference count of the Arc pointer.
+}
+
+/// Type-erased drop function of an [`ArcPtr`] type.
+///
+/// There is an interleaving where a pointer loaded by an `AtomicArc` can be upgraded by another
+/// `AtomicArc`, while the `Arc` has been reallocated in between, with possibly a different type,
+/// or mutably borrowed.
+///
+/// As a consequence, the loaded pointer cannot be used for a borrow, and must be dropped. As its
+/// exact type cannot be known, its destructor must be passed with the upgrade.
+///
+/// Wrapping the drop function pointer in a vtable ensures the required alignment.
+#[repr(align(4))]
+pub(crate) struct DropVTable {
+    pub(crate) drop: unsafe fn(*mut ()),
+}
+
+pub(crate) trait ArcPtrExt: ArcPtr {
+    const DROP_VTABLE: &'static DropVTable = &DropVTable {
+        drop: |ptr| drop(unsafe { Self::from_ptr(ptr) }),
+    };
+
+    /// Clones the Arc and tries transferring the new reference ownership with the given operation.
     ///
-    /// # Safety
-    ///
-    /// Same precondition as [`from_ptr`](Self::from_ptr).
-    #[inline(always)]
-    unsafe fn incr_rc(ptr: *mut ()) {
-        let _ = unsafe { ManuallyDrop::new(Self::from_ptr(ptr)).clone() };
-    }
-    /// Decrements the reference count of the Arc pointer.
-    ///
-    /// # Safety
-    ///
-    /// Same precondition as [`from_ptr`](Self::from_ptr).
-    #[inline(always)]
-    unsafe fn decr_rc(ptr: *mut ()) {
-        unsafe { drop(Self::from_ptr(ptr)) }
+    /// The clone's pointer is passed to the operation, and the clone is dropped if it returns
+    /// `Err`.
+    fn transfer_ownership<T, E>(&self, f: impl FnOnce(*mut ()) -> Result<T, E>) -> Result<T, E> {
+        let clone = self.clone();
+        f(Self::as_ptr(self)).inspect(|_| mem::forget(clone))
     }
 }
+
+impl<A: ArcPtr> ArcPtrExt for A {}
 
 unsafe impl<A: NonNullArcPtr> ArcPtr for Option<A> {
     const NULLABLE: bool = true;
@@ -117,11 +132,11 @@ unsafe impl<T> ArcPtr for Weak<T> {
     }
 }
 
-/// An [`ArcPtr`] whose [`ArcPtr::into_ptr`] never returns a null pointer.
+/// An [`ArcPtr`] whose underlying pointer is never null.
 ///
 /// # Safety
 ///
-/// [`ArcPtr::into_ptr`] must return a non-null pointer; [`ArcPtr::NULLABLE`] must be `false`.
+/// [`ArcPtr::NULLABLE`] must be `false`.
 pub unsafe trait NonNullArcPtr: ArcPtr {}
 
 unsafe impl<A: NonNullArcPtr + Deref> NonNullArcPtr for Pin<A> {}
