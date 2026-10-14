@@ -266,7 +266,8 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     /// Scans all the domain's slots, providing an owned pointer to pending slow-path loads of
     /// this `AtomicArc`, and transferring the ownership of the old pointer to its borrows.
     fn swap_impl(&self, old_ptr: *mut ()) -> A {
-        let old_arc = unsafe { A::from_ptr(old_ptr) };
+        // Leaked if the scan panics, as some borrows may not have been upgraded yet
+        let old_arc = ManuallyDrop::new(unsafe { A::from_ptr(old_ptr) });
         let mut owned_cache: Option<ArcPtrBorrow<A>> = None;
         for node in D::static_list().nodes() {
             #[cfg(any(
@@ -304,7 +305,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
                 }
             }
         }
-        old_arc
+        ManuallyDrop::into_inner(old_arc)
     }
 
     fn is_same_atomic_arc(
