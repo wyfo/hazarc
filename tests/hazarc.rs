@@ -1,9 +1,18 @@
-use std::{mem::ManuallyDrop, ptr, sync::Arc, thread};
+use std::{
+    cell::Cell,
+    mem::ManuallyDrop,
+    panic, ptr,
+    sync::{
+        atomic::{AtomicUsize, Ordering::Relaxed},
+        Arc,
+    },
+    thread,
+};
 
 use hazarc::{
     arc::ArcPtr,
     atomic::AtomicArcPtr,
-    domain::Domain,
+    domain::{Domain, DomainList, DomainNodeRef},
     write_policy::{Concurrent, Serialized, WritePolicy},
     ArcBorrow, AtomicArc, AtomicOptionArc,
 };
@@ -247,4 +256,51 @@ fn unvalidated_transferred_borrow<D: Domain, W: WritePolicy>(
         });
         s.spawn(|| drop(a.load()));
     });
+}
+
+/// Creates an isolated domain with one borrow slot, whose `static_list` panics on its second call,
+/// i.e. at the beginning of the first write scan following the first load.
+macro_rules! panicking_domain {
+    () => {{
+        struct PanickingDomain;
+        thread_local! {
+            static LOCAL: Cell<Option<DomainNodeRef<PanickingDomain>>> = const { Cell::new(None) };
+        }
+        unsafe impl Domain for PanickingDomain {
+            const BORROW_SLOT_COUNT: usize = 1;
+            fn static_list() -> &'static DomainList<Self> {
+                static CALLS: AtomicUsize = AtomicUsize::new(0);
+                static LIST: DomainList<PanickingDomain> = DomainList::new();
+                if CALLS.fetch_add(1, Relaxed) == 1 {
+                    panic!("static list access");
+                }
+                &LIST
+            }
+            fn get_thread_local_node() -> Option<DomainNodeRef<Self>> {
+                LOCAL.with(Cell::get)
+            }
+            unsafe fn set_thread_local_node(node: Option<DomainNodeRef<Self>>) {
+                LOCAL.with(|local| local.set(node));
+            }
+        }
+        PanickingDomain
+    }};
+}
+
+/// If a write panics during the scan, the old Arc must not be dropped, as borrows may not have
+/// been upgraded yet.
+#[rstest]
+fn panic_during_write_scan<D: Domain, W: WritePolicy>(
+    #[values(panicking_domain!())] _domain: D,
+    #[values(Concurrent, Serialized)] _policy: W,
+) {
+    let atomic_arc = AtomicArc::<usize, D, W>::from(0);
+    let borrow = atomic_arc.load();
+    let store = || atomic_arc.store(1.into());
+    assert!(panic::catch_unwind(panic::AssertUnwindSafe(store)).is_err());
+    assert_eq!(**borrow, 0);
+    // The old Arc is leaked by the panicking store
+    let old_ptr = Arc::as_ptr(&borrow);
+    drop(borrow);
+    unsafe { Arc::decrement_strong_count(old_ptr) };
 }
