@@ -149,6 +149,9 @@ hazarc::pthread_domain! {
     unsafe { Self::pthread_key_already_created() }
 }
 
+#[cfg(feature = "membarrier")]
+hazarc::membarrier_domain!(MembarrierDomain(8));
+
 impl LoadBench for RwLock<Arc<usize>> {
     type Guard<'a> = RwLockReadGuard<'a, Arc<usize>>;
     fn load(&self) -> Self::Guard<'_> {
@@ -242,6 +245,11 @@ fn hazarc_load_pthread_unsafe(b: Bencher) {
     UnsafePthreadDomain::pthread_key_create();
     AtomicArc::<_, UnsafePthreadDomain>::bench_load(b, false);
 }
+#[cfg(feature = "membarrier")]
+#[divan::bench]
+fn hazarc_load_membarrier(b: Bencher) {
+    AtomicArc::<_, MembarrierDomain>::bench_load(b, false);
+}
 #[divan::bench]
 fn hazarc_load_spin(b: Bencher) {
     LoadSpin::<AtomicArc<_, DefaultDomain>>::bench_load(b, false);
@@ -262,13 +270,28 @@ fn hazarc_load_none(b: Bencher) {
 fn hazarc_load_contended(b: Bencher) {
     AtomicArc::<_, DefaultDomain>::bench_load_contended(b, false);
 }
+#[cfg(feature = "membarrier")]
+#[divan::bench]
+fn hazarc_load_contended_membarrier(b: Bencher) {
+    AtomicArc::<_, MembarrierDomain>::bench_load_contended(b, false);
+}
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
 fn hazarc_store(b: Bencher, threads: usize) {
     AtomicArc::<_, DefaultDomain>::bench_store(b, threads);
 }
+#[cfg(feature = "membarrier")]
+#[divan::bench(args = [0, 1, 2, 4, 8, 16])]
+fn hazarc_store_membarrier(b: Bencher, threads: usize) {
+    AtomicArc::<_, MembarrierDomain>::bench_store(b, threads);
+}
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
 fn hazarc_store_contended(b: Bencher, threads: usize) {
     AtomicArc::<_, DefaultDomain>::bench_store_contended(b, threads);
+}
+#[cfg(feature = "membarrier")]
+#[divan::bench(args = [0, 1, 2, 4, 8, 16])]
+fn hazarc_store_contended_membarrier(b: Bencher, threads: usize) {
+    AtomicArc::<_, MembarrierDomain>::bench_store_contended(b, threads);
 }
 
 #[divan::bench(threads = [0, 1, 2, 4, 8, 16])]

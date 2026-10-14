@@ -94,9 +94,30 @@ macro_rules! node_field_getter {
 ///   [`set_thread_local_node`](Self::set_thread_local_node).
 /// - [`get_or_acquire_thread_local_node`](Self::get_or_acquire_thread_local_node) and
 ///   [`release_thread_local_node`](Self::release_thread_local_node) should not be overwritten.
+/// - If [`ASYMMETRIC_BARRIERS`](Self::ASYMMETRIC_BARRIERS) is true, a
+///   [`light_barrier`](Self::light_barrier) and a [`heavy_barrier`](Self::heavy_barrier) must
+///   synchronize like two `fence(SeqCst)`.
 pub unsafe trait Domain: Sized + Send + Sync + 'static {
     /// Number of borrow slots of a thread-local node.
     const BORROW_SLOT_COUNT: usize;
+    /// Whether `AtomicArc` uses [`light_barrier`](Self::light_barrier) in loads and
+    /// [`heavy_barrier`](Self::heavy_barrier) in writes, instead of sequentially consistent
+    /// operations.
+    const ASYMMETRIC_BARRIERS: bool = false;
+    /// Barrier executed in the critical path of loads, e.g. a compiler fence.
+    ///
+    /// Only used if [`ASYMMETRIC_BARRIERS`](Self::ASYMMETRIC_BARRIERS) is true.
+    #[inline(always)]
+    fn light_barrier() {
+        unimplemented!("asymmetric barriers are not used")
+    }
+    /// Barrier executed in writes, e.g. a process-wide memory barrier like Linux `membarrier`.
+    ///
+    /// Only used if [`ASYMMETRIC_BARRIERS`](Self::ASYMMETRIC_BARRIERS) is true.
+    #[inline(always)]
+    fn heavy_barrier() {
+        unimplemented!("asymmetric barriers are not used")
+    }
     /// Returns the domain's static list.
     fn static_list() -> &'static DomainList<Self>;
     /// Returns the domain's thread-local node.
@@ -490,6 +511,43 @@ impl<D> Drop for WriterGuard<D> {
 #[macro_export]
 macro_rules! domain {
     ($(#[$attrs:meta])* $vis:vis $name:ident($borrow_slot_count:expr)) => {
+        $crate::__domain!($(#[$attrs])* $vis $name($borrow_slot_count, false));
+    };
+}
+
+/// Asymmetric barriers are only used on x86, as the critical path still emits a store-load barrier
+/// on ARM. Moreover, the `membarrier` crate only guarantees light barrier support on Linux for x86.
+#[doc(hidden)]
+pub const __ASYMMETRIC_BARRIERS_SUPPORTED: bool = cfg!(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    any(target_os = "linux", target_os = "windows")
+));
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn __light_barrier() {
+    // `membarrier::light` is always a compiler fence on supported platforms, so its lazy
+    // initialization check can be skipped.
+    if cfg!(all(feature = "membarrier", not(miri))) && __ASYMMETRIC_BARRIERS_SUPPORTED {
+        core::sync::atomic::compiler_fence(SeqCst);
+    } else {
+        core::sync::atomic::fence(SeqCst);
+    }
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn __heavy_barrier() {
+    #[cfg(all(feature = "membarrier", not(miri)))]
+    membarrier::heavy();
+    #[cfg(not(all(feature = "membarrier", not(miri))))]
+    core::sync::atomic::fence(SeqCst);
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __domain {
+    ($(#[$attrs:meta])* $vis:vis $name:ident($borrow_slot_count:expr, $asymmetric_barriers:literal)) => {
         $(#[$attrs])*
         #[derive(Debug)]
         $vis struct $name;
@@ -505,6 +563,16 @@ macro_rules! domain {
         }
         unsafe impl $crate::domain::Domain for $name {
             const BORROW_SLOT_COUNT: usize = $borrow_slot_count;
+            const ASYMMETRIC_BARRIERS: bool =
+                $asymmetric_barriers && $crate::domain::__ASYMMETRIC_BARRIERS_SUPPORTED;
+            #[inline(always)]
+            fn light_barrier() {
+                $crate::domain::__light_barrier();
+            }
+            #[inline(always)]
+            fn heavy_barrier() {
+                $crate::domain::__heavy_barrier();
+            }
             #[inline(always)]
             fn static_list() -> &'static $crate::domain::DomainList<Self> {
                 static LIST: $crate::domain::DomainList<$name> = $crate::domain::DomainList::new();
@@ -528,6 +596,33 @@ macro_rules! domain {
                 GUARD.try_with(|_| ()).ok();
             }
         }
+    };
+}
+
+/// Declare a domain using standard thread-local storage, and process-wide memory barriers
+/// provided by the [`membarrier`] crate.
+///
+/// Loads only execute a compiler fence, at the cost of a process-wide memory barrier in writes,
+/// e.g. a `membarrier` system call on Linux. It makes loads faster, but writes significantly
+/// costlier, impacting all the program's threads.
+///
+/// Process-wide memory barriers are only used on x86 Linux and Windows. On other platforms, the
+/// macro is equivalent to [`domain!`](crate::domain!).
+///
+/// The domain should not be used in combination with [`Cache`](crate::Cache), as its loads don't
+/// use any barrier as long as the `AtomicArc` is not updated, while writes still pay for the
+/// process-wide memory barrier.
+///
+/// # Examples
+///
+/// ```rust
+/// hazarc::membarrier_domain!(pub(crate) MyDomain(2)); // 2 borrow slots
+/// ```
+#[cfg(feature = "membarrier")]
+#[macro_export]
+macro_rules! membarrier_domain {
+    ($(#[$attrs:meta])* $vis:vis $name:ident($borrow_slot_count:expr)) => {
+        $crate::__domain!($(#[$attrs])* $vis $name($borrow_slot_count, true));
     };
 }
 

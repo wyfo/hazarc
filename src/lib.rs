@@ -80,6 +80,8 @@
 //! - `default-domain` *(enabled by default)*: provides a default domain parameter to [`AtomicArc`]
 //!   using standard thread-local storage.
 //! - `domain-gc`: enables automatic domain deallocation.
+//! - `membarrier`: enables the `membarrier_domain!` macro, using process-wide memory barriers
+//!   provided by [`membarrier`](https://docs.rs/membarrier) crate.
 //! - `pthread-domain`: enables the `pthread_domain!` macro for `no_std` environments using
 //!   POSIX pthread thread-local storage.
 //! - `serde`: enables `serde` support.

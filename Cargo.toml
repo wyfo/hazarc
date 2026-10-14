@@ -14,12 +14,14 @@ rust-version = "1.65"
 default = ["default-domain"]
 default-domain = []
 domain-gc = []
+membarrier = ["dep:membarrier"]
 pthread-domain = ["dep:libc"]
 serde = ["dep:serde"]
 
 [dependencies]
 crossbeam-utils = "0.8"
 libc = { version = "0.2", optional = true }
+membarrier = { version = "0.2.3", optional = true }
 serde = { version = "1", optional = true }
 
 [dev-dependencies]
