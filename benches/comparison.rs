@@ -139,9 +139,9 @@ impl<D: Domain> LoadBench for AtomicOptionArc<usize, D> {
         self.load()
     }
 }
-#[cfg(feature = "pthread-domain")]
+#[cfg(all(feature = "pthread-domain", unix))]
 hazarc::pthread_domain!(PthreadDomain(8));
-#[cfg(feature = "pthread-domain")]
+#[cfg(all(feature = "pthread-domain", unix))]
 hazarc::pthread_domain! {
     UnsafePthreadDomain(8);
     // SAFETY: `UnsafePthreadDomain::pthread_key_create` is called
@@ -234,12 +234,12 @@ fn arcswap_store_contended(b: Bencher, threads: usize) {
 fn hazarc_load(b: Bencher) {
     AtomicArc::<_, DefaultDomain>::bench_load(b, false);
 }
-#[cfg(feature = "pthread-domain")]
+#[cfg(all(feature = "pthread-domain", unix))]
 #[divan::bench]
 fn hazarc_load_pthread(b: Bencher) {
     AtomicArc::<_, PthreadDomain>::bench_load(b, false);
 }
-#[cfg(feature = "pthread-domain")]
+#[cfg(all(feature = "pthread-domain", unix))]
 #[divan::bench]
 fn hazarc_load_pthread_unsafe(b: Bencher) {
     UnsafePthreadDomain::pthread_key_create();

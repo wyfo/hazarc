@@ -652,7 +652,7 @@ macro_rules! membarrier_domain {
 /// like `clippy::undocumented_unsafe_blocks`. Any other expression than
 /// `Self::pthread_key_create()` and `Self::pthread_key_already_created()`
 /// will trigger a runtime panic.*
-#[cfg(feature = "pthread-domain")]
+#[cfg(all(feature = "pthread-domain", unix))]
 #[macro_export]
 macro_rules! pthread_domain {
     ($(#[$attrs:meta])* $vis:vis $name:ident($borrow_slot_count:expr)) => {
@@ -743,9 +743,9 @@ mod tests {
 
     #[test]
     fn node_reuse() {
-        #[cfg(feature = "pthread-domain")]
+        #[cfg(all(feature = "pthread-domain", unix))]
         pthread_domain!(TestDomain(2));
-        #[cfg(not(feature = "pthread-domain"))]
+        #[cfg(not(all(feature = "pthread-domain", unix)))]
         domain!(TestDomain(2));
         let node_addr = || (TestDomain::get_or_acquire_thread_local_node().into_raw()).addr();
         std::thread::scope(|s| {
@@ -762,9 +762,9 @@ mod tests {
 
     #[test]
     fn reserve() {
-        #[cfg(feature = "pthread-domain")]
+        #[cfg(all(feature = "pthread-domain", unix))]
         pthread_domain!(TestDomain(2));
-        #[cfg(not(feature = "pthread-domain"))]
+        #[cfg(not(all(feature = "pthread-domain", unix)))]
         domain!(TestDomain(2));
         std::thread::scope(|s| {
             let _guard = ListAccessGuard::new(TestDomain::static_list()); // prevent gc
@@ -779,9 +779,9 @@ mod tests {
 
     #[test]
     fn deallocation() {
-        #[cfg(feature = "pthread-domain")]
+        #[cfg(all(feature = "pthread-domain", unix))]
         pthread_domain!(TestDomain(2));
-        #[cfg(not(feature = "pthread-domain"))]
+        #[cfg(not(all(feature = "pthread-domain", unix)))]
         domain!(TestDomain(2));
         let barrier = std::sync::Barrier::new(2);
         let guard = ListAccessGuard::new(TestDomain::static_list()); // prevent gc

@@ -83,7 +83,7 @@
 //! - `membarrier`: enables the `membarrier_domain!` macro, using process-wide memory barriers
 //!   provided by [`membarrier`](https://docs.rs/membarrier) crate.
 //! - `pthread-domain`: enables the `pthread_domain!` macro for `no_std` environments using
-//!   POSIX pthread thread-local storage.
+//!   POSIX pthread thread-local storage (Unix only).
 //! - `serde`: enables `serde` support.
 //!
 //! # Write policy
@@ -172,7 +172,7 @@ domain! {
     /// Default domain with 8 borrow slots.
     pub DefaultDomain(8)
 }
-#[cfg(feature = "pthread-domain")]
+#[cfg(all(feature = "pthread-domain", unix))]
 #[doc(hidden)]
 pub use libc;
 
