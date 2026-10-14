@@ -38,6 +38,29 @@ jobs:
         env:
           RUSTDOCFLAGS: "-Dwarnings"
 
+  loom:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["", --features=domain-gc]
+    steps:
+      - uses: actions/checkout@v6
+      - name: update toolchain
+        run: rustup update stable && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loom-${{ matrix.features }}
+      - name: clippy
+        run: cargo clippy ${{ matrix.features }} --tests -- -D warnings
+        env:
+          RUSTFLAGS: "--cfg loom -C debug_assertions"
+      - name: test
+        run: cargo test --release --tests ${{ matrix.features }}
+        env:
+          RUSTFLAGS: "--cfg loom -C debug_assertions"
+          LOOM_MAX_PREEMPTIONS: 2
+
   compute-miri-seeds:
     runs-on: ubuntu-latest
     outputs:

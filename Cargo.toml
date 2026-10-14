@@ -28,6 +28,10 @@ libc = { version = "0.2", optional = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"], optional = true }
 
+[target.'cfg(loom)'.dependencies]
+loom = "0.7.2"
+const_fn = "0.4.12"
+
 [dev-dependencies]
 arc-swap = "1.8.0"
 divan = "0.1.21"
@@ -43,7 +47,7 @@ required-features = ["default-domain"]
 
 [lints.rust]
 missing_debug_implementations = "forbid"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hazarc_force_active_writer_count_64bit)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hazarc_force_active_writer_count_64bit)', 'cfg(loom)'] }
 unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]

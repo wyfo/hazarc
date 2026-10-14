@@ -42,25 +42,21 @@ use alloc::{
     alloc::{alloc_zeroed, dealloc, handle_alloc_error},
     vec::Vec,
 };
-use core::{
-    alloc::Layout,
-    cell::Cell,
-    fmt, iter,
-    marker::PhantomData,
-    ptr::NonNull,
-    slice,
-    sync::atomic::{
-        AtomicPtr, AtomicUsize,
-        Ordering::{Acquire, Relaxed, SeqCst},
-    },
-};
+use core::{alloc::Layout, cell::Cell, fmt, iter, marker::PhantomData, ptr::NonNull, slice};
 
 use crossbeam_utils::CachePadded;
 
 #[cfg(feature = "domain-gc")]
 #[allow(unused_imports)]
 use crate::msrv::StrictProvenance;
-use crate::{msrv::ptr, NULL};
+use crate::{
+    loom::sync::atomic::{
+        AtomicPtr, AtomicUsize,
+        Ordering::{Acquire, Relaxed, Release, SeqCst},
+    },
+    msrv::ptr,
+    NULL,
+};
 
 #[cfg(feature = "domain-gc")]
 const GC_FLAG: usize = 1;
@@ -167,6 +163,7 @@ impl<D: Domain> Default for DomainList<D> {
 
 impl<D: Domain> DomainList<D> {
     /// Constructs a new, empty `DomainList`.
+    #[cfg_attr(loom, const_fn::const_fn(cfg(false)))]
     pub const fn new() -> Self {
         Self {
             head: AtomicPtr::new(NULL.cast()),
@@ -204,7 +201,15 @@ impl<D: Domain> DomainList<D> {
             if node.is_none() {
                 let new_node =
                     (allocated_node.0).get_or_insert_with(|| DomainNodeRef::<D>::allocate());
-                match node_ptr.compare_exchange(NULL.cast(), new_node.as_ptr(), SeqCst, Acquire) {
+                // SeqCst, so a writer traversing the list cannot miss a node, before a borrow
+                // stored in it, while the load of the borrow misses the writer's pointer swap;
+                // with asymmetric barriers, the light and heavy barriers ensure it.
+                let success = if D::ASYMMETRIC_BARRIERS {
+                    Release
+                } else {
+                    SeqCst
+                };
+                match node_ptr.compare_exchange(NULL.cast(), new_node.as_ptr(), success, Acquire) {
                     Ok(_) => node = allocated_node.0.take(),
                     Err(n) => node = unsafe { DomainNodeRef::new(n) },
                 }
@@ -279,6 +284,10 @@ impl<'a, D: Domain> ListAccessGuard<'a, D> {
     fn new(list: &'a DomainList<D>) -> Self {
         #[cfg(feature = "domain-gc")]
         let active = (list.active_nodes_and_writers).fetch_add(1 << GC_FLAG, SeqCst);
+        // Loom doesn't support SeqCst operations, so the Dekker with the GC, between this
+        // increment and the head load, needs an explicit fence
+        #[cfg(all(feature = "domain-gc", loom))]
+        crate::loom::sync::atomic::fence(SeqCst);
         #[cfg(feature = "domain-gc")]
         abort_before_overflow(active, "too many active nodes and writers");
         Self(list)
@@ -315,6 +324,9 @@ impl<D: Domain> Drop for ListAccessGuard<'_, D> {
             let head = unsafe { DomainNodeRef::<D>::new(head_ptr) };
             if head.is_some() {
                 self.0.head.store(gc_head_ptr, SeqCst);
+                // Loom doesn't support SeqCst operations, see `ListAccessGuard::new`
+                #[cfg(loom)]
+                crate::loom::sync::atomic::fence(SeqCst);
                 if self.0.active_nodes_and_writers.load(SeqCst) == GC_FLAG
                     && iter::successors(head, |&node| node.next())
                         .flat_map(|n| n.borrow_slots())
@@ -345,6 +357,10 @@ pub(crate) struct DomainNode {
     next: AtomicPtr<DomainNode>,
     in_use: AtomicUsize,
     atomic_arc_slot: AtomicPtr<()>,
+    /// Read on slot accesses and written on deallocation, so loom detects slot accesses that
+    /// don't happen before the deallocation.
+    #[cfg(loom)]
+    alive: loom::cell::Cell<()>,
     load_generation: Cell<usize>,
     // Wrapping around BORROW_SLOT_COUNT
     next_borrow_slot_idx: Cell<usize>,
@@ -406,10 +422,24 @@ impl<D: Domain> DomainNodeRef<D> {
         let layout = Self::layout();
         // SAFETY: layout has non-zero size
         let ptr = unsafe { alloc_zeroed(layout) }.cast();
-        DomainNodeRef {
+        let node = DomainNodeRef {
             node: NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout)),
             _domain: PhantomData,
+        };
+        // loom atomics have an internal state, so they cannot be zero-initialized
+        #[cfg(loom)]
+        unsafe {
+            let ptr = node.as_ptr();
+            ptr::addr_of_mut!((*ptr).next).write(AtomicPtr::new(NULL.cast()));
+            ptr::addr_of_mut!((*ptr).in_use).write(AtomicUsize::new(0));
+            ptr::addr_of_mut!((*ptr).atomic_arc_slot).write(AtomicPtr::new(NULL));
+            ptr::addr_of_mut!((*ptr).alive).write(loom::cell::Cell::new(()));
+            let slots = ptr::addr_of_mut!((*ptr).borrow_slots).cast::<BorrowSlot>();
+            for i in 0..=D::BORROW_SLOT_COUNT {
+                slots.add(i).write(AtomicPtr::new(NULL));
+            }
         }
+        node
     }
 
     unsafe fn deallocate(self) {
@@ -417,6 +447,20 @@ impl<D: Domain> DomainNodeRef<D> {
         let in_use = node_field!(self.in_use).load(SeqCst);
         debug_assert_eq!(in_use, 0);
         debug_assert!((self.borrow_slots().iter()).all(|s| s.load(Relaxed).is_null()));
+        #[cfg(loom)]
+        unsafe {
+            let ptr = self.as_ptr();
+            ptr::drop_in_place(ptr::addr_of_mut!((*ptr).next));
+            ptr::drop_in_place(ptr::addr_of_mut!((*ptr).in_use));
+            ptr::drop_in_place(ptr::addr_of_mut!((*ptr).atomic_arc_slot));
+            (*ptr).alive.set(());
+            ptr::drop_in_place(ptr::addr_of_mut!((*ptr).alive));
+            let slots = ptr::addr_of_mut!((*ptr).borrow_slots).cast::<BorrowSlot>();
+            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
+                slots,
+                D::BORROW_SLOT_COUNT + 1,
+            ));
+        }
         let layout = Self::layout();
         unsafe { dealloc(self.as_ptr().cast(), layout) }
     }
@@ -449,14 +493,22 @@ impl<D: Domain> DomainNodeRef<D> {
     }
 
     fn next(self) -> Option<DomainNodeRef<D>> {
+        // SeqCst, see `DomainList::nodes_or_allocate`
+        let ordering = if D::ASYMMETRIC_BARRIERS {
+            Acquire
+        } else {
+            SeqCst
+        };
         #[allow(unused_unsafe)]
         unsafe {
-            Self::new(node_field!(self.next).load(SeqCst))
+            Self::new(node_field!(self.next).load(ordering))
         }
     }
 
     #[inline(always)]
     pub(crate) fn borrow_slots(self) -> &'static [BorrowSlot] {
+        #[cfg(loom)]
+        node_field!(self.alive).get();
         unsafe {
             let slots = ptr::addr_of!((*self.as_ptr()).borrow_slots);
             slice::from_raw_parts(slots as _, D::BORROW_SLOT_COUNT + 1)
@@ -527,10 +579,10 @@ pub const __ASYMMETRIC_BARRIERS_SUPPORTED: bool = cfg!(all(
 #[doc(hidden)]
 #[inline(always)]
 pub fn __light_barrier() {
-    if cfg!(all(feature = "membarrier", not(miri))) && __ASYMMETRIC_BARRIERS_SUPPORTED {
+    if cfg!(all(feature = "membarrier", not(miri), not(loom))) && __ASYMMETRIC_BARRIERS_SUPPORTED {
         core::sync::atomic::compiler_fence(SeqCst);
     } else {
-        core::sync::atomic::fence(SeqCst);
+        crate::loom::sync::atomic::fence(SeqCst);
     }
 }
 
@@ -540,6 +592,7 @@ pub fn __heavy_barrier() {
     #[cfg(all(
         feature = "membarrier",
         not(miri),
+        not(loom),
         any(target_arch = "x86", target_arch = "x86_64"),
         any(target_os = "linux", target_os = "windows")
     ))]
@@ -547,10 +600,117 @@ pub fn __heavy_barrier() {
     #[cfg(not(all(
         feature = "membarrier",
         not(miri),
+        not(loom),
         any(target_arch = "x86", target_arch = "x86_64"),
         any(target_os = "linux", target_os = "windows")
     )))]
-    core::sync::atomic::fence(SeqCst);
+    crate::loom::sync::atomic::fence(SeqCst);
+}
+
+/// Implements the domain's thread-local node storage, with `with_local` and `register_release`
+/// methods.
+///
+/// The node is stored in a destructor-less thread-local, so its access is not checked, and a
+/// second thread-local releases it when the thread exits.
+#[cfg(not(loom))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __thread_local_node {
+    ($name:ident) => {
+        impl $name {
+            #[doc(hidden)]
+            #[inline(always)]
+            fn with_local<R>(f: impl FnOnce(&::std::cell::Cell<::std::option::Option<$crate::domain::DomainNodeRef<Self>>>) -> R) -> R {
+                ::std::thread_local! {
+                    static LOCAL: ::std::cell::Cell<::std::option::Option<$crate::domain::DomainNodeRef<$name>>> = const { ::std::cell::Cell::new(None) };
+                }
+                LOCAL.with(f)
+            }
+            #[doc(hidden)]
+            fn register_release() {
+                struct NodeGuard;
+                impl Drop for NodeGuard {
+                    fn drop(&mut self) {
+                        <$name as $crate::domain::Domain>::release_thread_local_node();
+                    }
+                }
+                ::std::thread_local! {
+                    static GUARD: NodeGuard = const { NodeGuard };
+                }
+                GUARD.try_with(|_| ()).ok();
+            }
+        }
+    };
+}
+
+/// Implements the domain's thread-local node storage, with `with_local` and `register_release`
+/// methods.
+///
+/// Loom makes all thread-locals inaccessible before dropping them, so the node release cannot
+/// read another thread-local; a single thread-local releases the node in its destructor.
+#[cfg(loom)]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __thread_local_node {
+    ($name:ident) => {
+        impl $name {
+            #[doc(hidden)]
+            fn with_local<R>(f: impl FnOnce(&::core::cell::Cell<::core::option::Option<$crate::domain::DomainNodeRef<Self>>>) -> R) -> R {
+                $crate::__loom::thread_local! {
+                    static LOCAL: $crate::domain::__LocalNode<$name> = $crate::domain::__LocalNode::default();
+                }
+                LOCAL.with(|local| f(&local.0))
+            }
+            #[doc(hidden)]
+            fn register_release() {}
+        }
+    };
+}
+
+/// Thread-local node releasing the node on drop, see `__thread_local_node`.
+#[cfg(loom)]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct __LocalNode<D: Domain>(pub Cell<Option<DomainNodeRef<D>>>);
+
+#[cfg(loom)]
+impl<D: Domain> Default for __LocalNode<D> {
+    fn default() -> Self {
+        Self(Cell::new(None))
+    }
+}
+
+#[cfg(loom)]
+impl<D: Domain> Drop for __LocalNode<D> {
+    fn drop(&mut self) {
+        if let Some(node) = self.0.take() {
+            unsafe { D::static_list().release_node(node) };
+        }
+    }
+}
+
+/// Returns the domain's static list, using loom's `lazy_static` with `cfg(loom)`.
+#[cfg(not(loom))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __static_list {
+    ($name:ident) => {{
+        static LIST: $crate::domain::DomainList<$name> = $crate::domain::DomainList::new();
+        &LIST
+    }};
+}
+
+/// Returns the domain's static list, using loom's `lazy_static` with `cfg(loom)`.
+#[cfg(loom)]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __static_list {
+    ($name:ident) => {{
+        $crate::__loom::lazy_static! {
+            static ref LIST: $crate::domain::DomainList<$name> = $crate::domain::DomainList::new();
+        }
+        &*LIST
+    }};
 }
 
 #[doc(hidden)]
@@ -560,16 +720,7 @@ macro_rules! __domain {
         $(#[$attrs])*
         #[derive(Debug)]
         $vis struct $name;
-        impl $name {
-            #[doc(hidden)]
-            #[inline(always)]
-            fn local_key() -> &'static ::std::thread::LocalKey<::std::cell::Cell<::std::option::Option<$crate::domain::DomainNodeRef<Self>>>> {
-                ::std::thread_local! {
-                    static LOCAL: ::std::cell::Cell<::std::option::Option<$crate::domain::DomainNodeRef<$name>>> = const { ::std::cell::Cell::new(None) };
-                }
-                &LOCAL
-            }
-        }
+        $crate::__thread_local_node!($name);
         unsafe impl $crate::domain::Domain for $name {
             const BORROW_SLOT_COUNT: usize = $borrow_slot_count;
             const ASYMMETRIC_BARRIERS: bool =
@@ -584,25 +735,15 @@ macro_rules! __domain {
             }
             #[inline(always)]
             fn static_list() -> &'static $crate::domain::DomainList<Self> {
-                static LIST: $crate::domain::DomainList<$name> = $crate::domain::DomainList::new();
-                &LIST
+                $crate::__static_list!($name)
             }
             #[inline(always)]
             fn get_thread_local_node() -> ::std::option::Option<$crate::domain::DomainNodeRef<Self>> {
-                $name::local_key().with(::std::cell::Cell::get)
+                $name::with_local(::std::cell::Cell::get)
             }
             unsafe fn set_thread_local_node(node: Option<$crate::domain::DomainNodeRef<Self>>) {
-                struct NodeGuard;
-                impl Drop for NodeGuard {
-                    fn drop(&mut self) {
-                        <$name as $crate::domain::Domain>::release_thread_local_node();
-                    }
-                }
-                ::std::thread_local! {
-                    static GUARD: NodeGuard = const { NodeGuard };
-                }
-                $name::local_key().with(|cell| cell.set(node));
-                GUARD.try_with(|_| ()).ok();
+                $name::with_local(|cell| cell.set(node));
+                $name::register_release();
             }
         }
     };
@@ -745,7 +886,7 @@ fn abort_before_overflow(n: usize, msg: &str) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use crate::domain::{Domain, ListAccessGuard};
 

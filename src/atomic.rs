@@ -1,23 +1,20 @@
 //! Generic atomic storage for `Arc`-like pointers.
 
 use alloc::sync::Arc;
-use core::{
-    fmt, hint,
-    marker::PhantomData,
-    mem,
-    mem::ManuallyDrop,
-    ops::Deref,
-    sync::atomic::{
-        fence, AtomicPtr,
-        Ordering::{Acquire, Relaxed, Release, SeqCst},
-    },
-};
+use core::{fmt, hint, marker::PhantomData, mem, mem::ManuallyDrop, ops::Deref};
 
 #[allow(unused_imports)]
 use crate::msrv::{OptionExt, StrictProvenance};
 use crate::{
     arc::{ArcPtr, ArcPtrExt, ArcRef, DropVTable, NonNullArcPtr},
     domain::{BorrowSlot, Domain, DomainNodeRef},
+    loom::{
+        sync::atomic::{
+            fence, AtomicPtr,
+            Ordering::{Acquire, Relaxed, Release, SeqCst},
+        },
+        AtomicPtrExt,
+    },
     msrv::ptr,
     write_policy::{Concurrent, WritePolicy},
     NULL,
@@ -303,7 +300,14 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
             ))]
             let _guard = W::CONCURRENT.then(|| node.writer_guard());
             for slot in node.borrow_slots() {
-                let mut slot_ptr = slot.load(SeqCst);
+                // With asymmetric barriers, the heavy barrier ensures the store-load ordering
+                // with loads, and the acquire fences replace the acquire semantic.
+                let ordering = if D::ASYMMETRIC_BARRIERS {
+                    Relaxed
+                } else {
+                    SeqCst
+                };
+                let mut slot_ptr = slot.load(ordering);
                 if slot_ptr.is_null() {
                     continue;
                 }
@@ -332,6 +336,11 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
                 }
             }
         }
+        // Acquire fence, so borrow releases observed by relaxed slot loads happen before the old
+        // pointer is returned (and possibly dropped)
+        if D::ASYMMETRIC_BARRIERS {
+            fence(Acquire);
+        }
         ManuallyDrop::into_inner(old_arc)
     }
 
@@ -343,6 +352,11 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     ) -> bool {
         let self_ptr = ptr::from_ref(&self.ptr).cast_mut().cast();
         if W::CONCURRENT {
+            // With asymmetric barriers, the `LOADING` slot is loaded relaxed; acquire fence, so
+            // `atomic_arc_slot` stored before the `LOADING` value (release) is observed.
+            if D::ASYMMETRIC_BARRIERS {
+                fence(Acquire);
+            }
             // Acquire load synchronizes with the release store in `load_slow`,
             // so the following slot load cannot be stale.
             // Without the synchronization, it would be possible to reload the
@@ -352,7 +366,14 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
             let prev_slot_ptr = *slot_ptr;
             // The slot is always reloaded, as a pending load may have completed by a borrow
             // of the swapped out arc.
-            *slot_ptr = slot.load(SeqCst);
+            // Not part of the store-load ordering with loads, only acquire to synchronize with
+            // a borrow release, which the final acquire fence does with asymmetric barriers.
+            let ordering = if D::ASYMMETRIC_BARRIERS {
+                Relaxed
+            } else {
+                Acquire
+            };
+            *slot_ptr = slot.load(ordering);
             same_atomic_arc && *slot_ptr == prev_slot_ptr
         } else {
             *slot_ptr == self_ptr.with_tag(LOADING)
@@ -369,7 +390,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     /// `self` must not be reused after.
     #[inline(always)]
     unsafe fn take_owned(&mut self) -> A {
-        let ptr = *self.ptr.get_mut();
+        let ptr = self.ptr.load_mut();
         if A::NULLABLE && ptr.is_null() {
             return unsafe { A::from_ptr(NULL) };
         }
@@ -444,6 +465,7 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D, Concurrent> {
 impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<Option<A>, D, W> {
     /// Constructs a new Arc atomic storage with `None`.
     #[inline]
+    #[cfg_attr(loom, const_fn::const_fn(cfg(false)))]
     pub const fn none() -> Self {
         Self {
             ptr: AtomicPtr::new(NULL),
@@ -684,6 +706,7 @@ impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicOptionArcPtr<A, D, W> {
 
     /// Constructs a new Arc atomic storage with `None`.
     #[inline]
+    #[cfg_attr(loom, const_fn::const_fn(cfg(false)))]
     pub const fn none() -> Self {
         Self(AtomicArcPtr::none())
     }
