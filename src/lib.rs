@@ -81,7 +81,7 @@
 //!   using standard thread-local storage.
 //! - `domain-gc`: enables automatic domain deallocation.
 //! - `membarrier`: enables the `membarrier_domain!` macro, using process-wide memory barriers
-//!   provided by [`membarrier`](https://docs.rs/membarrier) crate.
+//!   (x86 Linux and Windows only).
 //! - `pthread-domain`: enables the `pthread_domain!` macro for `no_std` environments using
 //!   POSIX pthread thread-local storage (Unix only).
 //! - `serde`: enables `serde` support.
@@ -152,7 +152,7 @@
 #![warn(missing_docs)]
 #![no_std]
 extern crate alloc;
-#[cfg(any(feature = "default-domain", test))]
+#[cfg(any(feature = "default-domain", feature = "membarrier", test))]
 extern crate std;
 
 use alloc::sync::Arc;
@@ -161,6 +161,13 @@ pub mod arc;
 pub mod atomic;
 pub mod cache;
 pub mod domain;
+// Same platforms as `domain::__ASYMMETRIC_BARRIERS_SUPPORTED`
+#[cfg(all(
+    feature = "membarrier",
+    any(target_arch = "x86", target_arch = "x86_64"),
+    any(target_os = "linux", target_os = "windows")
+))]
+mod membarrier;
 mod msrv;
 #[cfg(feature = "serde")]
 mod serde;

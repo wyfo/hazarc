@@ -516,7 +516,8 @@ macro_rules! domain {
 }
 
 /// Asymmetric barriers are only used on x86, as the critical path still emits a store-load barrier
-/// on ARM. Moreover, the `membarrier` crate only guarantees light barrier support on Linux for x86.
+/// on ARM. Moreover, the `mprotect` fallback of process-wide memory barriers on Linux only works
+/// on x86.
 #[doc(hidden)]
 pub const __ASYMMETRIC_BARRIERS_SUPPORTED: bool = cfg!(all(
     any(target_arch = "x86", target_arch = "x86_64"),
@@ -526,8 +527,6 @@ pub const __ASYMMETRIC_BARRIERS_SUPPORTED: bool = cfg!(all(
 #[doc(hidden)]
 #[inline(always)]
 pub fn __light_barrier() {
-    // `membarrier::light` is always a compiler fence on supported platforms, so its lazy
-    // initialization check can be skipped.
     if cfg!(all(feature = "membarrier", not(miri))) && __ASYMMETRIC_BARRIERS_SUPPORTED {
         core::sync::atomic::compiler_fence(SeqCst);
     } else {
@@ -538,9 +537,19 @@ pub fn __light_barrier() {
 #[doc(hidden)]
 #[inline(always)]
 pub fn __heavy_barrier() {
-    #[cfg(all(feature = "membarrier", not(miri)))]
-    membarrier::heavy();
-    #[cfg(not(all(feature = "membarrier", not(miri))))]
+    #[cfg(all(
+        feature = "membarrier",
+        not(miri),
+        any(target_arch = "x86", target_arch = "x86_64"),
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    crate::membarrier::heavy();
+    #[cfg(not(all(
+        feature = "membarrier",
+        not(miri),
+        any(target_arch = "x86", target_arch = "x86_64"),
+        any(target_os = "linux", target_os = "windows")
+    )))]
     core::sync::atomic::fence(SeqCst);
 }
 
@@ -599,8 +608,7 @@ macro_rules! __domain {
     };
 }
 
-/// Declare a domain using standard thread-local storage, and process-wide memory barriers
-/// provided by the [`membarrier`] crate.
+/// Declare a domain using standard thread-local storage, and process-wide memory barriers.
 ///
 /// Loads only execute a compiler fence, at the cost of a process-wide memory barrier in writes,
 /// e.g. a `membarrier` system call on Linux. It makes loads faster, but writes significantly
