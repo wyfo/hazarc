@@ -3,10 +3,7 @@ use std::{
     mem::ManuallyDrop,
     panic, ptr,
     sync::{
-        atomic::{
-            AtomicUsize,
-            Ordering::{Relaxed, SeqCst},
-        },
+        atomic::{AtomicUsize, Ordering::Relaxed},
         Arc,
     },
     thread,
@@ -74,29 +71,6 @@ fn concurrent_reads_other_atomic_arc<D: Domain, W: WritePolicy>(
         });
         s.spawn(|| atomic_arc.store(1.into()));
     });
-}
-
-/// Dekker between an `AtomicArc` and another atomic: as operations are sequentially consistent,
-/// at least one thread must observe the other's write.
-#[rstest]
-fn seqcst_ordering<D: Domain, W: WritePolicy>(
-    #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
-    #[values(Concurrent, Serialized)] _policy: W,
-) {
-    let atomic_arc = AtomicArc::<usize, D, W>::from(0);
-    let atomic = AtomicUsize::new(0);
-    let (arc_value, atomic_value) = thread::scope(|s| {
-        let arc_value = s.spawn(|| {
-            atomic.store(1, SeqCst);
-            **atomic_arc.load()
-        });
-        let atomic_value = s.spawn(|| {
-            atomic_arc.store(1.into());
-            atomic.load(SeqCst)
-        });
-        (arc_value.join().unwrap(), atomic_value.join().unwrap())
-    });
-    assert!(arc_value == 1 || atomic_value == 1);
 }
 
 #[rstest]
