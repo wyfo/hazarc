@@ -19,16 +19,25 @@ use hazarc::{
 use rstest::rstest;
 
 /// Creates isolated domains per tests
-macro_rules! test_domain {
+macro_rules! d {
     ($slots:literal) => {{
         hazarc::domain!(TestDomain($slots));
         TestDomain
     }};
 }
 
+/// Creates isolated domains per tests, using asymmetric barriers (`membarrier` if the feature is
+/// enabled, `fence(SeqCst)` otherwise).
+macro_rules! dm {
+    ($slots:literal) => {{
+        hazarc::__domain!(TestDomain($slots, true));
+        TestDomain
+    }};
+}
+
 #[rstest]
 fn concurrent_reads<D: Domain, W: WritePolicy>(
-    #[values(test_domain!(0), test_domain!(1), test_domain!(8))] _domain: D,
+    #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
     let check_borrow = |b: &_| assert!([0, 1, 2].contains(b));
@@ -45,7 +54,7 @@ fn concurrent_reads<D: Domain, W: WritePolicy>(
 
 #[rstest]
 fn concurrent_reads_other_atomic_arc<D: Domain, W: WritePolicy>(
-    #[values(test_domain!(0), test_domain!(1), test_domain!(8))] _domain: D,
+    #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
     let check_borrow = |b: &_| assert!([0, 1].contains(b));
@@ -66,7 +75,7 @@ fn concurrent_reads_other_atomic_arc<D: Domain, W: WritePolicy>(
 
 #[rstest]
 fn concurrent_writes<D: Domain, W: WritePolicy>(
-    #[values(test_domain!(0), test_domain!(1), test_domain!(8))] _domain: D,
+    #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
     let check_borrow = |b: &_| assert!([0, 1, 2].contains(b));
@@ -91,7 +100,7 @@ fn concurrent_writes<D: Domain, W: WritePolicy>(
 
 #[rstest]
 fn concurrent_writes_option<D: Domain, W: WritePolicy>(
-    #[values(test_domain!(0), test_domain!(1), test_domain!(8))] _domain: D,
+    #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
     let check_borrow = |b: &Option<ArcBorrow<_>>| {
@@ -118,7 +127,7 @@ fn concurrent_writes_option<D: Domain, W: WritePolicy>(
 
 #[rstest]
 fn drop_atomic_arc_with_active_borrow<D: Domain, W: WritePolicy>(
-    #[values(test_domain!(0), test_domain!(1), test_domain!(8))] _domain: D,
+    #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
     let atomic_arc = AtomicArc::<usize, D, W>::from(0);
@@ -129,7 +138,7 @@ fn drop_atomic_arc_with_active_borrow<D: Domain, W: WritePolicy>(
 
 #[rstest]
 fn drop_borrow_in_another_thread<D: Domain, W: WritePolicy>(
-    #[values(test_domain!(0), test_domain!(1), test_domain!(8))] _domain: D,
+    #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
     let atomic_arc = AtomicOptionArc::<usize, D, W>::from(0);
@@ -142,7 +151,7 @@ fn drop_borrow_in_another_thread<D: Domain, W: WritePolicy>(
 
 #[rstest]
 fn seq_cst_ordering<D: Domain, W: WritePolicy>(
-    #[values(test_domain!(0), test_domain!(1), test_domain!(8))] _domain: D,
+    #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
     let x = AtomicOptionArc::<(), D, W>::new(None);
@@ -161,9 +170,7 @@ fn seq_cst_ordering<D: Domain, W: WritePolicy>(
 }
 
 #[rstest]
-fn fetch_and_add<D: Domain>(
-    #[values(test_domain!(0), test_domain!(1), test_domain!(8))] _domain: D,
-) {
+fn fetch_and_add<D: Domain>(#[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D) {
     let atomic_arc = AtomicArc::<usize, D, Concurrent>::from(0);
     thread::scope(|s| {
         s.spawn(|| atomic_arc.update(|i| **i + 1));
@@ -174,9 +181,7 @@ fn fetch_and_add<D: Domain>(
 
 /// Consecutive loads must be monotonic with `Concurrent`.
 #[rstest]
-fn consecutive_loads<D: Domain>(
-    #[values(test_domain!(0), test_domain!(1), test_domain!(8))] _domain: D,
-) {
+fn consecutive_loads<D: Domain>(#[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D) {
     let atomic_arc = AtomicArc::<usize, D, Concurrent>::from(0);
     thread::scope(|s| {
         s.spawn(|| atomic_arc.store(1.into()));
@@ -242,7 +247,7 @@ unsafe impl<const TAG: usize> ArcPtr for Tagged<TAG> {
 /// assumed the borrow was upgraded by the same `AtomicArc` and was thus valid.
 #[rstest]
 fn unvalidated_transferred_borrow<D: Domain, W: WritePolicy>(
-    #[values(test_domain!(0), test_domain!(1), test_domain!(8))] _domain: D,
+    #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
     let a = AtomicArcPtr::<Tagged<0>, D, W>::new(Tagged::new());

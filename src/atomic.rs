@@ -122,8 +122,19 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         slot_idx: usize,
         into_owned: bool,
     ) -> ArcPtrBorrow<A> {
-        slot.store(ptr, SeqCst);
-        let ptr_checked = self.ptr.load(SeqCst);
+        let ptr_checked = if D::ASYMMETRIC_BARRIERS {
+            // Release, so a writer reading this borrow is synchronized with the release of the
+            // previous one in `ArcPtrBorrow::drop` (a plain store is not part of its release
+            // sequence).
+            slot.store(ptr, Release);
+            D::light_barrier();
+            // SeqCst, as the checked pointer is the one returned, so it is the load's
+            // linearization point (the initial load may be relaxed).
+            self.ptr.load(SeqCst)
+        } else {
+            slot.store(ptr, SeqCst);
+            self.ptr.load(SeqCst)
+        };
         if ptr != ptr_checked {
             return self.load_slow(node, slot, ptr);
         }
@@ -182,9 +193,17 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         // may come from another `AtomicArc` reusing the same allocation, possibly with another
         // pointer type. It must not be used, only released with the provided vtable.
         // The slot can only contain the outdated borrow, or its upgrade, so it can be swapped.
-        // SeqCst also acquires the ownership transfer, so it happens before the release.
-        let outdated_or_upgraded = slot.swap(loading_ptr, SeqCst);
-        let ptr = self.ptr.load(SeqCst);
+        let outdated_or_upgraded;
+        let ptr = if D::ASYMMETRIC_BARRIERS {
+            // Release, so a writer reading the `LOADING` value observes `atomic_arc_slot`.
+            let ordering = if W::CONCURRENT { Release } else { Relaxed };
+            outdated_or_upgraded = slot.swap(loading_ptr, ordering);
+            D::light_barrier();
+            self.ptr.load(Acquire)
+        } else {
+            outdated_or_upgraded = slot.swap(loading_ptr, SeqCst);
+            self.ptr.load(SeqCst)
+        };
         // Failure ordering must be SeqCst for load to have a full SeqCst semantic
         let borrow = match slot.compare_exchange(loading_ptr, ptr, SeqCst, SeqCst) {
             // the slot is released if the pointer is null
@@ -208,6 +227,11 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
             }
         };
         if outdated_or_upgraded != outdated_ptr {
+            // Acquire, so the ownership transfer happens before the release
+            // (already done by the SeqCst swap without asymmetric barriers).
+            if D::ASYMMETRIC_BARRIERS {
+                fence(Acquire);
+            }
             let vtable = outdated_or_upgraded
                 .without_tag(UPGRADED)
                 .cast::<DropVTable>();
@@ -260,6 +284,9 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     /// Stores the Arc and returns the previous one.
     pub fn swap(&self, arc: A) -> A {
         let old_ptr = self.ptr.swap(A::into_ptr(arc), SeqCst);
+        if D::ASYMMETRIC_BARRIERS {
+            D::heavy_barrier();
+        }
         self.swap_impl(old_ptr)
     }
 
@@ -364,7 +391,12 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D, Concurrent> {
     pub fn compare_exchange<C: ArcRef<A>>(&self, current: C, new: A) -> Result<A, ArcPtrBorrow<A>> {
         let new = ManuallyDrop::new(new);
         match (self.ptr).compare_exchange(C::as_ptr(current), A::as_ptr(&new), SeqCst, Acquire) {
-            Ok(old_ptr) => Ok(self.swap_impl(old_ptr)),
+            Ok(old_ptr) => {
+                if D::ASYMMETRIC_BARRIERS {
+                    D::heavy_barrier();
+                }
+                Ok(self.swap_impl(old_ptr))
+            }
             Err(old_ptr) => {
                 drop(ManuallyDrop::into_inner(new));
                 Err(self.load_impl(old_ptr))
