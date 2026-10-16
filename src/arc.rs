@@ -116,6 +116,25 @@ unsafe impl<T> ArcPtr for Arc<T> {
     }
 }
 
+#[cfg(loom)]
+unsafe impl<T> ArcPtr for loom::sync::Arc<T> {
+    #[inline(always)]
+    unsafe fn from_ptr(ptr: *mut ()) -> Self {
+        unsafe { loom::sync::Arc::from_raw(ptr.cast()) }
+    }
+    #[inline(always)]
+    fn into_ptr(arc: Self) -> *mut () {
+        loom::sync::Arc::into_raw(arc).cast_mut().cast()
+    }
+    #[inline(always)]
+    fn as_ptr(arc: &Self) -> *mut () {
+        loom::sync::Arc::as_ptr(arc).cast_mut().cast()
+    }
+}
+
+#[cfg(loom)]
+unsafe impl<T> NonNullArcPtr for loom::sync::Arc<T> {}
+
 #[cfg(not(target_pointer_width = "16"))]
 unsafe impl<T> ArcPtr for Weak<T> {
     #[inline(always)]

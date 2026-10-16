@@ -195,7 +195,7 @@ impl<A: AtomicArcRef> From<A> for Cache<A> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use alloc::sync::Arc;
 

@@ -161,9 +161,11 @@ pub mod arc;
 pub mod atomic;
 pub mod cache;
 pub mod domain;
+mod loom;
 // Same platforms as `domain::__ASYMMETRIC_BARRIERS_SUPPORTED`
 #[cfg(all(
     feature = "membarrier",
+    not(loom),
     any(target_arch = "x86", target_arch = "x86_64"),
     any(target_os = "linux", target_os = "windows")
 ))]
@@ -179,6 +181,9 @@ domain! {
     /// Default domain with 8 borrow slots.
     pub DefaultDomain(8)
 }
+#[cfg(loom)]
+#[doc(hidden)]
+pub use ::loom as __loom;
 #[cfg(all(feature = "pthread-domain", unix))]
 #[doc(hidden)]
 pub use libc;
