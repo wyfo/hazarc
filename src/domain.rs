@@ -48,13 +48,13 @@ use crossbeam_utils::CachePadded;
 
 #[cfg(feature = "domain-gc")]
 #[allow(unused_imports)]
-use crate::msrv::StrictProvenance;
+use crate::msrv::{OffsetFromUnsigned, StrictProvenance};
 use crate::{
     loom::sync::atomic::{
         AtomicPtr, AtomicUsize,
         Ordering::{Acquire, Relaxed, Release, SeqCst},
     },
-    msrv::ptr,
+    msrv::{hint, ptr},
     NULL,
 };
 
@@ -513,7 +513,54 @@ impl<D: Domain> DomainNodeRef<D> {
         }
     }
 
-    node_field_getter!(next_borrow_slot_idx: Cell<usize>);
+    /// Returns the next borrow slot in round-robin order, never the extra slot.
+    #[inline(always)]
+    pub(crate) fn next_borrow_slot(self) -> &'static BorrowSlot {
+        assert!(D::BORROW_SLOT_COUNT > 0, "no borrow slot");
+        let slot_idx = match D::BORROW_SLOT_COUNT {
+            1 => 0,
+            _ => node_field!(self.next_borrow_slot_idx).get(),
+        };
+        // SAFETY: the index is always wrapped around `BORROW_SLOT_COUNT`
+        unsafe { hint::assert_unchecked(slot_idx < D::BORROW_SLOT_COUNT) };
+        &self.borrow_slots()[slot_idx]
+    }
+
+    /// Sets the next borrow slot in round-robin order after the given one.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must be one of the node's borrow slots, but not the extra slot.
+    #[inline(always)]
+    pub(crate) unsafe fn set_next_borrow_slot_after(self, slot: &BorrowSlot) {
+        // SAFETY: same function contract
+        let slot_idx =
+            unsafe { ptr::from_ref(slot).offset_from_unsigned(self.borrow_slots().as_ptr()) };
+        // SAFETY: same function contract
+        unsafe { hint::assert_unchecked(slot_idx < D::BORROW_SLOT_COUNT) };
+        if D::BORROW_SLOT_COUNT > 1 {
+            node_field!(self.next_borrow_slot_idx).set(if D::BORROW_SLOT_COUNT.is_power_of_two() {
+                (slot_idx + 1) % D::BORROW_SLOT_COUNT
+            } else if slot_idx + 1 == D::BORROW_SLOT_COUNT {
+                0
+            } else {
+                slot_idx + 1
+            });
+        }
+    }
+
+    /// Returns the extra slot, following the borrow slots.
+    #[inline(always)]
+    pub(crate) fn extra_slot(self) -> &'static BorrowSlot {
+        &self.borrow_slots()[D::BORROW_SLOT_COUNT]
+    }
+
+    /// Returns whether the given slot is the extra slot.
+    #[inline(always)]
+    pub(crate) fn is_extra_slot(self, slot: &BorrowSlot) -> bool {
+        ptr::eq(slot, self.extra_slot())
+    }
+
     node_field_getter!(atomic_arc_slot: AtomicPtr<()>);
     node_field_getter!(next_loading_generation: Cell<usize>);
 }
@@ -529,7 +576,7 @@ impl<D: Domain> fmt::Debug for DomainNodeRef<D> {
                 "borrow_slots",
                 &&self.borrow_slots()[..D::BORROW_SLOT_COUNT],
             )
-            .field("extra_slot", &self.borrow_slots()[D::BORROW_SLOT_COUNT])
+            .field("extra_slot", self.extra_slot())
             .finish_non_exhaustive()
     }
 }

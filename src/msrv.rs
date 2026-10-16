@@ -76,6 +76,34 @@ impl<T> StrictProvenance<T> for ptr::NonNull<T> {
     }
 }
 
+// 1.87: `offset_from_unsigned`
+#[allow(dead_code)]
+pub(crate) trait OffsetFromUnsigned<T> {
+    unsafe fn offset_from_unsigned(self, origin: *const T) -> usize;
+}
+
+impl<T> OffsetFromUnsigned<T> for *const T {
+    #[inline(always)]
+    unsafe fn offset_from_unsigned(self, origin: *const T) -> usize {
+        // SAFETY: same function contract
+        let offset = unsafe { self.offset_from(origin) };
+        unsafe { hint::assert_unchecked(offset >= 0) };
+        offset as usize
+    }
+}
+
+pub(crate) mod hint {
+    pub(crate) use core::hint::*;
+
+    // 1.81: `hint::assert_unchecked`
+    #[inline(always)]
+    pub(crate) const unsafe fn assert_unchecked(cond: bool) {
+        if !cond {
+            unsafe { unreachable_unchecked() }
+        }
+    }
+}
+
 pub(crate) mod ptr {
     pub(crate) use core::ptr::*;
 
