@@ -361,7 +361,8 @@ pub(crate) struct DomainNode {
     /// don't happen before the deallocation.
     #[cfg(loom)]
     alive: loom::cell::Cell<()>,
-    load_generation: Cell<usize>,
+    // Next `LOADING` generation (ABA counter)
+    next_loading_generation: Cell<usize>,
     // Wrapping around BORROW_SLOT_COUNT
     next_borrow_slot_idx: Cell<usize>,
     // `BORROW_SLOT_COUNT` borrow slots followed by the extra slot
@@ -478,10 +479,7 @@ impl<D: Domain> DomainNodeRef<D> {
         node_field!(self.in_use).fetch_and(!IN_USE, SeqCst);
     }
 
-    #[cfg(any(
-        not(target_pointer_width = "64"),
-        hazarc_force_active_writer_count_64bit
-    ))]
+    #[cfg(any(not(target_pointer_width = "64"), hazarc_test_generation_wrap))]
     pub(crate) fn writer_guard(self) -> WriterGuard<D> {
         let in_use = node_field!(self.in_use).fetch_add(1 << IN_USE, SeqCst);
         abort_before_overflow(in_use, "too many concurrent writers");
@@ -517,7 +515,7 @@ impl<D: Domain> DomainNodeRef<D> {
 
     node_field_getter!(next_borrow_slot_idx: Cell<usize>);
     node_field_getter!(atomic_arc_slot: AtomicPtr<()>);
-    node_field_getter!(load_generation: Cell<usize>);
+    node_field_getter!(next_loading_generation: Cell<usize>);
 }
 
 impl<D: Domain> fmt::Debug for DomainNodeRef<D> {
@@ -536,16 +534,10 @@ impl<D: Domain> fmt::Debug for DomainNodeRef<D> {
     }
 }
 
-#[cfg(any(
-    not(target_pointer_width = "64"),
-    hazarc_force_active_writer_count_64bit
-))]
+#[cfg(any(not(target_pointer_width = "64"), hazarc_test_generation_wrap))]
 pub(crate) struct WriterGuard<D>(DomainNodeRef<D>);
 
-#[cfg(any(
-    not(target_pointer_width = "64"),
-    hazarc_force_active_writer_count_64bit
-))]
+#[cfg(any(not(target_pointer_width = "64"), hazarc_test_generation_wrap))]
 impl<D> Drop for WriterGuard<D> {
     fn drop(&mut self) {
         let node = self.0;
@@ -871,7 +863,7 @@ macro_rules! pthread_domain {
 #[cfg(any(
     feature = "domain-gc",
     not(target_pointer_width = "64"),
-    hazarc_force_active_writer_count_64bit
+    hazarc_test_generation_wrap
 ))]
 fn abort_before_overflow(n: usize, msg: &str) {
     if n >= usize::MAX / 2 {
