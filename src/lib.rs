@@ -82,9 +82,13 @@
 //! - `domain-gc`: enables automatic domain deallocation.
 //! - `membarrier`: enables the `membarrier_domain!` macro, using process-wide memory barriers
 //!   (x86 Linux and Windows only).
+//! - `portable-atomic`: uses [`portable-atomic`](https://docs.rs/portable-atomic) atomics instead
+//!   of `core` ones.
+//! - `portable-atomic-util`: enables [`portable_atomic_util::Arc`](https://docs.rs/portable-atomic-util/latest/portable_atomic_util/struct.Arc.html) support.
 //! - `pthread-domain`: enables the `pthread_domain!` macro for `no_std` environments using
 //!   POSIX pthread thread-local storage (Unix only).
 //! - `serde`: enables `serde` support.
+//! - `triomphe`: enables [`triomphe::Arc`](https://docs.rs/triomphe/latest/triomphe/struct.Arc.html) support.
 //!
 //! # Write policy
 //!
@@ -155,6 +159,7 @@ extern crate alloc;
 #[cfg(any(feature = "default-domain", feature = "membarrier", test))]
 extern crate std;
 
+#[cfg(target_has_atomic = "ptr")]
 use alloc::sync::Arc;
 
 pub mod arc;
@@ -189,23 +194,24 @@ pub use ::loom as __loom;
 pub use libc;
 
 /// Alias for `AtomicArcPtr<Arc<T>>`
-#[cfg(feature = "default-domain")]
+#[cfg(all(feature = "default-domain", target_has_atomic = "ptr"))]
 #[cfg_attr(docsrs, doc(cfg(all())))]
 pub type AtomicArc<T, D = DefaultDomain, W = write_policy::Concurrent> =
     atomic::AtomicArcPtr<Arc<T>, D, W>;
 /// Alias for `AtomicArcPtr<Arc<T>>`
-#[cfg(not(feature = "default-domain"))]
+#[cfg(all(not(feature = "default-domain"), target_has_atomic = "ptr"))]
 pub type AtomicArc<T, D, W = write_policy::Concurrent> = atomic::AtomicArcPtr<Arc<T>, D, W>;
 /// Alias for `AtomicOptionArcPtr<Arc<T>>`
-#[cfg(feature = "default-domain")]
+#[cfg(all(feature = "default-domain", target_has_atomic = "ptr"))]
 #[cfg_attr(docsrs, doc(cfg(all())))]
 pub type AtomicOptionArc<T, D = DefaultDomain, W = write_policy::Concurrent> =
     atomic::AtomicOptionArcPtr<Arc<T>, D, W>;
 /// Alias for `AtomicOptionArcPtr<Arc<T>>`
-#[cfg(not(feature = "default-domain"))]
+#[cfg(all(not(feature = "default-domain"), target_has_atomic = "ptr"))]
 pub type AtomicOptionArc<T, D, W = write_policy::Concurrent> =
     atomic::AtomicOptionArcPtr<Arc<T>, D, W>;
 /// Alias for `ArcPtrBorrow<Arc<T>>`
+#[cfg(target_has_atomic = "ptr")]
 pub type ArcBorrow<T> = atomic::ArcPtrBorrow<Arc<T>>;
 
 pub use cache::Cache;

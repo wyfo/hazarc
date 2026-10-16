@@ -15,12 +15,18 @@ default = ["default-domain"]
 default-domain = []
 domain-gc = []
 membarrier = ["dep:libc", "dep:windows-sys"]
+portable-atomic = ["dep:portable-atomic"]
+portable-atomic-util = ["dep:portable-atomic-util"]
 pthread-domain = ["dep:libc"]
 serde = ["dep:serde"]
+triomphe = ["dep:triomphe"]
 
 [dependencies]
-crossbeam-utils = "0.8"
+crossbeam-utils = { version = "0.8", default-features = false }
+portable-atomic = { version = "1.3", optional = true, default-features = false, features = ["require-cas"] }
+portable-atomic-util = { version = "0.2", optional = true, features = ["alloc"] }
 serde = { version = "1", optional = true }
+triomphe = { version = "0.1", optional = true, default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }

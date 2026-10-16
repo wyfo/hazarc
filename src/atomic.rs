@@ -1,5 +1,6 @@
 //! Generic atomic storage for `Arc`-like pointers.
 
+#[cfg(target_has_atomic = "ptr")]
 use alloc::sync::Arc;
 use core::{fmt, hint, marker::PhantomData, mem, mem::ManuallyDrop, ops::Deref};
 
@@ -513,18 +514,21 @@ impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> From<A> for AtomicArcPtr<Optio
     }
 }
 
+#[cfg(target_has_atomic = "ptr")]
 impl<T, D: Domain, W: WritePolicy> From<T> for AtomicArcPtr<Arc<T>, D, W> {
     fn from(value: T) -> Self {
         Arc::new(value).into()
     }
 }
 
+#[cfg(target_has_atomic = "ptr")]
 impl<T, D: Domain, W: WritePolicy> From<T> for AtomicArcPtr<Option<Arc<T>>, D, W> {
     fn from(value: T) -> Self {
         Some(Arc::new(value)).into()
     }
 }
 
+#[cfg(target_has_atomic = "ptr")]
 impl<T, D: Domain, W: WritePolicy> From<Option<T>> for AtomicArcPtr<Option<Arc<T>>, D, W> {
     fn from(value: Option<T>) -> Self {
         value.map(Arc::new).into()

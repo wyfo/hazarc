@@ -38,6 +38,24 @@ jobs:
         env:
           RUSTDOCFLAGS: "-Dwarnings"
 
+  thumbv6m:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: [portable-atomic, "portable-atomic,portable-atomic-util,domain-gc"]
+    steps:
+      - uses: actions/checkout@v6
+      - name: update toolchain
+        run: rustup update stable && rustup default stable && rustup target add thumbv6m-none-eabi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: thumbv6m-${{ matrix.features }}
+      - name: clippy
+        run: cargo clippy --lib --target thumbv6m-none-eabi --no-default-features --features ${{ matrix.features }} -- -D warnings
+        env:
+          RUSTFLAGS: --cfg portable_atomic_unsafe_assume_single_core
+
   loom:
     needs: test
     runs-on: ubuntu-latest
