@@ -32,10 +32,6 @@ const UPGRADED: usize = 0b01;
 const LOADING: usize = 0b10;
 /// An owned Arc pointer provided by a helping writer to a concurrent loading.
 const OWNED: usize = 0b11;
-/// `LOADING` generations (i.e. ABA counter) for `Concurrent`, are stored above the tag bits.
-const GENERATION_INCR: usize = TAG_MASK + 1;
-/// Generation can overflow on 32-bit
-const MAX_GENERATION: usize = !TAG_MASK;
 
 trait TaggedPtr: Sized {
     fn tag(self) -> usize;
@@ -176,12 +172,10 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
             // Release store, so the slot load following the acquire load in
             // `is_same_atomic_arc` cannot be stale.
             node.atomic_arc_slot().store(self_ptr, Release);
-            let generation = node.load_generation().get();
-            node.load_generation()
-                .set(generation.wrapping_add(GENERATION_INCR));
-            if generation == MAX_GENERATION {
-                D::release_thread_local_node();
-            }
+            let generation = node.next_loading_generation().get();
+            #[cfg(not(hazarc_test_generation_wrap))]
+            node.next_loading_generation()
+                .set(generation.wrapping_add(TAG_MASK + 1));
             ptr::without_provenance_mut::<()>(generation).with_tag(LOADING)
         } else {
             self_ptr.with_tag(LOADING)
@@ -223,6 +217,15 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
                 ArcPtrBorrow::new(owned_ptr.without_tag(OWNED), None)
             }
         };
+        // If the generation overflows, the node must be released to avoid ABA
+        // (it can't be reacquired as long as it has ongoing swap's scans).
+        // The release must happen after the last slot access, as it could be
+        // reacquired by another concurrent load, but before the upgraded pointer
+        // release, which could reenter `load`.
+        #[cfg(any(not(target_pointer_width = "64"), hazarc_test_generation_wrap))]
+        if W::CONCURRENT && node.next_loading_generation().get() == 0 {
+            D::release_thread_local_node();
+        }
         if outdated_or_upgraded != outdated_ptr {
             // Acquire, so the ownership transfer happens before the release
             // (already done by the SeqCst swap without asymmetric barriers).
@@ -294,10 +297,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         let old_arc = ManuallyDrop::new(unsafe { A::from_ptr(old_ptr) });
         let mut owned_cache: Option<ArcPtrBorrow<A>> = None;
         for node in D::static_list().nodes() {
-            #[cfg(any(
-                not(target_pointer_width = "64"),
-                hazarc_force_active_writer_count_64bit
-            ))]
+            #[cfg(any(not(target_pointer_width = "64"), hazarc_test_generation_wrap))]
             let _guard = W::CONCURRENT.then(|| node.writer_guard());
             for slot in node.borrow_slots() {
                 // With asymmetric barriers, the heavy barrier ensures the store-load ordering

@@ -21,10 +21,10 @@ jobs:
           key: ${{ matrix.features }}
       - name: rustfmt
         run: cargo fmt -- --check --config "unstable_features=true,imports_granularity=Crate,group_imports=StdExternalCrate,format_code_in_doc_comments=true"
-      - name: clippy hazarc_force_active_writer_count_64bit
-        run: cargo clippy ${{ matrix.features }} -- -D warnings
+      - name: clippy hazarc_test_generation_wrap
+        run: cargo clippy ${{ matrix.features }} --all-targets -- -D warnings
         env:
-          RUSTFLAGS: --cfg=hazarc_force_active_writer_count_64bit
+          RUSTFLAGS: --cfg=hazarc_test_generation_wrap
       - name: clippy
         run: cargo clippy ${{ matrix.features }} --all-targets -- -D warnings
       - name: test
@@ -59,6 +59,11 @@ jobs:
         run: cargo test --release --tests ${{ matrix.features }}
         env:
           RUSTFLAGS: "--cfg loom -C debug_assertions"
+          LOOM_MAX_PREEMPTIONS: 2
+      - name: test hazarc_test_generation_wrap
+        run: cargo test --release --test hazarc ${{ matrix.features }} concurrent_reads::_domain_4_dm__0_::_policy_1_Concurrent
+        env:
+          RUSTFLAGS: "--cfg loom -C debug_assertions --cfg=hazarc_test_generation_wrap"
           LOOM_MAX_PREEMPTIONS: 2
 
   compute-miri-seeds:

@@ -47,7 +47,7 @@ required-features = ["default-domain"]
 
 [lints.rust]
 missing_debug_implementations = "forbid"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hazarc_force_active_writer_count_64bit)', 'cfg(loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hazarc_test_generation_wrap)', 'cfg(loom)'] }
 unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
