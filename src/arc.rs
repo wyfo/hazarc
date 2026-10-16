@@ -5,7 +5,10 @@ use core::{mem, mem::ManuallyDrop, ops::Deref, pin::Pin, ptr};
 
 #[allow(unused_imports)]
 use crate::msrv::{ResultExt, StrictProvenance};
-use crate::{atomic::ArcPtrBorrow, NULL};
+use crate::{
+    atomic::{ArcPtrBorrow, TaggedPtr},
+    NULL,
+};
 
 /// An `Arc`-like pointer.
 ///
@@ -135,19 +138,34 @@ unsafe impl<T> ArcPtr for loom::sync::Arc<T> {
 #[cfg(loom)]
 unsafe impl<T> NonNullArcPtr for loom::sync::Arc<T> {}
 
+/// `Weak::new()` may return an unaligned pointer, so it is normalized to null.
+#[cfg(not(target_pointer_width = "16"))]
+#[inline(always)]
+fn normalize_weak_ptr<T>(ptr: *const T) -> *mut () {
+    let ptr = ptr.cast_mut().cast::<()>();
+    if ptr.tag() != 0 {
+        return NULL;
+    }
+    ptr
+}
+
 #[cfg(not(target_pointer_width = "16"))]
 unsafe impl<T> ArcPtr for Weak<T> {
+    const NULLABLE: bool = true;
     #[inline(always)]
     unsafe fn from_ptr(ptr: *mut ()) -> Self {
+        if ptr.is_null() {
+            return Weak::new();
+        }
         unsafe { Weak::from_raw(ptr.cast()) }
     }
     #[inline(always)]
     fn into_ptr(arc: Self) -> *mut () {
-        Weak::into_raw(arc).cast_mut().cast()
+        normalize_weak_ptr(Weak::into_raw(arc))
     }
     #[inline(always)]
     fn as_ptr(arc: &Self) -> *mut () {
-        Weak::as_ptr(arc).cast_mut().cast()
+        normalize_weak_ptr(Weak::as_ptr(arc))
     }
 }
 

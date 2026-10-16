@@ -21,7 +21,7 @@ use crate::{
 };
 
 // Slot tags, stored in the 2 LSBs (`ArcPtr` pointers are aligned to 4).
-const TAG_MASK: usize = 0b11;
+pub(crate) const TAG_MASK: usize = 0b11;
 /// A borrowed (validated or not) Arc pointer.
 #[allow(dead_code)]
 const BORROWED: usize = 0b00;
@@ -33,7 +33,7 @@ const LOADING: usize = 0b10;
 /// An owned Arc pointer provided by a helping writer to a concurrent loading.
 const OWNED: usize = 0b11;
 
-trait TaggedPtr: Sized {
+pub(crate) trait TaggedPtr: Sized {
     fn tag(self) -> usize;
     fn with_tag(self, tag: usize) -> Self;
     fn without_tag(self, tag: usize) -> Self;
