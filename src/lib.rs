@@ -178,8 +178,8 @@ pub mod write_policy;
 #[cfg(feature = "default-domain")]
 domain! {
     #[cfg(feature = "default-domain")]
-    /// Default domain with 8 borrow slots.
-    pub DefaultDomain(8)
+    /// Default domain with 32 borrow slots.
+    pub DefaultDomain(32)
 }
 #[cfg(loom)]
 #[doc(hidden)]

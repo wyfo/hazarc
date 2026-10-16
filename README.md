@@ -113,15 +113,17 @@ If there are concurrent writes on the same `AtomicArc`, they may execute `Atomic
 ## Safety
 
 This library uses unsafe code to deal with `AtomicPtr` manipulation and DST allocations. It is extensively tested with [`miri`](https://github.com/rust-lang/miri) to ensure its soundness, including over multiple weak memory model permutations.
- 
+
 ## Differences with `arc-swap`
 
 - Custom domains to reduce contention and add `no_std` support
 - Manual/automatic domain deallocation
+- Domain's slot count has a small impact on `AtomicArc::swap` performance; the default domain has more slots (32 vs 8)
 - Wait-free `AtomicArc::swap` — `ArcSwap::swap` is only lock-free
 - Optimized `Serialized` write policy
-- Less atomic RMW instructions
+- Fewer atomic RMW instructions
 - `AtomicArc::load` critical path fully inlined
+- Linux `membarrier`/Windows `FlushProcessWriteBuffers` support to make `AtomicArc::load` even faster on x86
 - [Better performance](benches/README.md), especially on ARM architecture
 - Null pointer/`None` load optimized
 - Ergonomic API for `Option`, `AtomicOptionArc<T>::load` returns `Option<ArcBorrow<T>>`

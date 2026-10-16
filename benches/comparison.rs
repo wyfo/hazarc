@@ -1,5 +1,5 @@
 use std::{
-    array, hint,
+    hint,
     hint::black_box,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
@@ -13,6 +13,7 @@ use divan::Bencher;
 use hazarc::{domain::Domain, ArcBorrow, AtomicArc, AtomicOptionArc, DefaultDomain};
 
 trait LoadBench: Default + Send + Sync {
+    const SLOT_COUNT: usize = 0;
     type Guard<'a>
     where
         Self: 'a;
@@ -28,7 +29,7 @@ trait LoadBench: Default + Send + Sync {
     }
     fn bench_load_no_slot(b: Bencher) {
         let x = black_box(Self::default());
-        let _guards = array::from_fn::<_, 8, _>(|_| x.load());
+        let _guards = (0..Self::SLOT_COUNT).map(|_| x.load()).collect::<Vec<_>>();
         b.bench_local(|| drop(x.load()));
     }
 }
@@ -105,6 +106,7 @@ trait StoreBench: LoadBench + From<Arc<usize>> {
 }
 
 impl LoadBench for ArcSwap<usize> {
+    const SLOT_COUNT: usize = 8;
     type Guard<'a> = Guard<Arc<usize>>;
     fn load(&self) -> Self::Guard<'_> {
         self.load()
@@ -116,6 +118,7 @@ impl StoreBench for ArcSwap<usize> {
     }
 }
 impl LoadBench for ArcSwapOption<usize> {
+    const SLOT_COUNT: usize = 8;
     type Guard<'a> = Guard<Option<Arc<usize>>>;
     fn load(&self) -> Self::Guard<'_> {
         self.load()
@@ -123,6 +126,7 @@ impl LoadBench for ArcSwapOption<usize> {
 }
 
 impl<D: Domain> LoadBench for AtomicArc<usize, D> {
+    const SLOT_COUNT: usize = D::BORROW_SLOT_COUNT;
     type Guard<'a> = ArcBorrow<usize>;
     fn load(&self) -> Self::Guard<'_> {
         self.load()
@@ -134,23 +138,26 @@ impl<D: Domain> StoreBench for AtomicArc<usize, D> {
     }
 }
 impl<D: Domain> LoadBench for AtomicOptionArc<usize, D> {
+    const SLOT_COUNT: usize = D::BORROW_SLOT_COUNT;
     type Guard<'a> = Option<ArcBorrow<usize>>;
     fn load(&self) -> Self::Guard<'_> {
         self.load()
     }
 }
 #[cfg(all(feature = "pthread-domain", unix))]
-hazarc::pthread_domain!(PthreadDomain(8));
+hazarc::pthread_domain!(PthreadDomain(DefaultDomain::BORROW_SLOT_COUNT));
 #[cfg(all(feature = "pthread-domain", unix))]
 hazarc::pthread_domain! {
-    UnsafePthreadDomain(8);
+    UnsafePthreadDomain(DefaultDomain::BORROW_SLOT_COUNT);
     // SAFETY: `UnsafePthreadDomain::pthread_key_create` is called
     // before using the domain in `hazarc_load_pthread_unsafe`
     unsafe { Self::pthread_key_already_created() }
 }
 
 #[cfg(feature = "membarrier")]
-hazarc::membarrier_domain!(MembarrierDomain(8));
+hazarc::membarrier_domain!(MembarrierDomain(DefaultDomain::BORROW_SLOT_COUNT));
+
+hazarc::domain!(Domain8Slots(8));
 
 impl LoadBench for RwLock<Arc<usize>> {
     type Guard<'a> = RwLockReadGuard<'a, Arc<usize>>;
@@ -186,6 +193,7 @@ impl StoreBench for RwLockClone<Arc<usize>> {
 #[derive(Default)]
 struct LoadSpin<T>(T);
 impl<T: LoadBench> LoadBench for LoadSpin<T> {
+    const SLOT_COUNT: usize = T::SLOT_COUNT;
     type Guard<'a>
         = T::Guard<'a>
     where
@@ -279,6 +287,10 @@ fn hazarc_load_contended_membarrier(b: Bencher) {
 fn hazarc_store(b: Bencher, threads: usize) {
     AtomicArc::<_, DefaultDomain>::bench_store(b, threads);
 }
+#[divan::bench(args = [0, 1, 2, 4, 8, 16])]
+fn hazarc_store_8_slots(b: Bencher, threads: usize) {
+    AtomicArc::<_, Domain8Slots>::bench_store(b, threads);
+}
 #[cfg(feature = "membarrier")]
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
 fn hazarc_store_membarrier(b: Bencher, threads: usize) {
@@ -287,6 +299,10 @@ fn hazarc_store_membarrier(b: Bencher, threads: usize) {
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
 fn hazarc_store_contended(b: Bencher, threads: usize) {
     AtomicArc::<_, DefaultDomain>::bench_store_contended(b, threads);
+}
+#[divan::bench(args = [0, 1, 2, 4, 8, 16])]
+fn hazarc_store_contended_8_slots(b: Bencher, threads: usize) {
+    AtomicArc::<_, Domain8Slots>::bench_store_contended(b, threads);
 }
 #[cfg(feature = "membarrier")]
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
