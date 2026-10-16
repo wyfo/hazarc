@@ -38,6 +38,24 @@ jobs:
         env:
           RUSTDOCFLAGS: "-Dwarnings"
 
+  msrv:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: install toolchains
+        run: rustup update stable && rustup default stable && rustup toolchain install 1.65 --profile minimal
+      - uses: taiki-e/install-action@cargo-hack
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: generate lockfile
+        run: cargo generate-lockfile
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+      - name: check
+        run: cargo hack check --rust-version --no-dev-deps --lib --profile test --features pthread-domain,domain-gc,serde,portable-atomic,portable-atomic-util
+
   thumbv6m:
     needs: test
     runs-on: ubuntu-latest

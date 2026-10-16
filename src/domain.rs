@@ -808,7 +808,9 @@ macro_rules! pthread_domain {
             #[inline(always)]
             fn key() -> *mut $crate::libc::pthread_key_t {
                 static mut KEY: ::core::mem::MaybeUninit<$crate::libc::pthread_key_t> = core::mem::MaybeUninit::uninit();
-                (&raw mut KEY).cast()
+                #[allow(unused_unsafe)] // `addr_of_mut!` on a `static mut` is safe since 1.82
+                let key = unsafe { ::core::ptr::addr_of_mut!(KEY) };
+                key.cast()
             }
             #[inline(always)]
             pub unsafe fn pthread_key_already_created() -> impl ::core::any::Any {
@@ -828,7 +830,7 @@ macro_rules! pthread_domain {
                 }
                 static mut KEY_ONCE: $crate::libc::pthread_once_t = $crate::libc::PTHREAD_ONCE_INIT;
                 #[allow(clippy::missing_transmute_annotations)] // signature is different across platforms
-                unsafe { $crate::libc::pthread_once(&raw mut KEY_ONCE, ::core::mem::transmute(make_key as unsafe extern "C" fn())) };
+                unsafe { $crate::libc::pthread_once(::core::ptr::addr_of_mut!(KEY_ONCE), ::core::mem::transmute(make_key as unsafe extern "C" fn())) };
                 unsafe { Self::pthread_key_already_created() }
             }
         }
@@ -881,6 +883,8 @@ fn abort_before_overflow(n: usize, msg: &str) {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use crate::domain::{Domain, ListAccessGuard};
+    #[allow(unused_imports)]
+    use crate::msrv::StrictProvenance;
 
     #[test]
     fn node_reuse() {

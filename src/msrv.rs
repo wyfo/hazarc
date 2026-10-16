@@ -63,6 +63,19 @@ impl<T> StrictProvenance<T> for *mut T {
     }
 }
 
+// 1.84: `NonNull::addr`/`NonNull::with_addr`
+impl<T> StrictProvenance<T> for ptr::NonNull<T> {
+    type Addr = core::num::NonZeroUsize;
+    fn addr(self) -> Self::Addr {
+        // SAFETY: the pointer is not null
+        unsafe { core::num::NonZeroUsize::new_unchecked(self.as_ptr().addr()) }
+    }
+    fn with_addr(self, addr: Self::Addr) -> Self {
+        // SAFETY: the address is not zero
+        unsafe { ptr::NonNull::new_unchecked(self.as_ptr().with_addr(addr.get())) }
+    }
+}
+
 pub(crate) mod ptr {
     pub(crate) use core::ptr::*;
 
