@@ -37,8 +37,7 @@ fn is_outdated<D: Domain, W: WritePolicy>(
     #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
-    loom_skip_no_barriers!(D);
-    model(|| {
+    model::<D>(|| {
         let atomic_arc = AtomicArc::<usize, D, W>::new(Arc::new(0));
         let borrow = atomic_arc.load();
         assert!(!borrow.is_outdated(&atomic_arc));
@@ -47,8 +46,6 @@ fn is_outdated<D: Domain, W: WritePolicy>(
         atomic_arc.store(old);
         assert!(!borrow.is_outdated(&atomic_arc));
         drop(borrow);
-        // Loom drops lazy statics before main thread-locals, so the node must be released first
-        D::release_thread_local_node();
     });
 }
 
@@ -57,8 +54,7 @@ fn concurrent_reads<D: Domain, W: WritePolicy>(
     #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
-    loom_skip_no_barriers!(D);
-    model(|| {
+    model::<D>(|| {
         let check_borrow = |b: &usize| assert!([0, 1, 2].contains(b));
         let atomic_arc = AtomicArc::<usize, D, W>::new(Arc::new(0));
         thread::scope(|s| {
@@ -77,8 +73,7 @@ fn concurrent_reads_other_atomic_arc<D: Domain, W: WritePolicy>(
     #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
-    loom_skip_no_barriers!(D);
-    model(|| {
+    model::<D>(|| {
         let check_borrow = |b: &_| assert!([0, 1].contains(b));
         let atomic_arc = AtomicArc::<usize, D, W>::new(Arc::new(0));
         let other = AtomicArc::<usize, D, W>::new(Arc::new(42));
@@ -101,8 +96,7 @@ fn concurrent_writes<D: Domain, W: WritePolicy>(
     #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
-    loom_skip_no_barriers!(D);
-    model(|| {
+    model::<D>(|| {
         let check_borrow = |b: &_| assert!([0, 1, 2].contains(b));
         let atomic_arc = AtomicArc::<usize, D, W>::new(Arc::new(0));
         thread::scope(|s| {
@@ -129,8 +123,7 @@ fn concurrent_writes_option<D: Domain, W: WritePolicy>(
     #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
-    loom_skip_no_barriers!(D);
-    model(|| {
+    model::<D>(|| {
         let check_borrow = |b: &Option<ArcPtrBorrow<Arc<_>>>| {
             assert!([Some(0), Some(1), None].contains(&b.as_ref().map(|b| ***b)));
         };
@@ -159,14 +152,11 @@ fn drop_atomic_arc_with_active_borrow<D: Domain, W: WritePolicy>(
     #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
-    loom_skip_no_barriers!(D);
-    model(|| {
+    model::<D>(|| {
         let atomic_arc = AtomicArc::<usize, D, W>::new(Arc::new(0));
         let borrow = atomic_arc.load();
         drop(atomic_arc);
         drop(borrow);
-        // Loom drops lazy statics before main thread-locals, so the node must be released first
-        D::release_thread_local_node();
     });
 }
 
@@ -175,8 +165,7 @@ fn drop_borrow_in_another_thread<D: Domain, W: WritePolicy>(
     #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
-    loom_skip_no_barriers!(D);
-    model(|| {
+    model::<D>(|| {
         let atomic_arc = AtomicOptionArc::<usize, D, W>::new(Some(Arc::new(0)));
         thread::scope(|s| {
             let borrow = s.spawn(|| atomic_arc.load());
@@ -210,8 +199,7 @@ fn borrow_happens_before_drop<D: Domain, W: WritePolicy>(
     #[values(d!(1), dm!(1))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
-    loom_skip_no_barriers!(D);
-    model(|| {
+    model::<D>(|| {
         let atomic_arc = AtomicArc::<WriteOnDrop, D, W>::new(Arc::new(WriteOnDrop::new()));
         thread::scope(|s| {
             s.spawn(|| assert_eq!(atomic_arc.load().read(), 0));
@@ -225,8 +213,7 @@ fn seq_cst_ordering<D: Domain, W: WritePolicy>(
     #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
-    loom_skip_no_barriers!(D);
-    model(|| {
+    model::<D>(|| {
         let x = AtomicOptionArc::<(), D, W>::new(None);
         let y = AtomicOptionArc::<(), D, W>::new(None);
         thread::scope(|s| {
@@ -245,16 +232,13 @@ fn seq_cst_ordering<D: Domain, W: WritePolicy>(
 
 #[rstest]
 fn fetch_and_add<D: Domain>(#[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D) {
-    loom_skip_no_barriers!(D);
-    model(|| {
+    model::<D>(|| {
         let atomic_arc = AtomicArc::<usize, D, Concurrent>::new(Arc::new(0));
         thread::scope(|s| {
             s.spawn(|| atomic_arc.update(|i| **i + 1));
             s.spawn(|| atomic_arc.update(|i| **i + 1));
         });
         assert_eq!(**atomic_arc.load(), 2);
-        // Loom drops lazy statics before main thread-locals, so the node must be released first
-        D::release_thread_local_node();
     });
 }
 
@@ -267,8 +251,7 @@ fn monotonic_loads<D: Domain, W: WritePolicy>(
     #[values(d!(1), dm!(1))] _domain: D,
     #[values(Concurrent)] _policy: W,
 ) {
-    loom_skip_no_barriers!(D);
-    model(|| {
+    model::<D>(|| {
         let atomic_arc = AtomicArc::<usize, D, W>::new(Arc::new(0));
         thread::scope(|s| {
             s.spawn(|| atomic_arc.store(Arc::new(1)));
@@ -357,8 +340,7 @@ fn unvalidated_transferred_borrow<D: Domain, W: WritePolicy>(
     #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
-    loom_skip_no_barriers!(D);
-    model(|| {
+    model::<D>(|| {
         let a = AtomicArcPtr::<Tagged<0>, D, W>::new(Tagged::new());
         let b = AtomicArcPtr::<Tagged<1>, D, W>::new(Tagged::new());
         thread::scope(|s| {
@@ -378,8 +360,7 @@ fn unvalidated_transferred_borrow<D: Domain, W: WritePolicy>(
 #[cfg(feature = "domain-gc")]
 #[rstest]
 fn gc_concurrent_write<D: Domain>(#[values(d!(1), dm!(1))] _domain: D) {
-    loom_skip_no_barriers!(D);
-    model(|| {
+    model::<D>(|| {
         let atomic_arc = AtomicArc::<usize, D, Concurrent>::new(Arc::new(0));
         thread::scope(|s| {
             s.spawn(|| drop(atomic_arc.load()));

@@ -4,27 +4,36 @@
 compile_error!("loom tests requires debug_assertions enabled");
 
 #[cfg(not(loom))]
-pub use std::{sync::Arc, thread};
+pub use std::{cell::Cell, sync::Arc, thread};
 
+use hazarc::domain::Domain;
 #[cfg(loom)]
-pub use loom::{model, sync::Arc};
+pub use loom::{cell::Cell, sync::Arc};
 
-#[cfg(not(loom))]
-pub fn model(f: impl Fn() + Sync + Send + 'static) {
+/// Wraps `loom::model`, releasing the main thread's node of domain `D` at the end of each
+/// iteration: loom drops lazy statics before main thread-locals, so a node acquired by a load in
+/// the main thread must be released first.
+///
+/// Loom doesn't support `SeqCst` operations, so domains without asymmetric barriers, which rely
+/// on them, are skipped.
+#[cfg_attr(not(loom), allow(clippy::extra_unused_type_parameters))]
+pub fn model<D: Domain>(f: impl Fn() + Sync + Send + 'static) {
+    #[cfg(not(loom))]
     f();
+    #[cfg(loom)]
+    if D::ASYMMETRIC_BARRIERS {
+        loom::model(move || {
+            f();
+            D::release_thread_local_node();
+        });
+    }
 }
-
-#[cfg(not(loom))]
-pub use std::cell::Cell;
-
-#[cfg(loom)]
-pub use loom::cell::Cell;
 
 /// Never frees memory, so addresses are never reused: the allocator state is not reset between
 /// loom iterations, so address reuse, e.g. a new Arc allocated at the address of a dropped one,
 /// would make the model non-deterministic.
 #[cfg(loom)]
-mod leaking_allocator {
+const _: () = {
     use std::alloc::{GlobalAlloc, Layout, System};
 
     struct LeakingAllocator;
@@ -38,19 +47,7 @@ mod leaking_allocator {
 
     #[global_allocator]
     static ALLOCATOR: LeakingAllocator = LeakingAllocator;
-}
-
-/// Loom doesn't support `SeqCst` operations, so domains without asymmetric barriers, which rely
-/// on them, must be skipped.
-#[macro_export]
-macro_rules! loom_skip_no_barriers {
-    ($D:ident) => {
-        #[cfg(loom)]
-        if !<$D as hazarc::domain::Domain>::ASYMMETRIC_BARRIERS {
-            return;
-        }
-    };
-}
+};
 
 #[cfg(loom)]
 pub mod thread {
