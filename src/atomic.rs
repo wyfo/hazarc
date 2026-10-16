@@ -559,6 +559,13 @@ impl<A: ArcPtr> ArcPtrBorrow<A> {
         self.clone()
     }
 
+    /// Returns `true` if the borrow is outdated, i.e. the Arc currently stored in `atomic`
+    /// is not the borrowed one.
+    #[inline]
+    pub fn is_outdated<D: Domain, W: WritePolicy>(&self, atomic: &AtomicArcPtr<A, D, W>) -> bool {
+        atomic.ptr.load(SeqCst) != ArcPtr::as_ptr(&*self.arc)
+    }
+
     /// Reload the borrow if it is outdated.
     #[inline]
     pub fn reload<D: Domain, W: WritePolicy>(

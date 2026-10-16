@@ -33,6 +33,26 @@ macro_rules! dm {
 }
 
 #[rstest]
+fn is_outdated<D: Domain, W: WritePolicy>(
+    #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
+    #[values(Concurrent, Serialized)] _policy: W,
+) {
+    loom_skip_no_barriers!(D);
+    model(|| {
+        let atomic_arc = AtomicArc::<usize, D, W>::new(Arc::new(0));
+        let borrow = atomic_arc.load();
+        assert!(!borrow.is_outdated(&atomic_arc));
+        let old = atomic_arc.swap(Arc::new(1));
+        assert!(borrow.is_outdated(&atomic_arc));
+        atomic_arc.store(old);
+        assert!(!borrow.is_outdated(&atomic_arc));
+        drop(borrow);
+        // Loom drops lazy statics before main thread-locals, so the node must be released first
+        D::release_thread_local_node();
+    });
+}
+
+#[rstest]
 fn concurrent_reads<D: Domain, W: WritePolicy>(
     #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
     #[values(Concurrent, Serialized)] _policy: W,
