@@ -22,6 +22,7 @@ pub fn model<D: Domain>(f: impl Fn() + Sync + Send + 'static) {
     f();
     #[cfg(loom)]
     if D::ASYMMETRIC_BARRIERS {
+        use hazarc::domain::DomainExt;
         loom::model(move || {
             f();
             D::release_thread_local_node();

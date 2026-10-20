@@ -81,6 +81,8 @@ macro_rules! node_field_getter {
 ///
 /// The trait is usually implemented using [`domain`](crate::domain!) macro.
 ///
+/// [`DomainExt`] methods can be used to handle domain's node lifecycle.
+///
 /// See [`module`](self) documentation.
 ///
 /// # Safety
@@ -88,8 +90,6 @@ macro_rules! node_field_getter {
 /// - [`static_list`](Self::static_list) must return a single static list.
 /// - [`get_thread_local_node`](Self::get_thread_local_node) must return the node set with
 ///   [`set_thread_local_node`](Self::set_thread_local_node).
-/// - [`get_or_acquire_thread_local_node`](Self::get_or_acquire_thread_local_node) and
-///   [`release_thread_local_node`](Self::release_thread_local_node) should not be overwritten.
 /// - If [`ASYMMETRIC_BARRIERS`](Self::ASYMMETRIC_BARRIERS) is true, a
 ///   [`light_barrier`](Self::light_barrier) and a [`heavy_barrier`](Self::heavy_barrier) must
 ///   synchronize like two `fence(SeqCst)`.
@@ -125,7 +125,11 @@ pub unsafe trait Domain: Sized + Send + Sync + 'static {
     /// If not `None`, the node must have been acquired from the domain's static list,
     /// and must not have been released.
     unsafe fn set_thread_local_node(node: Option<DomainNodeRef<Self>>);
-    /// Gets the domain's thread-local node, or acquires one from the static list and cache it.
+}
+
+/// [`Domain`] utility methods to handle domain's node lifecycle.
+pub trait DomainExt: Domain {
+    /// Gets the domain's thread-local node, or acquires one from the static list and caches it.
     fn get_or_acquire_thread_local_node() -> DomainNodeRef<Self> {
         #[cold]
         #[inline(never)]
@@ -144,6 +148,8 @@ pub unsafe trait Domain: Sized + Send + Sync + 'static {
         }
     }
 }
+
+impl<D: Domain> DomainExt for D {}
 
 /// The domain's list.
 ///
@@ -592,8 +598,11 @@ impl<D> Drop for WriterGuard<D> {
     }
 }
 
-/// Declare a domain using standard thread-local storage.
-///
+/// Declares a domain using standard thread-local storage.
+#[cfg_attr(
+    feature = "membarrier",
+    doc = "\nSee also [`membarrier_domain!`](crate::membarrier_domain!).\n"
+)]
 /// # Examples
 ///
 /// ```rust
@@ -670,7 +679,7 @@ macro_rules! __thread_local_node {
                 struct NodeGuard;
                 impl Drop for NodeGuard {
                     fn drop(&mut self) {
-                        <$name as $crate::domain::Domain>::release_thread_local_node();
+                        <$name as $crate::domain::DomainExt>::release_thread_local_node();
                     }
                 }
                 ::std::thread_local! {
@@ -788,7 +797,7 @@ macro_rules! __domain {
     };
 }
 
-/// Declare a domain using standard thread-local storage, and process-wide memory barriers.
+/// Declares a domain using standard thread-local storage, and process-wide memory barriers.
 ///
 /// Loads only execute a compiler fence, at the cost of a process-wide memory barrier in writes,
 /// e.g. a `membarrier` system call on Linux. It makes loads faster, but writes significantly
@@ -814,7 +823,7 @@ macro_rules! membarrier_domain {
     };
 }
 
-/// Declare a domain using POSIX pthread API.
+/// Declares a domain using POSIX pthread API.
 ///
 /// # Examples
 ///
@@ -929,7 +938,7 @@ fn abort_before_overflow(n: usize, msg: &str) {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
-    use crate::domain::{Domain, ListAccessGuard};
+    use crate::domain::{Domain, DomainExt, ListAccessGuard};
     #[allow(unused_imports)]
     use crate::msrv::StrictProvenance;
 

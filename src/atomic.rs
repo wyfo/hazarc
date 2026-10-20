@@ -8,7 +8,7 @@ use core::{fmt, marker::PhantomData, mem, mem::ManuallyDrop, ops::Deref};
 use crate::msrv::{OptionExt, StrictProvenance};
 use crate::{
     arc::{ArcPtr, ArcPtrExt, ArcRef, DropVTable, NonNullArcPtr},
-    domain::{BorrowSlot, Domain, DomainNodeRef},
+    domain::{BorrowSlot, Domain, DomainExt, DomainNodeRef},
     loom::{
         sync::atomic::{
             fence, AtomicPtr,

@@ -144,7 +144,7 @@
 //! If there are concurrent writes on the same `AtomicArc`, they may execute `AtomicArc::load`
 //! internally, with the same consequences on wait-freedom.
 //!
-//! [access the thread-local node]: domain::Domain::get_or_acquire_thread_local_node
+//! [access the thread-local node]: domain::DomainExt::get_or_acquire_thread_local_node
 //! [`ArcPtr`]: arc::ArcPtr
 //!
 //! # Safety
