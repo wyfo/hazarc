@@ -8,15 +8,15 @@ use core::{fmt, marker::PhantomData, mem, mem::ManuallyDrop, ops::Deref};
 use crate::msrv::{OptionExt, StrictProvenance};
 use crate::{
     arc::{ArcPtr, ArcPtrExt, ArcRef, DropVTable, NonNullArcPtr},
-    domain::{BorrowSlot, Domain, DomainExt, DomainNodeRef},
+    domain::{Domain, DomainExt, DomainNodeRef, SlotRef},
     loom::{
         sync::atomic::{
-            fence, AtomicPtr,
+            fence, AtomicPtr, Ordering,
             Ordering::{Acquire, Relaxed, Release, SeqCst},
         },
         AtomicPtrExt,
     },
-    msrv::ptr,
+    msrv::{hint, ptr},
     write_policy::{Concurrent, WritePolicy},
     NULL,
 };
@@ -81,13 +81,13 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
 
     /// Loads a borrowed Arc.
     #[inline]
-    pub fn load(&self) -> ArcPtrBorrow<A> {
+    pub fn load(&self) -> ArcPtrBorrow<A, D> {
         let ptr = self.ptr.load(if A::NULLABLE { SeqCst } else { Relaxed });
         self.load_impl::<false>(ptr)
     }
 
     #[inline(always)]
-    fn load_impl<const INTO_OWNED: bool>(&self, ptr: *mut ()) -> ArcPtrBorrow<A> {
+    fn load_impl<const INTO_OWNED: bool>(&self, ptr: *mut ()) -> ArcPtrBorrow<A, D> {
         if A::NULLABLE && ptr.is_null() {
             return ArcPtrBorrow::new(NULL, None);
         }
@@ -100,7 +100,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
             return self.load_with_slot(ptr, node, node.extra_slot());
         }
         let slot = node.next_borrow_slot();
-        if !slot.load(Relaxed).is_null() {
+        if !slot.load(Self::FREE_SLOT_ORDERING).is_null() {
             return self.load_find_available_slot(ptr, node);
         }
         self.load_with_slot(ptr, node, slot)
@@ -108,22 +108,33 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
 
     #[cold]
     #[inline(never)]
-    fn load_acquire_node<const INTO_OWNED: bool>(&self, ptr: *mut ()) -> ArcPtrBorrow<A> {
+    fn load_acquire_node<const INTO_OWNED: bool>(&self, ptr: *mut ()) -> ArcPtrBorrow<A, D> {
         D::get_or_acquire_thread_local_node();
         self.load_impl::<INTO_OWNED>(ptr)
     }
+
+    /// With asymmetric barriers, a free slot may have been released by a guard dropped in another
+    /// thread, so the slot load must be acquire for the reset of
+    /// [`releasing`](SlotRef::releasing) to be ordered after its set.
+    const FREE_SLOT_ORDERING: Ordering = if D::ASYMMETRIC_BARRIERS {
+        Acquire
+    } else {
+        Relaxed
+    };
 
     #[inline(always)]
     fn load_with_slot(
         &self,
         ptr: *mut (),
         node: DomainNodeRef<D>,
-        slot: &'static BorrowSlot,
-    ) -> ArcPtrBorrow<A> {
+        slot: SlotRef<D>,
+    ) -> ArcPtrBorrow<A, D> {
         let ptr_checked = if D::ASYMMETRIC_BARRIERS {
+            // Reset the releasing flag of the previous borrow, so the new one can be upgraded.
+            slot.releasing().store(false, Relaxed);
             // Release, so a writer reading this borrow is synchronized with the release of the
             // previous one in `ArcPtrBorrow::drop` (a plain store is not part of its release
-            // sequence).
+            // sequence), and observes the reset releasing flag.
             slot.store(ptr, Release);
             D::light_barrier();
             // SeqCst as all AtomicArc operations must have this ordering.
@@ -135,7 +146,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         if ptr != ptr_checked {
             return self.load_slow(ptr, node, slot);
         }
-        let borrow = ArcPtrBorrow::<A>::new(ptr_checked, Some(slot));
+        let borrow = ArcPtrBorrow::<A, D>::new(ptr_checked, Some(slot));
         if node.is_extra_slot(slot) {
             return borrow.clone().into();
         }
@@ -146,9 +157,9 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
 
     #[cold]
     #[inline(never)]
-    fn load_find_available_slot(&self, ptr: *mut (), node: DomainNodeRef<D>) -> ArcPtrBorrow<A> {
-        let slot = (node.borrow_slots().iter().take(D::BORROW_SLOT_COUNT))
-            .find(|slot| slot.load(Relaxed).is_null())
+    fn load_find_available_slot(&self, ptr: *mut (), node: DomainNodeRef<D>) -> ArcPtrBorrow<A, D> {
+        let slot = (node.borrow_slots().take(D::BORROW_SLOT_COUNT))
+            .find(|slot| slot.load(Self::FREE_SLOT_ORDERING).is_null())
             .unwrap_or_else(|| node.extra_slot());
         self.load_with_slot(ptr, node, slot)
     }
@@ -159,8 +170,8 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         &self,
         ptr: *mut (),
         node: DomainNodeRef<D>,
-        slot: &'static BorrowSlot,
-    ) -> ArcPtrBorrow<A> {
+        slot: SlotRef<D>,
+    ) -> ArcPtrBorrow<A, D> {
         let self_ptr = ptr::from_ref(&self.ptr).cast_mut().cast();
         let loading_ptr = if W::CONCURRENT {
             // Release store, so the slot load following the acquire load in
@@ -192,9 +203,9 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         // Failure ordering must be SeqCst for load to have a full SeqCst semantic
         let borrow = match slot.compare_exchange(loading_ptr, ptr_checked, SeqCst, SeqCst) {
             // the slot is released if the pointer is null
-            Ok(_) if A::NULLABLE && ptr_checked.is_null() => ArcPtrBorrow::<A>::new(NULL, None),
+            Ok(_) if A::NULLABLE && ptr_checked.is_null() => ArcPtrBorrow::<A, D>::new(NULL, None),
             Ok(_) => {
-                let mut borrow = ArcPtrBorrow::<A>::new(ptr_checked, Some(slot));
+                let mut borrow = ArcPtrBorrow::<A, D>::new(ptr_checked, Some(slot));
                 // The extra slot must be released before releasing the upgraded pointer,
                 // as the latter may reenter `load`.
                 if node.is_extra_slot(slot) {
@@ -243,13 +254,13 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     }
 
     #[cold]
-    fn load_impl_cold(&self, ptr: *mut ()) -> ArcPtrBorrow<A> {
+    fn load_impl_cold(&self, ptr: *mut ()) -> ArcPtrBorrow<A, D> {
         self.load_impl::<false>(ptr)
     }
 
     /// Returns a reference to the cached Arc if it is up-to-date, or loads the latest Arc.
     #[inline]
-    pub fn load_cached_or_reload<'a>(&self, cached: &'a A) -> CachedOrReloaded<'a, A> {
+    pub fn load_cached_or_reload<'a>(&self, cached: &'a A) -> CachedOrReloaded<'a, A, D> {
         let ptr = self.ptr.load(SeqCst);
         if ptr == A::as_ptr(cached) {
             CachedOrReloaded::Cached(cached)
@@ -280,18 +291,24 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     /// Stores the Arc and returns the previous one.
     pub fn swap(&self, arc: A) -> A {
         let old_ptr = self.ptr.swap(A::into_ptr(arc), SeqCst);
-        if D::ASYMMETRIC_BARRIERS {
-            D::heavy_barrier();
-        }
         self.swap_impl(old_ptr)
     }
 
     /// Scans all the domain's slots, providing an owned pointer to pending slow-path loads of
     /// this `AtomicArc`, and transferring the ownership of the old pointer to its borrows.
     fn swap_impl(&self, old_ptr: *mut ()) -> A {
+        // With asymmetric barriers, the heavy barrier is executed after having registered an
+        // active writer until the end of the scan. A guard drop with no active writer can then
+        // reset its slot with a plain store, as the scan of all subsequent writes will observe
+        // the slot's releasing flag, while the upgrades of the previous ones are visible.
+        let mut _guard = None;
+        if D::ASYMMETRIC_BARRIERS {
+            _guard = Some(D::static_list().active_writer_guard());
+            D::heavy_barrier();
+        }
         // Leaked if the scan panics, as some borrows may not have been upgraded yet
         let old_arc = ManuallyDrop::new(unsafe { A::from_ptr(old_ptr) });
-        let mut owned_cache: Option<ArcPtrBorrow<A>> = None;
+        let mut owned_cache: Option<ArcPtrBorrow<A, D>> = None;
         for node in D::static_list().nodes() {
             #[cfg(any(not(target_pointer_width = "64"), hazarc_test_generation_wrap))]
             let _guard = W::CONCURRENT.then(|| node.writer_guard());
@@ -313,9 +330,9 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
                         _ => owned_cache.get_or_insert_with(|| self.load()),
                     };
                     if let Err(ptr) = owned.transfer_ownership(|owned_ptr| {
-                        // Acquire failure, so the borrow release happens before the old pointer
-                        // is returned (and possibly dropped)
-                        slot.compare_exchange(slot_ptr, owned_ptr.with_tag(OWNED), SeqCst, Acquire)
+                        // Release, so the ownership transfer happens before the release of the
+                        // owned pointer by the loading thread.
+                        slot.compare_exchange(slot_ptr, owned_ptr.with_tag(OWNED), Release, Relaxed)
                     }) {
                         // the slow-path load may have borrowed the old pointer in the meantime
                         slot_ptr = ptr;
@@ -323,27 +340,35 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
                 }
                 // The slot may have been released after a `LOADING` value, so it can be null
                 if slot_ptr == old_ptr && (!A::NULLABLE || !old_ptr.is_null()) {
+                    // With asymmetric barriers, a releasing borrow must not be upgraded, as the
+                    // slot may be reset with a plain store. Acquire fence, so the releasing flag
+                    // is not older than the borrow (the flag is reset before storing it).
+                    if D::ASYMMETRIC_BARRIERS {
+                        fence(Acquire);
+                        if slot.releasing().load(Relaxed) {
+                            continue;
+                        }
+                    }
                     let _ = old_arc.transfer_ownership(|old_ptr| {
                         let vtable = ptr::from_ref(A::DROP_VTABLE).cast_mut().cast::<()>();
-                        // Acquire failure, so the borrow release happens before the old pointer
-                        // is returned (and possibly dropped)
-                        slot.compare_exchange(old_ptr, vtable.with_tag(UPGRADED), SeqCst, Acquire)
+                        // Release, so the ownership transfer happens before the release of the old
+                        // pointer by the borrow.
+                        slot.compare_exchange(old_ptr, vtable.with_tag(UPGRADED), Release, Relaxed)
                     });
                 }
             }
         }
-        // Acquire fence, so borrow releases observed by relaxed slot loads happen before the old
-        // pointer is returned (and possibly dropped)
-        if D::ASYMMETRIC_BARRIERS {
-            fence(Acquire);
-        }
+        // Acquire fence, so borrow releases observed by relaxed slot loads (with asymmetric
+        // barriers) or by compare-exchange failures happen before the old arc is returned (and
+        // possibly dropped).
+        fence(Acquire);
         ManuallyDrop::into_inner(old_arc)
     }
 
     fn is_same_atomic_arc(
         &self,
         node: DomainNodeRef<D>,
-        slot: &BorrowSlot,
+        slot: SlotRef<D>,
         slot_ptr: &mut *mut (),
     ) -> bool {
         let self_ptr = ptr::from_ref(&self.ptr).cast_mut().cast();
@@ -390,6 +415,16 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         if A::NULLABLE && ptr.is_null() {
             return unsafe { A::from_ptr(NULL) };
         }
+        // As there is no concurrent load, all borrows are visible. Asymmetric barrier normally
+        // requires a heavy barrier, but it is not necessary here if there is no borrow.
+        if D::ASYMMETRIC_BARRIERS {
+            let mut slots = (D::static_list().nodes()).flat_map(|node| node.borrow_slots());
+            if !slots.any(|slot| slot.load(Relaxed) == ptr) {
+                // Acquire fence, so the borrow releases happen before the pointer is returned.
+                fence(Acquire);
+                return unsafe { A::from_ptr(ptr) };
+            }
+        }
         self.swap_impl(ptr)
     }
 
@@ -405,15 +440,14 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D, Concurrent> {
     /// Stores the new Arc if the current one matches the argument.
     ///
     /// Returns the previous Arc if store succeeds, or loads the current Arc otherwise.
-    pub fn compare_exchange<C: ArcRef<A>>(&self, current: C, new: A) -> Result<A, ArcPtrBorrow<A>> {
+    pub fn compare_exchange<C: ArcRef<A>>(
+        &self,
+        current: C,
+        new: A,
+    ) -> Result<A, ArcPtrBorrow<A, D>> {
         let new = ManuallyDrop::new(new);
         match (self.ptr).compare_exchange(C::as_ptr(current), A::as_ptr(&new), SeqCst, Acquire) {
-            Ok(old_ptr) => {
-                if D::ASYMMETRIC_BARRIERS {
-                    D::heavy_barrier();
-                }
-                Ok(self.swap_impl(old_ptr))
-            }
+            Ok(old_ptr) => Ok(self.swap_impl(old_ptr)),
             Err(old_ptr) => {
                 drop(ManuallyDrop::into_inner(new));
                 Err(self.load_impl::<false>(old_ptr))
@@ -429,7 +463,7 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D, Concurrent> {
     pub fn try_update<F: FnMut(&A) -> Option<R>, R: Into<A>>(
         &self,
         mut f: F,
-    ) -> Result<A, ArcPtrBorrow<A>> {
+    ) -> Result<A, ArcPtrBorrow<A, D>> {
         let mut current = self.load();
         while let Some(new) = f(&current) {
             match self.compare_exchange(&*current, new.into()) {
@@ -453,7 +487,7 @@ impl<A: ArcPtr, D: Domain> AtomicArcPtr<A, D, Concurrent> {
     pub fn fetch_update<F: FnMut(&A) -> Option<R>, R: Into<A>>(
         &self,
         f: F,
-    ) -> Result<A, ArcPtrBorrow<A>> {
+    ) -> Result<A, ArcPtrBorrow<A, D>> {
         self.try_update(f)
     }
 }
@@ -534,15 +568,23 @@ impl<T, D: Domain, W: WritePolicy> From<Option<T>> for AtomicArcPtr<Option<Arc<T
 ///
 /// In most cases, the borrowed Arc doesn't need to be cloned, hence the name.
 #[must_use]
-#[derive(Debug)]
-pub struct ArcPtrBorrow<A: ArcPtr> {
+pub struct ArcPtrBorrow<A: ArcPtr, D: Domain> {
     arc: ManuallyDrop<A>,
-    slot: Option<&'static BorrowSlot>,
+    slot: Option<SlotRef<D>>,
 }
 
-impl<A: ArcPtr> ArcPtrBorrow<A> {
+impl<A: ArcPtr + fmt::Debug, D: Domain> fmt::Debug for ArcPtrBorrow<A, D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ArcPtrBorrow")
+            .field("arc", &self.arc)
+            .field("slot", &self.slot)
+            .finish()
+    }
+}
+
+impl<A: ArcPtr, D: Domain> ArcPtrBorrow<A, D> {
     #[inline(always)]
-    pub(crate) fn new(ptr: *mut (), slot: Option<&'static BorrowSlot>) -> Self {
+    pub(crate) fn new(ptr: *mut (), slot: Option<SlotRef<D>>) -> Self {
         let arc = ManuallyDrop::new(unsafe { A::from_ptr(ptr) });
         Self { arc, slot }
     }
@@ -571,16 +613,13 @@ impl<A: ArcPtr> ArcPtrBorrow<A> {
     /// Returns `true` if the borrow is outdated, i.e. the Arc currently stored in `atomic`
     /// is not the borrowed one.
     #[inline]
-    pub fn is_outdated<D: Domain, W: WritePolicy>(&self, atomic: &AtomicArcPtr<A, D, W>) -> bool {
+    pub fn is_outdated<W: WritePolicy>(&self, atomic: &AtomicArcPtr<A, D, W>) -> bool {
         atomic.ptr.load(SeqCst) != ArcPtr::as_ptr(&*self.arc)
     }
 
     /// Reload the borrow if it is outdated.
     #[inline]
-    pub fn reload<D: Domain, W: WritePolicy>(
-        &mut self,
-        atomic: &AtomicArcPtr<A, D, W>,
-    ) -> &mut Self {
+    pub fn reload<W: WritePolicy>(&mut self, atomic: &AtomicArcPtr<A, D, W>) -> &mut Self {
         let ptr = atomic.ptr.load(SeqCst);
         if ptr != ArcPtr::as_ptr(&*self.arc) {
             *self = atomic.load_impl_cold(ptr);
@@ -589,24 +628,48 @@ impl<A: ArcPtr> ArcPtrBorrow<A> {
     }
 }
 
-impl<A: NonNullArcPtr> ArcPtrBorrow<Option<A>> {
-    /// Transpose a `ArcPtrBorrow<Option<A>>` into an `Option<ArcPtrBorrow<A>>`.
+impl<A: NonNullArcPtr, D: Domain> ArcPtrBorrow<Option<A>, D> {
+    /// Transpose a `ArcPtrBorrow<Option<A>, D>` into an `Option<ArcPtrBorrow<A, D>>`.
     ///
     /// This operation should be optimized out in release build.
     #[inline(always)]
-    pub fn transpose(self) -> Option<ArcPtrBorrow<A>> {
+    pub fn transpose(self) -> Option<ArcPtrBorrow<A, D>> {
         let this = ManuallyDrop::new(self);
         Some(ArcPtrBorrow::new(A::as_ptr(this.arc.as_ref()?), this.slot))
     }
 }
 
-impl<A: ArcPtr> Drop for ArcPtrBorrow<A> {
+impl<A: ArcPtr, D: Domain> Drop for ArcPtrBorrow<A, D> {
     #[inline]
     fn drop(&mut self) {
         let ptr = A::as_ptr(&self.arc);
-        // Reset the borrow slot to NULL with Release so the use of the Arc happens before its
-        // release, as slots are loaded with SeqCst (Acquire) in `swap_impl`.
-        if let Some(slot_ptr) = self.slot.map(|slot| slot.swap(NULL, Release)) {
+        if let Some(slot) = self.slot {
+            // With asymmetric barriers, the releasing flag of the slot is set before the light
+            // barrier to make it visible from a further concurrent swap. A swap seeing this flag
+            // will not try to upgrade it. If there is no swap ongoing after the barrier, the slot
+            // can then be reset with a store, with the guarantee there is no concurrent upgrade.
+            // Otherwise, the slot is reset with a swap to handle concurrent upgrade.
+            let slot_ptr = if D::ASYMMETRIC_BARRIERS {
+                // Release, so a writer skipping the releasing borrow is synchronized with its use.
+                // The flag is reset by the next load using the slot.
+                slot.releasing().store(true, Release);
+                D::light_barrier();
+                // Acquire is required to not miss a concurrent upgrade done by a completed swap.
+                if D::static_list().active_writers().load(Acquire) == 0 {
+                    let slot_ptr = slot.load(Relaxed);
+                    // Release, so a load reusing the slot in another thread resets the releasing
+                    // flag after it has been set.
+                    slot.store(NULL, Release);
+                    slot_ptr
+                } else {
+                    hint::cold_path();
+                    slot.swap(NULL, Release)
+                }
+            } else {
+                // Release, so the use of the Arc happens before its release, as slots are loaded
+                // with SeqCst (Acquire) in `swap_impl`.
+                slot.swap(NULL, Release)
+            };
             if slot_ptr == ptr {
                 return;
             }
@@ -621,7 +684,7 @@ impl<A: ArcPtr> Drop for ArcPtrBorrow<A> {
     }
 }
 
-impl<A: ArcPtr> Deref for ArcPtrBorrow<A> {
+impl<A: ArcPtr, D: Domain> Deref for ArcPtrBorrow<A, D> {
     type Target = A;
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -630,20 +693,20 @@ impl<A: ArcPtr> Deref for ArcPtrBorrow<A> {
 }
 
 // NonNullPtr bound to avoid collision with `Option::as_ref`
-impl<A: NonNullArcPtr> AsRef<A> for ArcPtrBorrow<A> {
+impl<A: NonNullArcPtr, D: Domain> AsRef<A> for ArcPtrBorrow<A, D> {
     #[inline]
     fn as_ref(&self) -> &A {
         self
     }
 }
 
-impl<A: ArcPtr + fmt::Display> fmt::Display for ArcPtrBorrow<A> {
+impl<A: ArcPtr + fmt::Display, D: Domain> fmt::Display for ArcPtrBorrow<A, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         (**self).fmt(f)
     }
 }
 
-impl<A: ArcPtr> From<A> for ArcPtrBorrow<A> {
+impl<A: ArcPtr, D: Domain> From<A> for ArcPtrBorrow<A, D> {
     #[inline]
     fn from(value: A) -> Self {
         Self {
@@ -653,9 +716,9 @@ impl<A: ArcPtr> From<A> for ArcPtrBorrow<A> {
     }
 }
 
-impl<A: NonNullArcPtr> From<Option<ArcPtrBorrow<A>>> for ArcPtrBorrow<Option<A>> {
+impl<A: NonNullArcPtr, D: Domain> From<Option<ArcPtrBorrow<A, D>>> for ArcPtrBorrow<Option<A>, D> {
     #[inline]
-    fn from(value: Option<ArcPtrBorrow<A>>) -> Self {
+    fn from(value: Option<ArcPtrBorrow<A, D>>) -> Self {
         match value.map(ManuallyDrop::new) {
             Some(a) => Self::new(A::as_ptr(&a.arc), a.slot),
             None => Self::new(NULL, None),
@@ -664,17 +727,25 @@ impl<A: NonNullArcPtr> From<Option<ArcPtrBorrow<A>>> for ArcPtrBorrow<Option<A>>
 }
 
 /// Result of [`AtomicArcPtr::load_cached_or_reload`].
-#[derive(Debug)]
-pub enum CachedOrReloaded<'a, A: ArcPtr> {
+pub enum CachedOrReloaded<'a, A: ArcPtr, D: Domain> {
     /// Cache Arc.
     Cached(&'a A),
     /// Reloaded Arc.
-    Reloaded(ArcPtrBorrow<A>),
+    Reloaded(ArcPtrBorrow<A, D>),
 }
 
-impl<'a, A: NonNullArcPtr> CachedOrReloaded<'a, Option<A>> {
+impl<A: ArcPtr + fmt::Debug, D: Domain> fmt::Debug for CachedOrReloaded<'_, A, D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cached(arc) => f.debug_tuple("Cached").field(arc).finish(),
+            Self::Reloaded(arc) => f.debug_tuple("Reloaded").field(arc).finish(),
+        }
+    }
+}
+
+impl<'a, A: NonNullArcPtr, D: Domain> CachedOrReloaded<'a, Option<A>, D> {
     /// Transpose a `CachedOrReloaded<Option<A>>` into an `Option<CacheReloaded<A>>`.
-    pub fn transpose(self) -> Option<CachedOrReloaded<'a, A>> {
+    pub fn transpose(self) -> Option<CachedOrReloaded<'a, A, D>> {
         match self {
             Self::Cached(arc) => arc.as_ref().map(CachedOrReloaded::Cached),
             Self::Reloaded(arc) => arc.transpose().map(CachedOrReloaded::Reloaded),
@@ -682,7 +753,7 @@ impl<'a, A: NonNullArcPtr> CachedOrReloaded<'a, Option<A>> {
     }
 }
 
-impl<A: ArcPtr> Deref for CachedOrReloaded<'_, A> {
+impl<A: ArcPtr, D: Domain> Deref for CachedOrReloaded<'_, A, D> {
     type Target = A;
     fn deref(&self) -> &Self::Target {
         match self {
@@ -694,8 +765,8 @@ impl<A: ArcPtr> Deref for CachedOrReloaded<'_, A> {
 
 /// A wrapper around `AtomicArcPtr<Option<A>>` with a more ergonomic API.
 ///
-/// For example, [`AtomicOptionArcPtr::load`] returns an `Option<ArcPtrBorrow<A>>` instead of
-/// `ArcPtrBorrow<Option<A>>`.
+/// For example, [`AtomicOptionArcPtr::load`] returns an `Option<ArcPtrBorrow<A, D>>` instead of
+/// `ArcPtrBorrow<Option<A>, D>`.
 #[repr(transparent)]
 pub struct AtomicOptionArcPtr<A: NonNullArcPtr, D: Domain, W: WritePolicy>(
     AtomicArcPtr<Option<A>, D, W>,
@@ -735,7 +806,7 @@ impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicOptionArcPtr<A, D, W> {
 
     /// Loads a borrowed Arc.
     #[inline]
-    pub fn load(&self) -> Option<ArcPtrBorrow<A>> {
+    pub fn load(&self) -> Option<ArcPtrBorrow<A, D>> {
         self.0.load().transpose()
     }
 
@@ -761,7 +832,10 @@ impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicOptionArcPtr<A, D, W> {
 
     /// Returns a reference to the cached Arc if it is up-to-date, or loads the latest Arc.
     #[inline]
-    pub fn load_cached_or_reload<'a>(&self, arc: &'a Option<A>) -> Option<CachedOrReloaded<'a, A>> {
+    pub fn load_cached_or_reload<'a>(
+        &self,
+        arc: &'a Option<A>,
+    ) -> Option<CachedOrReloaded<'a, A, D>> {
         self.0.load_cached_or_reload(arc).transpose()
     }
 
@@ -784,7 +858,7 @@ impl<A: NonNullArcPtr, D: Domain> AtomicOptionArcPtr<A, D, Concurrent> {
         &self,
         current: C,
         new: Option<A>,
-    ) -> Result<Option<A>, Option<ArcPtrBorrow<A>>> {
+    ) -> Result<Option<A>, Option<ArcPtrBorrow<A, D>>> {
         self.0
             .compare_exchange(current, new)
             .map_err(ArcPtrBorrow::transpose)
@@ -798,7 +872,7 @@ impl<A: NonNullArcPtr, D: Domain> AtomicOptionArcPtr<A, D, Concurrent> {
     pub fn try_update<F: FnMut(Option<&A>) -> Option<R>, R: Into<Option<A>>>(
         &self,
         mut f: F,
-    ) -> Result<Option<A>, Option<ArcPtrBorrow<A>>> {
+    ) -> Result<Option<A>, Option<ArcPtrBorrow<A, D>>> {
         self.0
             .try_update(|arc| f(arc.as_ref()))
             .map_err(ArcPtrBorrow::transpose)
@@ -817,7 +891,7 @@ impl<A: NonNullArcPtr, D: Domain> AtomicOptionArcPtr<A, D, Concurrent> {
     pub fn fetch_update<F: FnMut(Option<&A>) -> Option<R>, R: Into<Option<A>>>(
         &self,
         f: F,
-    ) -> Result<Option<A>, Option<ArcPtrBorrow<A>>> {
+    ) -> Result<Option<A>, Option<ArcPtrBorrow<A, D>>> {
         self.try_update(f)
     }
 }

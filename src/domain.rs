@@ -38,14 +38,13 @@
 //! operations. The deallocation is best-effort; it should happen in normal cases but some
 //! non-trivial concurrent workflows can theoretically prevent it.
 
-use alloc::{
-    alloc::{alloc_zeroed, dealloc, handle_alloc_error},
-    vec::Vec,
-};
-use core::{alloc::Layout, cell::Cell, fmt, iter, marker::PhantomData, ptr::NonNull, slice};
+use alloc::alloc::{alloc_zeroed, dealloc, handle_alloc_error};
+use core::{alloc::Layout, cell::Cell, iter, marker::PhantomData, mem, ops::Deref, ptr::NonNull};
 
 use crossbeam_utils::CachePadded;
 
+#[cfg(loom)]
+use crate::msrv::ptr::{self, addr_of_mut};
 #[allow(unused_imports)]
 use crate::msrv::OffsetFromUnsigned;
 #[cfg(feature = "domain-gc")]
@@ -53,10 +52,10 @@ use crate::msrv::OffsetFromUnsigned;
 use crate::msrv::StrictProvenance;
 use crate::{
     loom::sync::atomic::{
-        AtomicPtr, AtomicUsize,
+        AtomicBool, AtomicPtr, AtomicUsize,
         Ordering::{Acquire, Relaxed, Release, SeqCst},
     },
-    msrv::{hint, ptr},
+    msrv::{fmt, hint},
     NULL,
 };
 
@@ -160,6 +159,7 @@ pub struct DomainList<D> {
     head: AtomicPtr<DomainNode>,
     #[cfg(feature = "domain-gc")]
     active_nodes_and_writers: AtomicUsize,
+    active_writers: AtomicUsize,
     _domain: PhantomData<D>,
 }
 
@@ -177,8 +177,30 @@ impl<D: Domain> DomainList<D> {
             head: AtomicPtr::new(NULL.cast()),
             #[cfg(feature = "domain-gc")]
             active_nodes_and_writers: AtomicUsize::new(0),
+            active_writers: AtomicUsize::new(0),
             _domain: PhantomData,
         }
+    }
+
+    /// Returns the number of ongoing writes, only used with asymmetric barriers.
+    #[inline(always)]
+    pub(crate) fn active_writers(&self) -> &AtomicUsize {
+        &self.active_writers
+    }
+
+    /// Increments the number of ongoing writes, decrementing it when the guard is dropped.
+    pub(crate) fn active_writer_guard(&self) -> impl Drop + '_ {
+        struct ActiveWriterGuard<'a>(&'a AtomicUsize);
+        impl Drop for ActiveWriterGuard<'_> {
+            fn drop(&mut self) {
+                // Release, so a guard drop observing no active writer also observes the write's
+                // upgrades
+                self.0.fetch_sub(1, Release);
+            }
+        }
+        let active = self.active_writers.fetch_add(1, Relaxed);
+        abort_before_overflow(active, "too many active writers");
+        ActiveWriterGuard(&self.active_writers)
     }
 
     pub(crate) fn nodes(&self) -> impl Iterator<Item = DomainNodeRef<D>> + '_ {
@@ -281,7 +303,10 @@ impl<D: Domain> fmt::Debug for DomainList<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DomainList")
             .field("domain", &core::any::type_name::<D>())
-            .field("nodes", &self.nodes().collect::<Vec<_>>())
+            .field(
+                "nodes",
+                &fmt::from_fn(|f| f.debug_list().entries(self.nodes()).finish()),
+            )
             .finish()
     }
 }
@@ -357,11 +382,7 @@ impl<D: Domain> Drop for ListAccessGuard<'_, D> {
     }
 }
 
-pub(crate) type BorrowSlot = AtomicPtr<()>;
-
-#[repr(C)] // borrow_slots must be the last field
 pub(crate) struct DomainNode {
-    _align: CachePadded<()>,
     next: AtomicPtr<DomainNode>,
     in_use: AtomicUsize,
     atomic_arc_slot: AtomicPtr<()>,
@@ -373,8 +394,7 @@ pub(crate) struct DomainNode {
     next_loading_generation: Cell<usize>,
     // Wrapping around BORROW_SLOT_COUNT
     next_borrow_slot_idx: Cell<usize>,
-    // `BORROW_SLOT_COUNT` borrow slots followed by the extra slot
-    borrow_slots: [BorrowSlot; 0],
+    // borrow slots + extra slot are stored at the end of DomainNode
 }
 
 /// A static reference to a domain's node.
@@ -420,15 +440,41 @@ impl<D: Domain> DomainNodeRef<D> {
         }
     }
 
-    fn layout() -> Layout {
-        let (layout, _) = Layout::new::<DomainNode>()
-            .extend(Layout::array::<BorrowSlot>(D::BORROW_SLOT_COUNT + 1).unwrap())
+    /// Number of words per slot: the slot's `AtomicPtr`, followed by its releasing flag with
+    /// asymmetric barriers.
+    const SLOT_WORDS: usize = if D::ASYMMETRIC_BARRIERS { 2 } else { 1 };
+
+    /// Returns the node allocation layout, and the offset of its slots.
+    #[inline(always)]
+    fn layout() -> (Layout, usize) {
+        let slot_words = (D::BORROW_SLOT_COUNT + 1) * Self::SLOT_WORDS;
+        let (layout, slots_offset) = Layout::new::<DomainNode>()
+            .extend(Layout::array::<AtomicPtr<()>>(slot_words).unwrap())
             .unwrap();
-        layout
+        // Cache-padded, to avoid false sharing with neighbor allocations
+        let layout = (layout.align_to(mem::align_of::<CachePadded<()>>()))
+            .unwrap()
+            .pad_to_align();
+        (layout, slots_offset)
+    }
+
+    #[inline(always)]
+    fn slot(self, idx: usize) -> SlotRef<D> {
+        debug_assert!(idx <= D::BORROW_SLOT_COUNT);
+        #[cfg(loom)]
+        node_field!(self.alive).get();
+        let (_, slots_offset) = Self::layout();
+        // SAFETY: the slots are in bounds of the node allocation
+        let slots = unsafe { self.as_ptr().cast::<u8>().add(slots_offset) }.cast::<AtomicPtr<()>>();
+        // SAFETY: the index is in bounds of the node allocation
+        SlotRef {
+            ptr: unsafe { NonNull::new_unchecked(slots.add(idx * Self::SLOT_WORDS)) },
+            _domain: PhantomData,
+        }
     }
 
     fn allocate() -> DomainNodeRef<D> {
-        let layout = Self::layout();
+        let (layout, _) = Self::layout();
         // SAFETY: layout has non-zero size
         let ptr = unsafe { alloc_zeroed(layout) }.cast();
         let node = DomainNodeRef {
@@ -439,13 +485,18 @@ impl<D: Domain> DomainNodeRef<D> {
         #[cfg(loom)]
         unsafe {
             let ptr = node.as_ptr();
-            ptr::addr_of_mut!((*ptr).next).write(AtomicPtr::new(NULL.cast()));
-            ptr::addr_of_mut!((*ptr).in_use).write(AtomicUsize::new(0));
-            ptr::addr_of_mut!((*ptr).atomic_arc_slot).write(AtomicPtr::new(NULL));
-            ptr::addr_of_mut!((*ptr).alive).write(loom::cell::Cell::new(()));
-            let slots = ptr::addr_of_mut!((*ptr).borrow_slots).cast::<BorrowSlot>();
+            addr_of_mut!((*ptr).next).write(AtomicPtr::new(NULL.cast()));
+            addr_of_mut!((*ptr).in_use).write(AtomicUsize::new(0));
+            addr_of_mut!((*ptr).atomic_arc_slot).write(AtomicPtr::new(NULL));
+            addr_of_mut!((*ptr).alive).write(loom::cell::Cell::new(()));
             for i in 0..=D::BORROW_SLOT_COUNT {
-                slots.add(i).write(AtomicPtr::new(NULL));
+                let slot = node.slot(i).ptr.as_ptr();
+                slot.write(AtomicPtr::new(NULL));
+                if D::ASYMMETRIC_BARRIERS {
+                    slot.add(1)
+                        .cast::<AtomicBool>()
+                        .write(AtomicBool::new(false));
+                }
             }
         }
         node
@@ -455,22 +506,25 @@ impl<D: Domain> DomainNodeRef<D> {
         // load `self.in_use` to avoid data race
         let in_use = node_field!(self.in_use).load(SeqCst);
         debug_assert_eq!(in_use, 0);
-        debug_assert!((self.borrow_slots().iter()).all(|s| s.load(Relaxed).is_null()));
+        debug_assert!(self.borrow_slots().all(|s| s.load(Relaxed).is_null()));
         #[cfg(loom)]
         unsafe {
             let ptr = self.as_ptr();
-            ptr::drop_in_place(ptr::addr_of_mut!((*ptr).next));
-            ptr::drop_in_place(ptr::addr_of_mut!((*ptr).in_use));
-            ptr::drop_in_place(ptr::addr_of_mut!((*ptr).atomic_arc_slot));
+            ptr::drop_in_place(addr_of_mut!((*ptr).next));
+            ptr::drop_in_place(addr_of_mut!((*ptr).in_use));
+            ptr::drop_in_place(addr_of_mut!((*ptr).atomic_arc_slot));
+            for i in 0..=D::BORROW_SLOT_COUNT {
+                let slot = self.slot(i).ptr.as_ptr();
+                ptr::drop_in_place(slot);
+                if D::ASYMMETRIC_BARRIERS {
+                    ptr::drop_in_place(slot.add(1).cast::<AtomicBool>());
+                }
+            }
             (*ptr).alive.set(());
-            ptr::drop_in_place(ptr::addr_of_mut!((*ptr).alive));
-            let slots = ptr::addr_of_mut!((*ptr).borrow_slots).cast::<BorrowSlot>();
-            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
-                slots,
-                D::BORROW_SLOT_COUNT + 1,
-            ));
+            // alive is accessed in self.slot so it must be dropped after
+            ptr::drop_in_place(addr_of_mut!((*ptr).alive));
         }
-        let layout = Self::layout();
+        let (layout, _) = Self::layout();
         unsafe { dealloc(self.as_ptr().cast(), layout) }
     }
 
@@ -511,27 +565,24 @@ impl<D: Domain> DomainNodeRef<D> {
         }
     }
 
+    /// Returns the borrow slots, followed by the extra slot.
     #[inline(always)]
-    pub(crate) fn borrow_slots(self) -> &'static [BorrowSlot] {
-        #[cfg(loom)]
-        node_field!(self.alive).get();
-        unsafe {
-            let slots = ptr::addr_of!((*self.as_ptr()).borrow_slots);
-            slice::from_raw_parts(slots as _, D::BORROW_SLOT_COUNT + 1)
-        }
+    pub(crate) fn borrow_slots(self) -> impl Iterator<Item = SlotRef<D>> + Clone {
+        (0..=D::BORROW_SLOT_COUNT).map(move |idx| self.slot(idx))
     }
 
     /// Returns the next borrow slot in round-robin order, never the extra slot.
     #[inline(always)]
-    pub(crate) fn next_borrow_slot(self) -> &'static BorrowSlot {
+    pub(crate) fn next_borrow_slot(self) -> SlotRef<D> {
         assert!(D::BORROW_SLOT_COUNT > 0, "no borrow slot");
         let slot_idx = match D::BORROW_SLOT_COUNT {
             1 => 0,
             _ => node_field!(self.next_borrow_slot_idx).get(),
         };
         // SAFETY: the index is always wrapped around `BORROW_SLOT_COUNT`
+        // It lets the compiler know that the slot is not the extra slot.
         unsafe { hint::assert_unchecked(slot_idx < D::BORROW_SLOT_COUNT) };
-        &self.borrow_slots()[slot_idx]
+        self.slot(slot_idx)
     }
 
     /// Sets the next borrow slot in round-robin order after the given one.
@@ -540,10 +591,11 @@ impl<D: Domain> DomainNodeRef<D> {
     ///
     /// `slot` must be one of the node's borrow slots, but not the extra slot.
     #[inline(always)]
-    pub(crate) unsafe fn set_next_borrow_slot_after(self, slot: &BorrowSlot) {
+    pub(crate) unsafe fn set_next_borrow_slot_after(self, slot: SlotRef<D>) {
         // SAFETY: same function contract
-        let slot_idx =
-            unsafe { ptr::from_ref(slot).offset_from_unsigned(self.borrow_slots().as_ptr()) };
+        let slot_words =
+            unsafe { (slot.ptr.as_ptr()).offset_from_unsigned(self.slot(0).ptr.as_ptr()) };
+        let slot_idx = slot_words / Self::SLOT_WORDS;
         // SAFETY: same function contract
         unsafe { hint::assert_unchecked(slot_idx < D::BORROW_SLOT_COUNT) };
         if D::BORROW_SLOT_COUNT > 1 {
@@ -559,14 +611,14 @@ impl<D: Domain> DomainNodeRef<D> {
 
     /// Returns the extra slot, following the borrow slots.
     #[inline(always)]
-    pub(crate) fn extra_slot(self) -> &'static BorrowSlot {
-        &self.borrow_slots()[D::BORROW_SLOT_COUNT]
+    pub(crate) fn extra_slot(self) -> SlotRef<D> {
+        self.slot(D::BORROW_SLOT_COUNT)
     }
 
     /// Returns whether the given slot is the extra slot.
     #[inline(always)]
-    pub(crate) fn is_extra_slot(self, slot: &BorrowSlot) -> bool {
-        ptr::eq(slot, self.extra_slot())
+    pub(crate) fn is_extra_slot(self, slot: SlotRef<D>) -> bool {
+        slot.ptr == self.extra_slot().ptr
     }
 
     node_field_getter!(atomic_arc_slot: AtomicPtr<()>);
@@ -582,10 +634,63 @@ impl<D: Domain> fmt::Debug for DomainNodeRef<D> {
             .field("active_writers", &(in_use >> IN_USE))
             .field(
                 "borrow_slots",
-                &&self.borrow_slots()[..D::BORROW_SLOT_COUNT],
+                &fmt::from_fn(|f| {
+                    let slots = self.borrow_slots().take(D::BORROW_SLOT_COUNT);
+                    f.debug_list().entries(slots).finish()
+                }),
             )
-            .field("extra_slot", self.extra_slot())
+            .field("extra_slot", &self.extra_slot())
             .finish_non_exhaustive()
+    }
+}
+
+/// A reference to a borrow slot, dereferencing to its tagged pointer.
+///
+/// With asymmetric barriers, each slot is followed by its releasing flag, see
+/// [`releasing`](Self::releasing).
+pub(crate) struct SlotRef<D> {
+    ptr: NonNull<AtomicPtr<()>>,
+    _domain: PhantomData<D>,
+}
+
+// SAFETY: the slot is only accessed through atomics
+unsafe impl<D> Send for SlotRef<D> {}
+// SAFETY: the slot is only accessed through atomics
+unsafe impl<D> Sync for SlotRef<D> {}
+
+impl<D> Clone for SlotRef<D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<D> Copy for SlotRef<D> {}
+
+impl<D: Domain> SlotRef<D> {
+    #[inline(always)]
+    pub(crate) fn releasing(&self) -> &AtomicBool {
+        assert!(D::ASYMMETRIC_BARRIERS, "no releasing flag");
+        // SAFETY: with asymmetric barriers, the slot is followed by its releasing flag
+        unsafe { &*self.ptr.as_ptr().add(1).cast::<AtomicBool>() }
+    }
+}
+
+impl<D> Deref for SlotRef<D> {
+    type Target = AtomicPtr<()>;
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: the slot is valid as long as its node is not deallocated
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl<D: Domain> fmt::Debug for SlotRef<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_struct("SlotRef");
+        debug.field("ptr", &**self);
+        if D::ASYMMETRIC_BARRIERS {
+            debug.field("releasing", self.releasing());
+        }
+        debug.finish()
     }
 }
 
@@ -616,6 +721,9 @@ macro_rules! domain {
         $crate::__domain!($(#[$attrs])* $vis $name($borrow_slot_count, false));
     };
 }
+
+#[doc(hidden)]
+pub use crossbeam_utils::CachePadded as __CachePadded;
 
 /// Asymmetric barriers are only used on x86, as the critical path still emits a store-load barrier
 /// on ARM. Moreover, the `mprotect` fallback of process-wide memory barriers on Linux only works
@@ -745,8 +853,16 @@ impl<D: Domain> Drop for __LocalNode<D> {
 #[macro_export]
 macro_rules! __static_list {
     ($name:ident) => {{
+        // With asymmetric barriers, the active writer count is accessed a lot in read-write, so
+        // it should be padded. The unused static should be removed from optimized builds.
         static LIST: $crate::domain::DomainList<$name> = $crate::domain::DomainList::new();
-        &LIST
+        static PADDED_LIST: $crate::domain::__CachePadded<$crate::domain::DomainList<$name>> =
+            $crate::domain::__CachePadded::new($crate::domain::DomainList::new());
+        if <$name as $crate::domain::Domain>::ASYMMETRIC_BARRIERS {
+            &*PADDED_LIST
+        } else {
+            &LIST
+        }
     }};
 }
 
@@ -801,9 +917,10 @@ macro_rules! __domain {
 
 /// Declares a domain using standard thread-local storage, and process-wide memory barriers.
 ///
-/// Loads only execute a compiler fence, at the cost of a process-wide memory barrier in writes,
-/// e.g. a `membarrier` system call on Linux. It makes loads faster, but writes significantly
-/// costlier, impacting all the program's threads.
+/// Loads' critical path only executes compiler fences instead of memory barriers/atomic RMW
+/// operations, at the cost of a process-wide memory barrier in writes, e.g. a `membarrier` system
+/// call on Linux. It makes loads faster, but writes significantly costlier, impacting all the
+/// program's threads.
 ///
 /// Process-wide memory barriers are only used on x86 Linux and Windows. On other platforms, the
 /// macro is equivalent to [`domain!`](crate::domain!).
@@ -920,11 +1037,6 @@ macro_rules! pthread_domain {
     };
 }
 
-#[cfg(any(
-    feature = "domain-gc",
-    not(target_pointer_width = "64"),
-    hazarc_test_generation_wrap
-))]
 fn abort_before_overflow(n: usize, msg: &str) {
     if n >= usize::MAX / 2 {
         struct PanicInDrop;

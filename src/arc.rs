@@ -6,7 +6,7 @@ use core::{mem, mem::ManuallyDrop, ops::Deref, pin::Pin, ptr};
 
 #[allow(unused_imports)]
 use crate::msrv::{ResultExt, StrictProvenance};
-use crate::{atomic::ArcPtrBorrow, NULL};
+use crate::{atomic::ArcPtrBorrow, domain::Domain, NULL};
 
 /// An `Arc`-like pointer.
 ///
@@ -269,13 +269,13 @@ impl<A: NonNullArcPtr> ArcRef<Option<A>> for Option<&A> {
     }
 }
 
-impl<A: ArcPtr> ArcRef<A> for &ArcPtrBorrow<A> {
+impl<A: ArcPtr, D: Domain> ArcRef<A> for &ArcPtrBorrow<A, D> {
     fn as_ptr(this: Self) -> *mut () {
         ArcRef::as_ptr(&**this)
     }
 }
 
-impl<A: NonNullArcPtr> ArcRef<Option<A>> for Option<&ArcPtrBorrow<A>> {
+impl<A: NonNullArcPtr, D: Domain> ArcRef<Option<A>> for Option<&ArcPtrBorrow<A, D>> {
     fn as_ptr(this: Self) -> *mut () {
         ArcRef::as_ptr(this.map(AsRef::as_ref))
     }
