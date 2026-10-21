@@ -127,7 +127,7 @@ impl LoadBench for ArcSwapOption<usize> {
 
 impl<D: Domain> LoadBench for AtomicArc<usize, D> {
     const SLOT_COUNT: usize = D::BORROW_SLOT_COUNT;
-    type Guard<'a> = ArcBorrow<usize>;
+    type Guard<'a> = ArcBorrow<usize, D>;
     fn load(&self) -> Self::Guard<'_> {
         self.load()
     }
@@ -139,7 +139,7 @@ impl<D: Domain> StoreBench for AtomicArc<usize, D> {
 }
 impl<D: Domain> LoadBench for AtomicOptionArc<usize, D> {
     const SLOT_COUNT: usize = D::BORROW_SLOT_COUNT;
-    type Guard<'a> = Option<ArcBorrow<usize>>;
+    type Guard<'a> = Option<ArcBorrow<usize, D>>;
     fn load(&self) -> Self::Guard<'_> {
         self.load()
     }

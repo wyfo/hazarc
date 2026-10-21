@@ -3,7 +3,7 @@ use std::{mem::ManuallyDrop, ptr};
 use hazarc::{
     arc::ArcPtr,
     atomic::{ArcPtrBorrow, AtomicArcPtr, AtomicOptionArcPtr},
-    domain::Domain,
+    domain::{Domain, DomainExt},
     write_policy::{Concurrent, Serialized, WritePolicy},
 };
 use rstest::rstest;
@@ -124,7 +124,7 @@ fn concurrent_writes_option<D: Domain, W: WritePolicy>(
     #[values(Concurrent, Serialized)] _policy: W,
 ) {
     model::<D>(|| {
-        let check_borrow = |b: &Option<ArcPtrBorrow<Arc<_>>>| {
+        let check_borrow = |b: &Option<ArcPtrBorrow<Arc<_>, _>>| {
             assert!([Some(0), Some(1), None].contains(&b.as_ref().map(|b| ***b)));
         };
         let atomic_arc = AtomicOptionArc::<usize, D, W>::new(Some(Arc::new(0)));
@@ -204,6 +204,52 @@ fn borrow_happens_before_drop<D: Domain, W: WritePolicy>(
         thread::scope(|s| {
             s.spawn(|| assert_eq!(atomic_arc.load().read(), 0));
             s.spawn(|| atomic_arc.store(Arc::new(WriteOnDrop::new())));
+        });
+    });
+}
+
+#[rstest]
+fn reuse_slot_dropped_in_another_thread<D: Domain, W: WritePolicy>(
+    #[values(d!(1), d!(8), dm!(1), dm!(8))] _domain: D,
+    #[values(Concurrent, Serialized)] _policy: W,
+) {
+    model::<D>(|| {
+        let atomic_arc = AtomicArc::<WriteOnDrop, D, W>::new(Arc::new(WriteOnDrop::new()));
+        let borrow = atomic_arc.load();
+        // Wrap the round-robin around, so the next load reuses the slot of `borrow`
+        for _ in 1..D::BORROW_SLOT_COUNT {
+            drop(atomic_arc.load());
+        }
+        // The node is reused by the next loading thread
+        D::release_thread_local_node();
+        thread::scope(|s| {
+            s.spawn(move || drop(borrow));
+            s.spawn(|| {
+                let borrow = atomic_arc.load();
+                atomic_arc.store(Arc::new(WriteOnDrop::new()));
+                assert_eq!(borrow.read(), 0);
+            });
+        });
+    });
+}
+
+/// With `domain-gc`, the borrow's node may be deallocated right after its slot is reset, while the
+/// guard drop still holds a reference to the slot.
+#[rstest]
+fn drop_atomic_arc_concurrent_borrow_drop<D: Domain, W: WritePolicy>(
+    #[values(d!(0), d!(1), d!(8), dm!(0), dm!(1), dm!(8))] _domain: D,
+    #[values(Concurrent, Serialized)] _policy: W,
+) {
+    model::<D>(|| {
+        let atomic_arc = AtomicArc::<WriteOnDrop, D, W>::new(Arc::new(WriteOnDrop::new()));
+        let borrow = atomic_arc.load();
+        D::release_thread_local_node();
+        thread::scope(|s| {
+            s.spawn(move || drop(atomic_arc));
+            s.spawn(move || {
+                assert_eq!(borrow.read(), 0);
+                drop(borrow);
+            });
         });
     });
 }

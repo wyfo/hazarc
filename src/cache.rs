@@ -48,7 +48,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcRef for AtomicArcPtr<A, D, W
     where
         Self::Arc: 'a;
     type LoadCachedOrReload<'a>
-        = CachedOrReloaded<'a, A>
+        = CachedOrReloaded<'a, A, D>
     where
         Self::Arc: 'a;
     #[inline]
@@ -73,7 +73,7 @@ impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicArcRef for AtomicOptionA
     where
         Self::Arc: 'a;
     type LoadCachedOrReload<'a>
-        = Option<CachedOrReloaded<'a, A>>
+        = Option<CachedOrReloaded<'a, A, D>>
     where
         Self::Arc: 'a;
     #[inline]

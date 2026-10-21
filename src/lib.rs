@@ -211,8 +211,12 @@ pub type AtomicOptionArc<T, D = DefaultDomain, W = write_policy::Concurrent> =
 pub type AtomicOptionArc<T, D, W = write_policy::Concurrent> =
     atomic::AtomicOptionArcPtr<Arc<T>, D, W>;
 /// Alias for `ArcPtrBorrow<Arc<T>>`
-#[cfg(target_has_atomic = "ptr")]
-pub type ArcBorrow<T> = atomic::ArcPtrBorrow<Arc<T>>;
+#[cfg(all(feature = "default-domain", target_has_atomic = "ptr"))]
+#[cfg_attr(docsrs, doc(cfg(all())))]
+pub type ArcBorrow<T, D = DefaultDomain> = atomic::ArcPtrBorrow<Arc<T>, D>;
+/// Alias for `ArcPtrBorrow<Arc<T>>`
+#[cfg(all(not(feature = "default-domain"), target_has_atomic = "ptr"))]
+pub type ArcBorrow<T, D> = atomic::ArcPtrBorrow<Arc<T>, D>;
 
 pub use cache::Cache;
 

@@ -23,7 +23,7 @@ impl<A: NonNullArcPtr + Serialize, D: Domain, W: WritePolicy> Serialize
     }
 }
 
-impl<A: ArcPtr + Serialize> Serialize for ArcPtrBorrow<A> {
+impl<A: ArcPtr + Serialize, D: Domain> Serialize for ArcPtrBorrow<A, D> {
     fn serialize<Ser: Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
         (**self).serialize(serializer)
     }
@@ -51,7 +51,7 @@ impl<'de, A: NonNullArcPtr + Deserialize<'de>, D: Domain, W: WritePolicy> Deseri
     }
 }
 
-impl<'de, A: ArcPtr + Deserialize<'de>> Deserialize<'de> for ArcPtrBorrow<A> {
+impl<'de, A: ArcPtr + Deserialize<'de>, D: Domain> Deserialize<'de> for ArcPtrBorrow<A, D> {
     fn deserialize<De: Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
         Ok(Self::from(A::deserialize(deserializer)?))
     }

@@ -1,13 +1,12 @@
-pub(crate) mod sync {
-    pub(crate) mod atomic {
-        #[cfg(not(any(loom, feature = "portable-atomic")))]
-        pub(crate) use core::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
+#[cfg(not(any(loom, feature = "portable-atomic")))]
+pub(crate) use core::sync;
 
-        #[cfg(loom)]
-        pub(crate) use loom::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
-        #[cfg(all(feature = "portable-atomic", not(loom)))]
-        pub(crate) use portable_atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
-    }
+#[cfg(loom)]
+pub(crate) use loom::sync;
+
+#[cfg(all(feature = "portable-atomic", not(loom)))]
+pub(crate) mod sync {
+    pub(crate) use portable_atomic as atomic;
 }
 
 pub(crate) trait AtomicPtrExt<T> {

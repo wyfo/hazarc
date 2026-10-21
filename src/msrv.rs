@@ -92,6 +92,23 @@ impl<T> OffsetFromUnsigned<T> for *const T {
     }
 }
 
+pub(crate) mod fmt {
+    pub(crate) use core::fmt::*;
+
+    // 1.93: `fmt::from_fn`
+    pub(crate) fn from_fn<F: Fn(&mut Formatter<'_>) -> Result>(f: F) -> FromFn<F> {
+        FromFn(f)
+    }
+
+    pub(crate) struct FromFn<F>(F);
+
+    impl<F: Fn(&mut Formatter<'_>) -> Result> Debug for FromFn<F> {
+        fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+            (self.0)(f)
+        }
+    }
+}
+
 pub(crate) mod hint {
     pub(crate) use core::hint::*;
 
@@ -102,6 +119,11 @@ pub(crate) mod hint {
             unsafe { unreachable_unchecked() }
         }
     }
+
+    // 1.95: `hint::cold_path`
+    #[cold]
+    #[inline(always)]
+    pub(crate) const fn cold_path() {}
 }
 
 pub(crate) mod ptr {
