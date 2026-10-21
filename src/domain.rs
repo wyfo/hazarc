@@ -46,9 +46,11 @@ use core::{alloc::Layout, cell::Cell, fmt, iter, marker::PhantomData, ptr::NonNu
 
 use crossbeam_utils::CachePadded;
 
+#[allow(unused_imports)]
+use crate::msrv::OffsetFromUnsigned;
 #[cfg(feature = "domain-gc")]
 #[allow(unused_imports)]
-use crate::msrv::{OffsetFromUnsigned, StrictProvenance};
+use crate::msrv::StrictProvenance;
 use crate::{
     loom::sync::atomic::{
         AtomicPtr, AtomicUsize,

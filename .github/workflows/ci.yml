@@ -41,6 +41,9 @@ jobs:
   msrv:
     needs: test
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: [--no-default-features, "--features pthread-domain,domain-gc,serde,portable-atomic,portable-atomic-util"]
     steps:
       - uses: actions/checkout@v6
       - name: install toolchains
@@ -48,13 +51,13 @@ jobs:
       - uses: taiki-e/install-action@cargo-hack
       - uses: Swatinem/rust-cache@v2
         with:
-          key: msrv
+          key: msrv ${{ matrix.features }}
       - name: generate lockfile
         run: cargo generate-lockfile
         env:
           CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
       - name: check
-        run: cargo hack check --rust-version --no-dev-deps --lib --profile test --features pthread-domain,domain-gc,serde,portable-atomic,portable-atomic-util
+        run: cargo hack check --rust-version --no-dev-deps --lib --profile test ${{ matrix.features }}
 
   thumbv6m:
     needs: test
