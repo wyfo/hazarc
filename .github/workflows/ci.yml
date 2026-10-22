@@ -77,6 +77,44 @@ jobs:
         env:
           RUSTFLAGS: --cfg portable_atomic_unsafe_assume_single_core
 
+  # Compilation of the platform-specific code, e.g. process-wide memory barriers
+  cross-platform:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - aarch64-linux-android
+          - x86_64-linux-android
+          - x86_64-unknown-freebsd
+          - aarch64-apple-darwin
+          - aarch64-apple-ios
+        rcpc: [false]
+        # Process-wide memory barriers are only used on AArch64 with `rcpc`
+        include:
+          - target: aarch64-pc-windows-msvc
+            rcpc: true
+          - target: aarch64-unknown-linux-gnu
+            rcpc: true
+          - target: aarch64-linux-android
+            rcpc: true
+          - target: aarch64-apple-ios
+            rcpc: true
+    steps:
+      - uses: actions/checkout@v6
+      - name: update toolchain
+        run: rustup update stable && rustup default stable && rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cross-platform-${{ matrix.target }}-${{ matrix.rcpc }}
+      - name: clippy
+        run: cargo clippy --target ${{ matrix.target }} --features membarrier,domain-gc --all-targets -- -D warnings
+        env:
+          RUSTFLAGS: ${{ matrix.rcpc && '-C target-feature=+rcpc' || '' }}
   loom:
     needs: test
     runs-on: ubuntu-latest

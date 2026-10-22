@@ -81,7 +81,7 @@
 //!   using standard thread-local storage.
 //! - `domain-gc`: enables automatic domain deallocation.
 //! - `membarrier`: enables the `membarrier_domain!` macro, using process-wide memory barriers
-//!   (x86 Linux and Windows only).
+//!   (Linux, Android, FreeBSD, Windows and Apple platforms only; on ARM, only AArch64 with `rcpc`).
 //! - `portable-atomic`: uses [`portable-atomic`](https://docs.rs/portable-atomic) atomics instead
 //!   of `core` ones.
 //! - `portable-atomic-util`: enables [`portable_atomic_util::Arc`](https://docs.rs/portable-atomic-util/latest/portable_atomic_util/struct.Arc.html) support.
@@ -180,11 +180,21 @@ mod loom;
 // Same platforms as `domain::__ASYMMETRIC_BARRIERS_SUPPORTED`
 #[cfg(all(
     feature = "membarrier",
+    not(miri),
     not(loom),
-    any(target_arch = "x86", target_arch = "x86_64"),
-    any(target_os = "linux", target_os = "windows")
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows",
+        target_vendor = "apple"
+    ),
+    not(target_arch = "arm"),
+    any(not(target_arch = "aarch64"), target_feature = "rcpc"),
 ))]
 mod membarrier;
+#[cfg(all(hazarc_assume_membarrier, not(feature = "membarrier")))]
+compile_error!("`hazarc_assume_membarrier` cfg requires `membarrier` feature");
 mod msrv;
 #[cfg(feature = "serde")]
 mod serde;

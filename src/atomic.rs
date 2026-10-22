@@ -70,6 +70,9 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     /// Constructs a new Arc atomic storage.
     #[inline]
     pub fn new(arc: A) -> Self {
+        if D::ASYMMETRIC_BARRIERS {
+            D::init_barriers();
+        }
         Self {
             ptr: AtomicPtr::new(A::into_ptr(arc)),
             _arc: PhantomData,

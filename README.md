@@ -123,7 +123,7 @@ This library uses unsafe code to deal with `AtomicPtr` manipulation and DST allo
 - Optimized `Serialized` write policy
 - Fewer atomic RMW instructions
 - `AtomicArc::load` critical path fully inlined
-- Linux `membarrier`/Windows `FlushProcessWriteBuffers` support to make `AtomicArc::load` even faster on x86
+- Process-wide memory barriers support, e.g. Linux `membarrier`, to make `AtomicArc::load` even faster
 - [Better performance](benches/README.md), especially on ARM architecture
 - Null pointer/`None` load optimized
 - Ergonomic API for `Option`, `AtomicOptionArc<T>::load` returns `Option<ArcBorrow<T>>`

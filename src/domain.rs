@@ -104,6 +104,14 @@ pub unsafe trait Domain: Sized + Send + Sync + 'static {
     /// Operations are then no longer sequentially consistent, see
     /// [memory ordering](crate#memory-ordering).
     const ASYMMETRIC_BARRIERS: bool = false;
+    /// Initializes the barriers, executed by `AtomicArc` non-const constructors, e.g. to check if
+    /// a process-wide memory barrier is supported.
+    ///
+    /// As const constructors don't execute it, barriers must not rely on it for their soundness.
+    ///
+    /// Only used if [`ASYMMETRIC_BARRIERS`](Self::ASYMMETRIC_BARRIERS) is true.
+    #[inline(always)]
+    fn init_barriers() {}
     /// Barrier executed in the critical path of loads, e.g. a compiler fence.
     ///
     /// Only used if [`ASYMMETRIC_BARRIERS`](Self::ASYMMETRIC_BARRIERS) is true.
@@ -731,13 +739,23 @@ macro_rules! domain {
 #[doc(hidden)]
 pub use crossbeam_utils::CachePadded as __CachePadded;
 
-/// Asymmetric barriers are only used on x86, as the critical path still emits a store-load barrier
-/// on ARM. Moreover, the `mprotect` fallback of process-wide memory barriers on Linux only works
-/// on x86.
+/// Platforms providing a process-wide memory barrier, possibly not supported at runtime, e.g.
+/// missing `membarrier` system call on old FreeBSD kernels, in which case barriers fall back to
+/// `fence(SeqCst)`.
 #[doc(hidden)]
 pub const __ASYMMETRIC_BARRIERS_SUPPORTED: bool = cfg!(all(
-    any(target_arch = "x86", target_arch = "x86_64"),
-    any(target_os = "linux", target_os = "windows")
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows",
+        target_vendor = "apple"
+    ),
+    // On ARM, only with RCpc (`ldapr`), as the acquire load of the critical path is otherwise
+    // already ordered after its release store (`ldar` on AArch64, `dmb` on 32-bit ARM), making
+    // process-wide memory barriers useless
+    not(target_arch = "arm"),
+    any(not(target_arch = "aarch64"), target_feature = "rcpc"),
 ));
 
 /// SeqCst loads are plain loads on x86, but not on other architectures (e.g. `ldar` on ARMv8,
@@ -745,35 +763,69 @@ pub const __ASYMMETRIC_BARRIERS_SUPPORTED: bool = cfg!(all(
 pub(crate) const SEQ_CST_LOAD_IS_FREE: bool =
     cfg!(any(target_arch = "x86", target_arch = "x86_64"));
 
-#[doc(hidden)]
-#[inline(always)]
-pub fn __light_barrier() {
-    if cfg!(all(feature = "membarrier", not(miri), not(loom))) && __ASYMMETRIC_BARRIERS_SUPPORTED {
-        core::sync::atomic::compiler_fence(SeqCst);
-    } else {
-        crate::loom::sync::atomic::fence(SeqCst);
+// Same platforms as `__ASYMMETRIC_BARRIERS_SUPPORTED`
+#[cfg(all(
+    feature = "membarrier",
+    not(miri),
+    not(loom),
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows",
+        target_vendor = "apple"
+    ),
+    not(target_arch = "arm"),
+    any(not(target_arch = "aarch64"), target_feature = "rcpc"),
+))]
+use crate::membarrier as barriers;
+
+/// `fence(SeqCst)` barriers, used without process-wide memory barriers.
+#[cfg(not(all(
+    feature = "membarrier",
+    not(miri),
+    not(loom),
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows",
+        target_vendor = "apple"
+    ),
+    not(target_arch = "arm"),
+    any(not(target_arch = "aarch64"), target_feature = "rcpc"),
+)))]
+mod barriers {
+    use crate::loom::sync::atomic::{fence, Ordering::SeqCst};
+
+    #[inline(always)]
+    pub(crate) fn init() {}
+    #[inline(always)]
+    pub(crate) fn light() {
+        fence(SeqCst);
+    }
+    #[inline(always)]
+    pub(crate) fn heavy() {
+        fence(SeqCst);
     }
 }
 
 #[doc(hidden)]
 #[inline(always)]
+pub fn __init_barriers() {
+    barriers::init();
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn __light_barrier() {
+    barriers::light();
+}
+
+#[doc(hidden)]
+#[inline(always)]
 pub fn __heavy_barrier() {
-    #[cfg(all(
-        feature = "membarrier",
-        not(miri),
-        not(loom),
-        any(target_arch = "x86", target_arch = "x86_64"),
-        any(target_os = "linux", target_os = "windows")
-    ))]
-    crate::membarrier::heavy();
-    #[cfg(not(all(
-        feature = "membarrier",
-        not(miri),
-        not(loom),
-        any(target_arch = "x86", target_arch = "x86_64"),
-        any(target_os = "linux", target_os = "windows")
-    )))]
-    crate::loom::sync::atomic::fence(SeqCst);
+    barriers::heavy();
 }
 
 /// Implements the domain's thread-local node storage, with `with_local` and `register_release`
@@ -903,6 +955,10 @@ macro_rules! __domain {
             const ASYMMETRIC_BARRIERS: bool =
                 $asymmetric_barriers && $crate::domain::__ASYMMETRIC_BARRIERS_SUPPORTED;
             #[inline(always)]
+            fn init_barriers() {
+                $crate::domain::__init_barriers();
+            }
+            #[inline(always)]
             fn light_barrier() {
                 $crate::domain::__light_barrier();
             }
@@ -934,12 +990,29 @@ macro_rules! __domain {
 /// program's threads. Operations are also no longer sequentially consistent, see
 /// [memory ordering](crate#memory-ordering).
 ///
-/// Process-wide memory barriers are only used on x86 Linux and Windows. On other platforms, the
-/// macro is equivalent to [`domain!`](crate::domain!).
-///
 /// The domain should not be used in combination with [`Cache`](crate::Cache), as its loads don't
 /// use any barrier as long as the `AtomicArc` is not updated, while writes still pay for the
 /// process-wide memory barrier.
+///
+/// # Compatibility
+///
+/// | Platform        | Process-wide memory barrier                               |
+/// |-----------------|-----------------------------------------------------------|
+/// | Linux, Android  | `membarrier` system call, with `mprotect` fallback on x86 |
+/// | FreeBSD         | `membarrier` system call (FreeBSD 14.1+)                  |
+/// | Windows         | `FlushProcessWriteBuffers`                                |
+/// | Apple platforms | `thread_get_register_pointer_values` on every thread      |
+///
+/// If the `membarrier` system call is not available, barriers fall back to `fence(SeqCst)`, except
+/// on x86 Linux/Android with the `mprotect` fallback. Selecting the fallback at runtime adds a
+/// `Relaxed` atomic check to the loads' critical path (except on x86 Linux/Android), unless
+/// compiled with `--cfg hazarc_assume_membarrier`, in which case writes panic if `membarrier` is
+/// not available.
+///
+/// On ARM, process-wide memory barriers are only used on AArch64 with `rcpc` target feature
+/// (enabled by default on macOS).
+///
+/// On other platforms, the macro is equivalent to [`domain!`](crate::domain!).
 ///
 /// # Examples
 ///
