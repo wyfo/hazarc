@@ -112,7 +112,7 @@ If there are concurrent writes on the same `AtomicArc`, they may execute `Atomic
 
 ## Safety
 
-This library uses unsafe code to deal with `AtomicPtr` manipulation and DST allocations. It is extensively tested with [`miri`](https://github.com/rust-lang/miri) to ensure its soundness, including over multiple weak memory model permutations.
+This library uses unsafe code to deal with `AtomicPtr` manipulation and DST allocations. It is extensively tested with [`loom`](https://github.com/tokio-rs/loom) and [`miri`](https://github.com/rust-lang/miri) to ensure its soundness, including over multiple weak memory model permutations.
 
 ## Differences with `arc-swap`
 

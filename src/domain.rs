@@ -100,6 +100,9 @@ pub unsafe trait Domain: Sized + Send + Sync + 'static {
     /// Whether `AtomicArc` uses [`light_barrier`](Self::light_barrier) in loads and
     /// [`heavy_barrier`](Self::heavy_barrier) in writes, instead of sequentially consistent
     /// operations.
+    ///
+    /// Operations are then no longer sequentially consistent, see
+    /// [memory ordering](crate#memory-ordering).
     const ASYMMETRIC_BARRIERS: bool = false;
     /// Barrier executed in the critical path of loads, e.g. a compiler fence.
     ///
@@ -928,7 +931,8 @@ macro_rules! __domain {
 /// Loads' critical path only executes compiler fences instead of memory barriers/atomic RMW
 /// operations, at the cost of a process-wide memory barrier in writes, e.g. a `membarrier` system
 /// call on Linux. It makes loads faster, but writes significantly costlier, impacting all the
-/// program's threads.
+/// program's threads. Operations are also no longer sequentially consistent, see
+/// [memory ordering](crate#memory-ordering).
 ///
 /// Process-wide memory barriers are only used on x86 Linux and Windows. On other platforms, the
 /// macro is equivalent to [`domain!`](crate::domain!).

@@ -147,11 +147,21 @@
 //! [access the thread-local node]: domain::DomainExt::get_or_acquire_thread_local_node
 //! [`ArcPtr`]: arc::ArcPtr
 //!
-//! # Safety
+//! # Memory ordering
 //!
-//! This library uses unsafe code to deal with `AtomicPtr` manipulation and DST allocations.
-//! It is extensively tested with [`miri`](https://github.com/rust-lang/miri) to ensure its
-//! soundness, including over multiple weak memory model permutations.
+//! Without [asymmetric barriers], all `AtomicArc` operations are [`SeqCst`].
+//!
+//! With asymmetric barriers, loads are [`Acquire`], preceded by a [light barrier], and swaps are
+//! [`AcqRel`], followed by a [heavy barrier]. The barriers make it possible to use `AtomicArc` in
+//! a Dekker algorithm. However, loads and swaps are not part of the `SeqCst` total order, so
+//! independent reads of independent writes (IRIW) may observe the writes in different orders.
+//!
+//! [asymmetric barriers]: domain::Domain::ASYMMETRIC_BARRIERS
+//! [light barrier]: domain::Domain::light_barrier
+//! [heavy barrier]: domain::Domain::heavy_barrier
+//! [`SeqCst`]: core::sync::atomic::Ordering::SeqCst
+//! [`Acquire`]: core::sync::atomic::Ordering::Acquire
+//! [`AcqRel`]: core::sync::atomic::Ordering::AcqRel
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 #![no_std]
