@@ -8,7 +8,7 @@ use core::{fmt, marker::PhantomData, mem, mem::ManuallyDrop, ops::Deref};
 use crate::msrv::{OptionExt, StrictProvenance};
 use crate::{
     arc::{ArcPtr, ArcPtrExt, ArcRef, DropVTable, NonNullArcPtr},
-    domain::{Domain, DomainExt, DomainNodeRef, SlotRef},
+    domain::{Domain, DomainExt, DomainNodeRef, SlotRef, SEQ_CST_LOAD_IS_FREE},
     loom::{
         sync::atomic::{
             fence, AtomicPtr, Ordering,
@@ -121,6 +121,11 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     } else {
         Relaxed
     };
+
+    /// With asymmetric barriers, or without [`SEQ_CST_LOAD_IS_FREE`], the writer's scan starts
+    /// with a store-load barrier (the heavy barrier or a SeqCst fence), so its slot loads can be
+    /// relaxed.
+    const RELAXED_SCAN: bool = D::ASYMMETRIC_BARRIERS || !SEQ_CST_LOAD_IS_FREE;
 
     #[inline(always)]
     fn load_with_slot(
@@ -305,6 +310,10 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
         if D::ASYMMETRIC_BARRIERS {
             _guard = Some(D::static_list().active_writer_guard());
             D::heavy_barrier();
+        } else if !SEQ_CST_LOAD_IS_FREE {
+            // The SeqCst fence allows relaxing the slot loads while preserving the Dekker
+            // algorithm of slot reservation.
+            fence(SeqCst);
         }
         // Leaked if the scan panics, as some borrows may not have been upgraded yet
         let old_arc = ManuallyDrop::new(unsafe { A::from_ptr(old_ptr) });
@@ -313,14 +322,7 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
             #[cfg(any(not(target_pointer_width = "64"), hazarc_test_generation_wrap))]
             let _guard = W::CONCURRENT.then(|| node.writer_guard());
             for slot in node.borrow_slots() {
-                // With asymmetric barriers, the heavy barrier ensures the store-load ordering
-                // with loads, and the acquire fences replace the acquire semantic.
-                let ordering = if D::ASYMMETRIC_BARRIERS {
-                    Relaxed
-                } else {
-                    SeqCst
-                };
-                let mut slot_ptr = slot.load(ordering);
+                let mut slot_ptr = slot.load(if Self::RELAXED_SCAN { Relaxed } else { SeqCst });
                 if slot_ptr.is_null() {
                     continue;
                 }
@@ -358,9 +360,8 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
                 }
             }
         }
-        // Acquire fence, so borrow releases observed by relaxed slot loads (with asymmetric
-        // barriers) or by compare-exchange failures happen before the old arc is returned (and
-        // possibly dropped).
+        // Acquire fence, so borrow releases observed by relaxed slot loads (`RELAXED_SCAN`) or by
+        // compare-exchange failures happen before the old arc is returned (and possibly dropped).
         fence(Acquire);
         ManuallyDrop::into_inner(old_arc)
     }
@@ -373,9 +374,10 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     ) -> bool {
         let self_ptr = ptr::from_ref(&self.ptr).cast_mut().cast();
         if W::CONCURRENT {
-            // With asymmetric barriers, the `LOADING` slot is loaded relaxed; acquire fence, so
-            // `atomic_arc_slot` stored before the `LOADING` value (release) is observed.
-            if D::ASYMMETRIC_BARRIERS {
+            // With `RELAXED_SCAN`, the `LOADING` slot is loaded relaxed; acquire fence, so
+            // `atomic_arc_slot` stored before the `LOADING` value (release) is observed, as well
+            // as the loads of `self.ptr` preceding it (for the monotonicity of the helping value).
+            if Self::RELAXED_SCAN {
                 fence(Acquire);
             }
             // Acquire load synchronizes with the release store in `load_slow`,
@@ -387,14 +389,9 @@ impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
             let prev_slot_ptr = *slot_ptr;
             // The slot is always reloaded, as a pending load may have completed by a borrow
             // of the swapped out arc.
-            // Not part of the store-load ordering with loads, only acquire to synchronize with
-            // a borrow release, which the final acquire fence does with asymmetric barriers.
-            let ordering = if D::ASYMMETRIC_BARRIERS {
-                Relaxed
-            } else {
-                Acquire
-            };
-            *slot_ptr = slot.load(ordering);
+            // Not part of the store-load ordering with loads, only Acquire to synchronize with
+            // a borrow release, which the final Acquire fence does with `RELAXED_SCAN`.
+            *slot_ptr = slot.load(if Self::RELAXED_SCAN { Relaxed } else { Acquire });
             same_atomic_arc && *slot_ptr == prev_slot_ptr
         } else {
             *slot_ptr == self_ptr.with_tag(LOADING)
@@ -667,7 +664,7 @@ impl<A: ArcPtr, D: Domain> Drop for ArcPtrBorrow<A, D> {
                 }
             } else {
                 // Release, so the use of the Arc happens before its release, as slots are loaded
-                // with SeqCst (Acquire) in `swap_impl`.
+                // with SeqCst in `swap_impl`, or Relaxed followed by an acquire fence.
                 slot.swap(NULL, Release)
             };
             if slot_ptr == ptr {

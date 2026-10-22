@@ -231,9 +231,10 @@ impl<D: Domain> DomainList<D> {
             if node.is_none() {
                 let new_node =
                     (allocated_node.0).get_or_insert_with(|| DomainNodeRef::<D>::allocate());
-                // SeqCst, so a writer traversing the list cannot miss a node, before a borrow
-                // stored in it, while the load of the borrow misses the writer's pointer swap;
-                // with asymmetric barriers, the light and heavy barriers ensure it.
+                // SeqCst, so a writer traversing the list (with SeqCst loads, or after a SeqCst
+                // fence) cannot miss a node, before a borrow stored in it, while the load of the
+                // borrow misses the writer's pointer swap; with asymmetric barriers, the light and
+                // heavy barriers ensure it.
                 let success = if D::ASYMMETRIC_BARRIERS {
                     Release
                 } else {
@@ -553,8 +554,10 @@ impl<D: Domain> DomainNodeRef<D> {
     }
 
     fn next(self) -> Option<DomainNodeRef<D>> {
-        // SeqCst, see `DomainList::nodes_or_allocate`
-        let ordering = if D::ASYMMETRIC_BARRIERS {
+        // SeqCst, see `DomainList::nodes_or_allocate`; with asymmetric barriers or without
+        // `SEQ_CST_LOAD_IS_FREE`, the heavy barrier or the SeqCst fence executed before the
+        // writer's scan ensures it.
+        let ordering = if D::ASYMMETRIC_BARRIERS || !SEQ_CST_LOAD_IS_FREE {
             Acquire
         } else {
             SeqCst
@@ -733,6 +736,11 @@ pub const __ASYMMETRIC_BARRIERS_SUPPORTED: bool = cfg!(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     any(target_os = "linux", target_os = "windows")
 ));
+
+/// SeqCst loads are plain loads on x86, but not on other architectures (e.g. `ldar` on ARMv8,
+/// `hwsync` on POWER).
+pub(crate) const SEQ_CST_LOAD_IS_FREE: bool =
+    cfg!(any(target_arch = "x86", target_arch = "x86_64"));
 
 #[doc(hidden)]
 #[inline(always)]
@@ -1052,9 +1060,9 @@ fn abort_before_overflow(n: usize, msg: &str) {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
-    use crate::domain::{Domain, DomainExt, ListAccessGuard};
-    #[allow(unused_imports)]
-    use crate::msrv::StrictProvenance;
+    use crate::domain::{Domain, ListAccessGuard};
+    #[cfg(feature = "domain-gc")]
+    use crate::{loom::sync::atomic::Ordering::Relaxed, msrv::ptr, NULL};
 
     #[test]
     fn node_reuse() {
@@ -1062,17 +1070,16 @@ mod tests {
         pthread_domain!(TestDomain(2));
         #[cfg(not(all(feature = "pthread-domain", unix)))]
         domain!(TestDomain(2));
-        let node_addr = || (TestDomain::get_or_acquire_thread_local_node().into_raw()).addr();
-        std::thread::scope(|s| {
-            let _guard = ListAccessGuard::new(TestDomain::static_list()); // prevent gc
-            let node1 = s.spawn(node_addr).join().unwrap();
-            let thread2 = s.spawn(node_addr);
-            let thread3 = s.spawn(node_addr);
-            let node2 = thread2.join().unwrap();
-            let node3 = thread3.join().unwrap();
-            assert!(node1 == node2 || node1 == node3);
-        });
-        TestDomain::get_or_acquire_thread_local_node();
+        let list = TestDomain::static_list();
+        let _guard = ListAccessGuard::new(list); // prevent gc
+        let node1 = list.acquire_node();
+        unsafe { list.release_node(node1) };
+        let node2 = list.acquire_node();
+        let node3 = list.acquire_node();
+        assert_eq!(node2.into_raw(), node1.into_raw());
+        assert_ne!(node3.into_raw(), node1.into_raw());
+        unsafe { list.release_node(node2) };
+        unsafe { list.release_node(node3) };
     }
 
     #[test]
@@ -1081,15 +1088,13 @@ mod tests {
         pthread_domain!(TestDomain(2));
         #[cfg(not(all(feature = "pthread-domain", unix)))]
         domain!(TestDomain(2));
-        std::thread::scope(|s| {
-            let _guard = ListAccessGuard::new(TestDomain::static_list()); // prevent gc
-            let thread = s.spawn(|| {
-                TestDomain::get_or_acquire_thread_local_node();
-            });
-            TestDomain::static_list().reserve(4);
-            thread.join().unwrap();
-            assert_eq!(TestDomain::static_list().nodes().count(), 4);
-        });
+        let list = TestDomain::static_list();
+        let _guard = ListAccessGuard::new(list); // prevent gc
+        let node = list.acquire_node();
+        // The acquired node is counted in the reserved ones
+        list.reserve(4);
+        assert_eq!(list.nodes().count(), 4);
+        unsafe { list.release_node(node) };
     }
 
     #[test]
@@ -1098,26 +1103,37 @@ mod tests {
         pthread_domain!(TestDomain(2));
         #[cfg(not(all(feature = "pthread-domain", unix)))]
         domain!(TestDomain(2));
-        let barrier = std::sync::Barrier::new(2);
-        let guard = ListAccessGuard::new(TestDomain::static_list()); // prevent gc
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                TestDomain::get_or_acquire_thread_local_node();
-                barrier.wait();
-                // It seems TLS can be destroyed after the thread has been joined...
-                TestDomain::release_thread_local_node();
-            });
-            s.spawn(|| {
-                TestDomain::get_or_acquire_thread_local_node();
-                barrier.wait();
-                TestDomain::release_thread_local_node();
-            });
-        });
-        assert_eq!(TestDomain::static_list().nodes().count(), 2);
+        let list = TestDomain::static_list();
+        let guard = ListAccessGuard::new(list); // prevent gc
+        let node = list.acquire_node();
+        unsafe { list.release_node(node) };
+        assert_eq!(list.nodes().count(), 1);
         drop(guard);
-        #[cfg(feature = "domain-gc")]
-        assert_eq!(TestDomain::static_list().nodes().count(), 0);
-        unsafe { TestDomain::static_list().deallocate() };
-        assert_eq!(TestDomain::static_list().nodes().count(), 0);
+        #[cfg(not(feature = "domain-gc"))]
+        unsafe {
+            list.deallocate();
+        }
+        assert_eq!(list.nodes().count(), 0);
+    }
+
+    /// A released node with a borrow must not be deallocated by the GC.
+    #[cfg(feature = "domain-gc")]
+    #[test]
+    fn no_deallocation_with_borrow() {
+        #[cfg(all(feature = "pthread-domain", unix))]
+        pthread_domain!(TestDomain(1));
+        #[cfg(not(all(feature = "pthread-domain", unix)))]
+        domain!(TestDomain(1));
+        let list = TestDomain::static_list();
+        let node = list.acquire_node();
+        let slot = node.borrow_slots().next().unwrap();
+        slot.store(ptr::without_provenance_mut(4), Relaxed);
+        // The release triggers the GC
+        unsafe { list.release_node(node) };
+        // The count triggers the GC again when its list access guard is dropped
+        assert_eq!(list.nodes().count(), 1);
+        slot.store(NULL, Relaxed);
+        unsafe { list.release_node(list.acquire_node()) };
+        assert_eq!(list.nodes().count(), 0);
     }
 }
