@@ -233,6 +233,47 @@ fn reuse_slot_dropped_in_another_thread<D: Domain, W: WritePolicy>(
     });
 }
 
+#[cfg(not(loom))] // loom doesn't support the spin loops used to force the interleaving
+#[rstest]
+fn reused_slot_borrow_happens_before_drop<D: Domain, W: WritePolicy>(
+    #[values(d!(1), dm!(1))] _domain: D,
+    #[values(Concurrent, Serialized)] _policy: W,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+    let atomic_arc = AtomicArc::<WriteOnDrop, D, W>::new(Arc::new(WriteOnDrop::new()));
+    let other = AtomicArc::<usize, D, W>::new(Arc::new(0));
+    let borrow = atomic_arc.load();
+    // The node is reused by the next loading thread
+    D::release_thread_local_node();
+    // Relaxed flags, so the threads are ordered without being synchronized
+    let wait = |flag: &AtomicBool| {
+        while !flag.load(Relaxed) {
+            thread::yield_now();
+        }
+    };
+    let (dropped, reused) = (AtomicBool::new(false), AtomicBool::new(false));
+    thread::scope(|s| {
+        s.spawn(|| {
+            assert_eq!(borrow.read(), 0);
+            drop(borrow);
+            dropped.store(true, Relaxed);
+        });
+        s.spawn(|| {
+            wait(&dropped);
+            // Reuses the slot of the dropped borrow
+            drop(other.load());
+            reused.store(true, Relaxed);
+        });
+        s.spawn(|| {
+            wait(&reused);
+            // store must be done in a separate thread, otherwise its fence(Acquire) would
+            // synchronize with the borrow release loaded with Relaxed.
+            atomic_arc.store(Arc::new(WriteOnDrop::new()));
+        });
+    });
+}
+
 /// With `domain-gc`, the borrow's node may be deallocated right after its slot is reset, while the
 /// guard drop still holds a reference to the slot.
 #[rstest]
