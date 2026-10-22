@@ -122,7 +122,19 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        features: ["", --features=domain-gc]
+        # Seeds are useless without threads, so only threaded tests are run
+        config:
+          - name: default
+            args: "-- $(python3 .github/scripts/threaded_tests.py)"
+          - name: domain-gc
+            args: "--features=domain-gc -- gc_concurrent_write:: drop_atomic_arc_concurrent_borrow_drop::"
+          # Non-x86 code path without asymmetric barriers, i.e. the SeqCst fence of the writer's
+          # scan, so `dm!` domains are skipped
+          - name: aarch64
+            args: >-
+              --target aarch64-unknown-linux-gnu --
+              concurrent_reads:: borrow_happens_before_drop:: monotonic_loads:: seq_cst_ordering::
+              --skip _dm_
         seeds: ${{ fromJson(needs.compute-miri-seeds.outputs.seeds) }}
     steps:
       - uses: actions/checkout@v6
@@ -130,11 +142,27 @@ jobs:
         run: rustup install nightly && rustup +nightly component add miri
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.features }}
+          key: miri-${{ matrix.config.name }}
       - name: miri
-        run: cargo +nightly miri test --tests ${{ matrix.features }}
+        run: cargo +nightly miri test --test hazarc ${{ matrix.config.args }}
         env:
           MIRIFLAGS: -Zmiri-many-seeds=${{ matrix.seeds }}
+
+  miri-no-seed:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        args: ["", --features=domain-gc, --target aarch64-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@v6
+      - name: install miri
+        run: rustup install nightly && rustup +nightly component add miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-no-seed-${{ matrix.args }}
+      - name: miri
+        run: cargo +nightly miri test --tests ${{ matrix.args }}
 
   benchmark:
     needs: test
