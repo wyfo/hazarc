@@ -14,7 +14,7 @@ rust-version = "1.65"
 default = ["default-domain"]
 default-domain = []
 domain-gc = []
-membarrier = ["dep:libc", "dep:windows-sys"]
+membarrier = ["dep:libc", "dep:mach2", "dep:windows-sys"]
 portable-atomic = ["dep:portable-atomic"]
 portable-atomic-util = ["dep:portable-atomic-util"]
 pthread-domain = ["dep:libc"]
@@ -30,6 +30,9 @@ triomphe = { version = "0.1", optional = true, default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+mach2 = { version = "0.6", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"], optional = true }
@@ -53,7 +56,7 @@ required-features = ["default-domain"]
 
 [lints.rust]
 missing_debug_implementations = "forbid"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hazarc_test_generation_wrap)', 'cfg(loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hazarc_assume_membarrier)', 'cfg(hazarc_test_generation_wrap)', 'cfg(loom)'] }
 unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
