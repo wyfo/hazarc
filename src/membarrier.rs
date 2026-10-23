@@ -2,68 +2,174 @@
 //! on `windows-sys`.
 //!
 //! `membarrier2` crate has not been used instead, as it has an unconditional dependency on `ctor`.
-//! Its support check, executed at load time, is replaced by [`init`], called in `AtomicArc`
-//! constructors.
+//! Its support check, executed at load time, is replaced by `AsymmetricBarriers::init`, called in
+//! `AtomicArc` constructors.
 
-use core::sync::atomic::{compiler_fence, Ordering::SeqCst};
+/// Process-wide memory barriers, with compiler fences as light barriers.
+///
+/// Loads' critical path only executes compiler fences instead of memory barriers/atomic RMW
+/// operations, at the cost of a process-wide memory barrier in writes, e.g. a `membarrier` system
+/// call on Linux. It makes loads faster, but writes significantly costlier, impacting all the
+/// program's threads. Operations are also no longer sequentially consistent, see
+/// [memory ordering](crate#memory-ordering).
+///
+/// It should not be used in combination with [`Cache`](crate::Cache), as its loads don't use any
+/// barrier as long as the `AtomicArc` is not updated, while writes still pay for the
+/// process-wide memory barrier.
+///
+/// # Compatibility
+///
+/// | Platform        | Process-wide memory barrier                               |
+/// |-----------------|-----------------------------------------------------------|
+/// | Linux, Android  | `membarrier` system call, with `mprotect` fallback on x86 |
+/// | FreeBSD         | `membarrier` system call (FreeBSD 14.1+)                  |
+/// | Windows         | `FlushProcessWriteBuffers`                                |
+/// | Apple platforms | `thread_get_register_pointer_values` on every thread      |
+///
+/// If the `membarrier` system call is not available, barriers fall back to `fence(SeqCst)`, except
+/// on x86 Linux/Android with the `mprotect` fallback. Selecting the fallback at runtime adds a
+/// `Relaxed` atomic check to the loads' critical path (except on x86 Linux/Android), unless
+/// compiled with `--cfg hazarc_assume_membarrier`, in which case writes panic if `membarrier` is
+/// not available.
+///
+/// On ARM, process-wide memory barriers are only used on AArch64 with `rcpc` target feature
+/// (enabled by default on macOS/iOS).
+///
+/// On other platforms, `AtomicArc` operations are sequentially consistent, like with
+/// [`Sequential`](crate::domain::Sequential).
+///
+/// # Examples
+///
+/// ```rust
+/// hazarc::domain!(pub(crate) MyDomain(synchronization = hazarc::domain::Membarrier));
+/// ```
+#[derive(Debug)]
+pub struct Membarrier;
 
-/// Initializes the process-wide memory barrier if needed. Before this call, light barrier may
-/// default to `fence(SeqCst)` if support is not assumed.
-#[inline]
-pub(crate) fn init() {
-    #[cfg(all(
-        any(
-            all(
-                any(target_os = "linux", target_os = "android"),
-                not(any(target_arch = "x86", target_arch = "x86_64"))
+// SAFETY: a process-wide memory barrier synchronizes with compiler fences; with miri/loom, both
+// barriers are `fence(SeqCst)`
+// Platforms providing a process-wide memory barrier, possibly not supported at runtime, e.g.
+// missing `membarrier` system call on old FreeBSD kernels, in which case barriers fall back to
+// `fence(SeqCst)`.
+// On ARM, only with RCpc (`ldapr`), as the acquire load of the critical path is otherwise already
+// ordered after its release store (`ldar` on AArch64, `dmb` on 32-bit ARM), making process-wide
+// memory barriers useless.
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows",
+        target_vendor = "apple"
+    ),
+    not(target_arch = "arm"),
+    any(not(target_arch = "aarch64"), target_feature = "rcpc"),
+))]
+unsafe impl crate::domain::AsymmetricBarriers for Membarrier {
+    /// Initializes the process-wide memory barrier if needed. Before this call, light barrier may
+    /// default to `fence(SeqCst)` if support is not assumed.
+    #[cfg(not(any(miri, loom)))]
+    #[inline]
+    fn init() {
+        #[cfg(all(
+            any(
+                all(
+                    any(target_os = "linux", target_os = "android"),
+                    not(any(target_arch = "x86", target_arch = "x86_64"))
+                ),
+                target_os = "freebsd"
             ),
-            target_os = "freebsd"
-        ),
-        not(hazarc_assume_membarrier)
-    ))]
-    unix::strategy();
-}
+            not(hazarc_assume_membarrier)
+        ))]
+        unix::strategy();
+    }
 
-#[inline(always)]
-pub(crate) fn light() {
-    // Without `membarrier` system call, the barrier falls back to `fence(SeqCst)`, unless there is
-    // the `mprotect` fallback (only on x86).
-    // Relaxed, as the flag is set before any `AtomicArc` is constructed, except with const
-    // constructors. Reading a stale `false` only executes a superfluous fence, while `true` can
-    // only be read after the initialization, so `heavy` uses the `membarrier` system call.
-    // With `hazarc_assume_membarrier` cfg, the check is bypassed, and `heavy` panics instead of
-    // falling back.
-    #[cfg(all(
-        any(
-            all(
-                any(target_os = "linux", target_os = "android"),
-                not(any(target_arch = "x86", target_arch = "x86_64"))
+    #[cfg(not(any(miri, loom)))]
+    #[inline(always)]
+    fn light_barrier() {
+        // Without `membarrier` system call, the barrier falls back to `fence(SeqCst)`, unless there
+        // is the `mprotect` fallback (only on x86).
+        // Relaxed, as the flag is set before any `AtomicArc` is constructed, except with const
+        // constructors. Reading a stale `false` only executes a superfluous fence, while `true` can
+        // only be read after the initialization, so `heavy_barrier` uses the `membarrier` system
+        // call.
+        // With `hazarc_assume_membarrier` cfg, the check is bypassed, and `heavy_barrier` panics
+        // instead of falling back.
+        #[cfg(all(
+            any(
+                all(
+                    any(target_os = "linux", target_os = "android"),
+                    not(any(target_arch = "x86", target_arch = "x86_64"))
+                ),
+                target_os = "freebsd"
             ),
-            target_os = "freebsd"
-        ),
-        not(hazarc_assume_membarrier)
-    ))]
-    if !unix::MEMBARRIER_SUPPORTED.load(core::sync::atomic::Ordering::Relaxed) {
-        crate::msrv::hint::cold_path();
-        core::sync::atomic::fence(SeqCst);
-        return;
+            not(hazarc_assume_membarrier)
+        ))]
+        if !unix::MEMBARRIER_SUPPORTED.load(core::sync::atomic::Ordering::Relaxed) {
+            crate::msrv::hint::cold_path();
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
-    compiler_fence(SeqCst);
+
+    #[cfg(any(miri, loom))]
+    #[inline(always)]
+    fn light_barrier() {
+        crate::loom::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(not(any(miri, loom)))]
+    #[inline]
+    fn heavy_barrier() {
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+        unix::heavy();
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Threading::FlushProcessWriteBuffers();
+        }
+        #[cfg(target_vendor = "apple")]
+        apple::heavy();
+    }
+
+    #[cfg(any(miri, loom))]
+    #[inline(always)]
+    fn heavy_barrier() {
+        crate::loom::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    }
 }
 
-#[inline]
-pub(crate) fn heavy() {
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
-    unix::heavy();
-    #[cfg(windows)]
-    unsafe {
-        windows_sys::Win32::System::Threading::FlushProcessWriteBuffers();
+// On unsupported platforms, `Membarrier` is equivalent to `Sequential`.
+#[cfg(not(all(
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows",
+        target_vendor = "apple"
+    ),
+    not(target_arch = "arm"),
+    any(not(target_arch = "aarch64"), target_feature = "rcpc"),
+)))]
+impl crate::domain::private::Synchronization for Membarrier {
+    const ASYMMETRIC_BARRIERS: bool = false;
+    fn init_barriers() {
+        unreachable!("no barriers")
     }
-    #[cfg(target_vendor = "apple")]
-    apple::heavy();
+    fn light_barrier() {
+        unreachable!("no barriers")
+    }
+    fn heavy_barrier() {
+        unreachable!("no barriers")
+    }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android", target_os = "freebsd"),
+    not(target_arch = "arm"),
+    any(not(target_arch = "aarch64"), target_feature = "rcpc"),
+    not(any(miri, loom)),
+))]
 mod unix {
     use std::{
         io,
@@ -73,7 +179,7 @@ mod unix {
         },
     };
 
-    /// Set if the `membarrier` system call is supported, see [`super::light`].
+    /// Set if the `membarrier` system call is supported, see `Membarrier::light_barrier`.
     #[cfg(not(any(
         all(
             any(target_os = "linux", target_os = "android"),
@@ -92,7 +198,7 @@ mod unix {
             any(target_arch = "x86", target_arch = "x86_64")
         ))]
         Mprotect(std::sync::Mutex<mprotect::Page>),
-        /// `fence(SeqCst)` fallback, paired with the one of [`super::light`].
+        /// `fence(SeqCst)` fallback, paired with the one of `Membarrier::light_barrier`.
         Fence,
     }
 
@@ -271,7 +377,12 @@ mod unix {
 
 /// Taken from `membarrier2`, itself taken from .NET runtime:
 /// <https://github.com/dotnet/runtime/blob/c290dc12ccd792d6cb431f47efc46df8cb9a7747/src/native/minipal/memorybarrierprocesswide.c#L157>
-#[cfg(target_vendor = "apple")]
+#[cfg(all(
+    target_vendor = "apple",
+    not(target_arch = "arm"),
+    any(not(target_arch = "aarch64"), target_feature = "rcpc"),
+    not(any(miri, loom)),
+))]
 mod apple {
     use std::{ffi::CStr, mem::MaybeUninit};
 

@@ -1,5 +1,7 @@
 use std::{mem::ManuallyDrop, ptr};
 
+#[cfg(all(feature = "membarrier", not(miri), not(loom)))]
+use hazarc::domain::Membarrier as TestBarriers;
 use hazarc::{
     arc::ArcPtr,
     atomic::{ArcPtrBorrow, AtomicArcPtr, AtomicOptionArcPtr},
@@ -18,16 +20,32 @@ type AtomicOptionArc<T, D, W> = AtomicOptionArcPtr<Arc<T>, D, W>;
 /// Creates isolated domains per tests
 macro_rules! d {
     ($slots:literal) => {{
-        hazarc::domain!(TestDomain($slots));
+        hazarc::domain!(TestDomain(slots = $slots));
         TestDomain
     }};
 }
 
-/// Creates isolated domains per tests, using asymmetric barriers (`membarrier` if the feature is
-/// enabled, `fence(SeqCst)` otherwise).
+#[cfg(not(all(feature = "membarrier", not(miri), not(loom))))]
+struct TestBarriers;
+
+// SAFETY: two `fence(SeqCst)` synchronize
+#[cfg(not(all(feature = "membarrier", not(miri), not(loom))))]
+unsafe impl hazarc::domain::AsymmetricBarriers for TestBarriers {
+    fn light_barrier() {
+        crate::loom::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+    fn heavy_barrier() {
+        crate::loom::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Creates isolated domains per tests, using asymmetric barriers ([`TestBarriers`]).
 macro_rules! dm {
     ($slots:literal) => {{
-        hazarc::__domain!(TestDomain($slots, true));
+        hazarc::domain!(TestDomain(
+            slots = $slots,
+            synchronization = crate::TestBarriers
+        ));
         TestDomain
     }};
 }
@@ -474,6 +492,7 @@ macro_rules! panicking_domain {
         }
         unsafe impl Domain for PanickingDomain {
             const BORROW_SLOT_COUNT: usize = 1;
+            type Synchronization = hazarc::domain::Sequential;
             fn static_list() -> &'static DomainList<Self> {
                 static CALLS: AtomicUsize = AtomicUsize::new(0);
                 static LIST: DomainList<PanickingDomain> = DomainList::new();
