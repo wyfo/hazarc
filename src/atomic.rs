@@ -66,6 +66,12 @@ pub struct AtomicArcPtr<A: ArcPtr, D: Domain, W: WritePolicy> {
     _write_policy: PhantomData<W>,
 }
 
+// SAFETY: writers transfer Arcs to readers of other threads (helping, borrow upgrade), so the
+// Arc must be both `Send` and `Sync`, as for std `Arc`.
+unsafe impl<A: ArcPtr + Send + Sync, D: Domain, W: WritePolicy> Send for AtomicArcPtr<A, D, W> {}
+// SAFETY: see above
+unsafe impl<A: ArcPtr + Send + Sync, D: Domain, W: WritePolicy> Sync for AtomicArcPtr<A, D, W> {}
+
 impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<A, D, W> {
     /// Constructs a new Arc atomic storage.
     #[inline]
