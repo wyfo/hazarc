@@ -20,7 +20,7 @@
 //!
 //! ```rust
 //! # use hazarc::AtomicArc;
-//! hazarc::domain!(MyDomain(2)); // 2 borrow slots.
+//! hazarc::domain!(MyDomain(slots = 2));
 //!
 //! type MyAtomicArc<T> = AtomicArc<T, MyDomain>;
 //! ```
@@ -59,6 +59,9 @@ use crate::{
     NULL,
 };
 
+/// Default number of borrow slots of [`domain!`](crate::domain!) and `pthread_domain!` macros.
+pub const DEFAULT_BORROW_SLOT_COUNT: usize = 32;
+
 #[cfg(feature = "domain-gc")]
 const GC_FLAG: usize = 1;
 const IN_USE: usize = 1;
@@ -91,41 +94,12 @@ macro_rules! node_field_getter {
 /// - [`static_list`](Self::static_list) must return a single static list.
 /// - [`get_thread_local_node`](Self::get_thread_local_node) must return the node set with
 ///   [`set_thread_local_node`](Self::set_thread_local_node).
-/// - If [`ASYMMETRIC_BARRIERS`](Self::ASYMMETRIC_BARRIERS) is true, a
-///   [`light_barrier`](Self::light_barrier) and a [`heavy_barrier`](Self::heavy_barrier) must
-///   synchronize like two `fence(SeqCst)`.
 pub unsafe trait Domain: Sized + Send + Sync + 'static {
     /// Number of borrow slots of a thread-local node.
     const BORROW_SLOT_COUNT: usize;
-    /// Whether `AtomicArc` uses [`light_barrier`](Self::light_barrier) in loads and
-    /// [`heavy_barrier`](Self::heavy_barrier) in writes, instead of sequentially consistent
-    /// operations.
-    ///
-    /// Operations are then no longer sequentially consistent, see
-    /// [memory ordering](crate#memory-ordering).
-    const ASYMMETRIC_BARRIERS: bool = false;
-    /// Initializes the barriers, executed by `AtomicArc` non-const constructors, e.g. to check if
-    /// a process-wide memory barrier is supported.
-    ///
-    /// As const constructors don't execute it, barriers must not rely on it for their soundness.
-    ///
-    /// Only used if [`ASYMMETRIC_BARRIERS`](Self::ASYMMETRIC_BARRIERS) is true.
-    #[inline(always)]
-    fn init_barriers() {}
-    /// Barrier executed in the critical path of loads, e.g. a compiler fence.
-    ///
-    /// Only used if [`ASYMMETRIC_BARRIERS`](Self::ASYMMETRIC_BARRIERS) is true.
-    #[inline(always)]
-    fn light_barrier() {
-        unimplemented!("asymmetric barriers are not used")
-    }
-    /// Barrier executed in writes, e.g. a process-wide memory barrier like Linux `membarrier`.
-    ///
-    /// Only used if [`ASYMMETRIC_BARRIERS`](Self::ASYMMETRIC_BARRIERS) is true.
-    #[inline(always)]
-    fn heavy_barrier() {
-        unimplemented!("asymmetric barriers are not used")
-    }
+    /// Synchronization of `AtomicArc` operations: [`Sequential`] for sequentially consistent
+    /// operations, or an [`AsymmetricBarriers`] implementation.
+    type Synchronization: private::Synchronization;
     /// Returns the domain's static list.
     fn static_list() -> &'static DomainList<Self>;
     /// Returns the domain's thread-local node.
@@ -162,6 +136,89 @@ pub trait DomainExt: Domain {
 }
 
 impl<D: Domain> DomainExt for D {}
+
+pub(crate) trait PrivateDomainExt: Domain {
+    const ASYMMETRIC_BARRIERS: bool =
+        <Self::Synchronization as private::Synchronization>::ASYMMETRIC_BARRIERS;
+    #[inline(always)]
+    fn init_barriers() {
+        <Self::Synchronization as private::Synchronization>::init_barriers();
+    }
+    #[inline(always)]
+    fn light_barrier() {
+        <Self::Synchronization as private::Synchronization>::light_barrier();
+    }
+    #[inline(always)]
+    fn heavy_barrier() {
+        <Self::Synchronization as private::Synchronization>::heavy_barrier();
+    }
+}
+
+impl<D: Domain> PrivateDomainExt for D {}
+
+/// All [`AtomicArc`](crate::AtomicArc) operations are `SeqCst`.
+#[derive(Debug)]
+pub struct Sequential;
+
+/// Asymmetric memory barriers, used by `AtomicArc` instead of sequentially consistent operations.
+///
+/// # Safety
+///
+/// A light barrier and a heavy barrier must synchronize like two `fence(SeqCst)`.
+pub unsafe trait AsymmetricBarriers: 'static {
+    /// Initializes the barriers' implementation. This helper should eventually be called, but
+    /// `light_barrier` must not rely on it. Instead, the initialization should also be done in
+    /// `heavy_barrier`, with `light_barrier` falling back to `fence(SeqCst)` in the meantime.
+    #[inline(always)]
+    fn init() {}
+    /// Barrier executed in the critical path of loads, e.g. a compiler fence.
+    fn light_barrier();
+    /// Barrier executed in writes, e.g. a process-wide memory barrier like Linux `membarrier`.
+    fn heavy_barrier();
+}
+
+#[cfg(feature = "membarrier")]
+pub use crate::membarrier::Membarrier;
+
+pub(crate) mod private {
+    use crate::domain::{AsymmetricBarriers, Sequential};
+
+    pub trait Synchronization: 'static {
+        const ASYMMETRIC_BARRIERS: bool;
+        fn init_barriers();
+        fn light_barrier();
+        fn heavy_barrier();
+    }
+
+    impl Synchronization for Sequential {
+        const ASYMMETRIC_BARRIERS: bool = false;
+        fn init_barriers() {
+            unreachable!("no barriers")
+        }
+        fn light_barrier() {
+            unreachable!("no barriers")
+        }
+        fn heavy_barrier() {
+            unreachable!("no barriers")
+        }
+    }
+
+    impl<B: AsymmetricBarriers> Synchronization for B {
+        const ASYMMETRIC_BARRIERS: bool = true;
+        #[inline(always)]
+        fn init_barriers() {
+            B::init();
+        }
+        #[inline(always)]
+        fn light_barrier() {
+            B::light_barrier();
+        }
+        #[inline(always)]
+        fn heavy_barrier() {
+            B::heavy_barrier();
+        }
+    }
+}
 
 /// The domain's list.
 ///
@@ -720,113 +777,54 @@ impl<D> Drop for WriterGuard<D> {
 }
 
 /// Declares a domain using standard thread-local storage.
-#[cfg_attr(
-    feature = "membarrier",
-    doc = "\nSee also [`membarrier_domain!`](crate::membarrier_domain!).\n"
-)]
+///
+/// # Parameters
+///
+/// Optional parameters, in this order:
+/// - `slots`: the number of borrow slots, see [`Domain::BORROW_SLOT_COUNT`]; defaults to
+///   [`DEFAULT_BORROW_SLOT_COUNT`].
+/// - `synchronization`: see [`Domain::Synchronization`]; defaults to [`Sequential`].
+///
 /// # Examples
 ///
 /// ```rust
-/// hazarc::domain!(pub(crate) MyDomain(2)); // 2 borrow slots
+/// hazarc::domain!(pub(crate) MyDomain);
+/// hazarc::domain!(pub(crate) MyDomain2(slots = 2));
+/// hazarc::domain!(pub(crate) MyDomain3(slots = 2, synchronization = hazarc::domain::Sequential));
 /// ```
 #[macro_export]
 macro_rules! domain {
-    ($(#[$attrs:meta])* $vis:vis $name:ident($borrow_slot_count:expr)) => {
-        $crate::__domain!($(#[$attrs])* $vis $name($borrow_slot_count, false));
+    ($(#[$attrs:meta])* $vis:vis $name:ident $(($($params:tt)*))?) => {
+        $crate::__domain_params!(__domain [$(#[$attrs])* $vis $name] [] $($($params)*)?);
+    };
+}
+
+/// Parses the parameters of domain macros, and calls the given macro with the domain's name
+/// followed by `(slots, synchronization)`, using default values for the missing ones.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __domain_params {
+    ($macro:ident [$($prefix:tt)*] [$($suffix:tt)*]) => {
+        $crate::$macro!($($prefix)* ($crate::domain::DEFAULT_BORROW_SLOT_COUNT, $crate::domain::Sequential) $($suffix)*);
+    };
+    ($macro:ident [$($prefix:tt)*] [$($suffix:tt)*] slots = $slots:expr, synchronization = $synchronization:ty $(,)?) => {
+        $crate::$macro!($($prefix)* ($slots, $synchronization) $($suffix)*);
+    };
+    ($macro:ident [$($prefix:tt)*] [$($suffix:tt)*] slots = $slots:expr $(,)?) => {
+        $crate::$macro!($($prefix)* ($slots, $crate::domain::Sequential) $($suffix)*);
+    };
+    ($macro:ident [$($prefix:tt)*] [$($suffix:tt)*] synchronization = $synchronization:ty $(,)?) => {
+        $crate::$macro!($($prefix)* ($crate::domain::DEFAULT_BORROW_SLOT_COUNT, $synchronization) $($suffix)*);
     };
 }
 
 #[doc(hidden)]
 pub use crossbeam_utils::CachePadded as __CachePadded;
 
-/// Platforms providing a process-wide memory barrier, possibly not supported at runtime, e.g.
-/// missing `membarrier` system call on old FreeBSD kernels, in which case barriers fall back to
-/// `fence(SeqCst)`.
-#[doc(hidden)]
-pub const __ASYMMETRIC_BARRIERS_SUPPORTED: bool = cfg!(all(
-    any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "windows",
-        target_vendor = "apple"
-    ),
-    // On ARM, only with RCpc (`ldapr`), as the acquire load of the critical path is otherwise
-    // already ordered after its release store (`ldar` on AArch64, `dmb` on 32-bit ARM), making
-    // process-wide memory barriers useless
-    not(target_arch = "arm"),
-    any(not(target_arch = "aarch64"), target_feature = "rcpc"),
-));
-
 /// SeqCst loads are plain loads on x86, but not on other architectures (e.g. `ldar` on ARMv8,
 /// `hwsync` on POWER).
 pub(crate) const SEQ_CST_LOAD_IS_FREE: bool =
     cfg!(any(target_arch = "x86", target_arch = "x86_64"));
-
-// Same platforms as `__ASYMMETRIC_BARRIERS_SUPPORTED`
-#[cfg(all(
-    feature = "membarrier",
-    not(miri),
-    not(loom),
-    any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "windows",
-        target_vendor = "apple"
-    ),
-    not(target_arch = "arm"),
-    any(not(target_arch = "aarch64"), target_feature = "rcpc"),
-))]
-use crate::membarrier as barriers;
-
-/// `fence(SeqCst)` barriers, used without process-wide memory barriers.
-#[cfg(not(all(
-    feature = "membarrier",
-    not(miri),
-    not(loom),
-    any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "windows",
-        target_vendor = "apple"
-    ),
-    not(target_arch = "arm"),
-    any(not(target_arch = "aarch64"), target_feature = "rcpc"),
-)))]
-mod barriers {
-    use crate::loom::sync::atomic::{fence, Ordering::SeqCst};
-
-    #[inline(always)]
-    pub(crate) fn init() {}
-    #[inline(always)]
-    pub(crate) fn light() {
-        fence(SeqCst);
-    }
-    #[inline(always)]
-    pub(crate) fn heavy() {
-        fence(SeqCst);
-    }
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub fn __init_barriers() {
-    barriers::init();
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub fn __light_barrier() {
-    barriers::light();
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub fn __heavy_barrier() {
-    barriers::heavy();
-}
 
 /// Implements the domain's thread-local node storage, with `with_local` and `register_release`
 /// methods.
@@ -921,7 +919,21 @@ macro_rules! __static_list {
         static LIST: $crate::domain::DomainList<$name> = $crate::domain::DomainList::new();
         static PADDED_LIST: $crate::domain::__CachePadded<$crate::domain::DomainList<$name>> =
             $crate::domain::__CachePadded::new($crate::domain::DomainList::new());
-        if <$name as $crate::domain::Domain>::ASYMMETRIC_BARRIERS {
+        // Checks whether the domain's synchronization implements `AsymmetricBarriers`: the
+        // inherent associated const, only defined if the bound is satisfied, takes precedence
+        // over the trait one (same technique as `impls` crate).
+        struct IsAsymmetricBarriers<T>(::core::marker::PhantomData<T>);
+        trait NotAsymmetricBarriers {
+            const VALUE: bool = false;
+        }
+        impl<T> NotAsymmetricBarriers for IsAsymmetricBarriers<T> {}
+        impl<T: $crate::domain::AsymmetricBarriers> IsAsymmetricBarriers<T> {
+            // Unused if the bound is not satisfied
+            #[allow(dead_code)]
+            const VALUE: bool = true;
+        }
+        type Synchronization = <$name as $crate::domain::Domain>::Synchronization;
+        if IsAsymmetricBarriers::<Synchronization>::VALUE {
             &*PADDED_LIST
         } else {
             &LIST
@@ -945,27 +957,14 @@ macro_rules! __static_list {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __domain {
-    ($(#[$attrs:meta])* $vis:vis $name:ident($borrow_slot_count:expr, $asymmetric_barriers:literal)) => {
+    ($(#[$attrs:meta])* $vis:vis $name:ident($borrow_slot_count:expr, $synchronization:ty)) => {
         $(#[$attrs])*
         #[derive(Debug)]
         $vis struct $name;
         $crate::__thread_local_node!($name);
         unsafe impl $crate::domain::Domain for $name {
             const BORROW_SLOT_COUNT: usize = $borrow_slot_count;
-            const ASYMMETRIC_BARRIERS: bool =
-                $asymmetric_barriers && $crate::domain::__ASYMMETRIC_BARRIERS_SUPPORTED;
-            #[inline(always)]
-            fn init_barriers() {
-                $crate::domain::__init_barriers();
-            }
-            #[inline(always)]
-            fn light_barrier() {
-                $crate::domain::__light_barrier();
-            }
-            #[inline(always)]
-            fn heavy_barrier() {
-                $crate::domain::__heavy_barrier();
-            }
+            type Synchronization = $synchronization;
             #[inline(always)]
             fn static_list() -> &'static $crate::domain::DomainList<Self> {
                 $crate::__static_list!($name)
@@ -982,57 +981,14 @@ macro_rules! __domain {
     };
 }
 
-/// Declares a domain using standard thread-local storage, and process-wide memory barriers.
-///
-/// Loads' critical path only executes compiler fences instead of memory barriers/atomic RMW
-/// operations, at the cost of a process-wide memory barrier in writes, e.g. a `membarrier` system
-/// call on Linux. It makes loads faster, but writes significantly costlier, impacting all the
-/// program's threads. Operations are also no longer sequentially consistent, see
-/// [memory ordering](crate#memory-ordering).
-///
-/// The domain should not be used in combination with [`Cache`](crate::Cache), as its loads don't
-/// use any barrier as long as the `AtomicArc` is not updated, while writes still pay for the
-/// process-wide memory barrier.
-///
-/// # Compatibility
-///
-/// | Platform        | Process-wide memory barrier                               |
-/// |-----------------|-----------------------------------------------------------|
-/// | Linux, Android  | `membarrier` system call, with `mprotect` fallback on x86 |
-/// | FreeBSD         | `membarrier` system call (FreeBSD 14.1+)                  |
-/// | Windows         | `FlushProcessWriteBuffers`                                |
-/// | Apple platforms | `thread_get_register_pointer_values` on every thread      |
-///
-/// If the `membarrier` system call is not available, barriers fall back to `fence(SeqCst)`, except
-/// on x86 Linux/Android with the `mprotect` fallback. Selecting the fallback at runtime adds a
-/// `Relaxed` atomic check to the loads' critical path (except on x86 Linux/Android), unless
-/// compiled with `--cfg hazarc_assume_membarrier`, in which case writes panic if `membarrier` is
-/// not available.
-///
-/// On ARM, process-wide memory barriers are only used on AArch64 with `rcpc` target feature
-/// (enabled by default on macOS).
-///
-/// On other platforms, the macro is equivalent to [`domain!`](crate::domain!).
-///
-/// # Examples
-///
-/// ```rust
-/// hazarc::membarrier_domain!(pub(crate) MyDomain(2)); // 2 borrow slots
-/// ```
-#[cfg(feature = "membarrier")]
-#[macro_export]
-macro_rules! membarrier_domain {
-    ($(#[$attrs:meta])* $vis:vis $name:ident($borrow_slot_count:expr)) => {
-        $crate::__domain!($(#[$attrs])* $vis $name($borrow_slot_count, true));
-    };
-}
-
 /// Declares a domain using POSIX pthread API.
 ///
+/// Parameters are the same as [`domain!`](crate::domain!).
+///
 /// # Examples
 ///
 /// ```rust
-/// hazarc::pthread_domain!(pub(crate) MyDomain(2)); // 2 borrow slots
+/// hazarc::pthread_domain!(pub(crate) MyDomain(slots = 2));
 /// ```
 ///
 /// # Unsafe use
@@ -1046,7 +1002,7 @@ macro_rules! membarrier_domain {
 ///
 /// ```rust
 /// // Requires to call `MyUnsafeDomain::pthread_key_create` before any use of it.
-/// hazarc::pthread_domain!(pub(crate) MyUnsafeDomain(2); unsafe { Self::pthread_key_already_created() });
+/// hazarc::pthread_domain!(pub(crate) MyUnsafeDomain(slots = 2); unsafe { Self::pthread_key_already_created() });
 /// ```
 ///
 /// *This convoluted syntax purpose is to trigger unsafe-related lints,
@@ -1056,10 +1012,19 @@ macro_rules! membarrier_domain {
 #[cfg(all(feature = "pthread-domain", unix))]
 #[macro_export]
 macro_rules! pthread_domain {
-    ($(#[$attrs:meta])* $vis:vis $name:ident($borrow_slot_count:expr)) => {
-        $crate::pthread_domain!($(#[$attrs])* $vis $name($borrow_slot_count); Self::pthread_key_create());
+    ($(#[$attrs:meta])* $vis:vis $name:ident $(($($params:tt)*))?; $init:expr) => {
+        $crate::__domain_params!(__pthread_domain [$(#[$attrs])* $vis $name] [; $init] $($($params)*)?);
     };
-    ($(#[$attrs:meta])* $vis:vis $name:ident($borrow_slot_count:expr); $init:expr) => {
+    ($(#[$attrs:meta])* $vis:vis $name:ident $(($($params:tt)*))?) => {
+        $crate::__domain_params!(__pthread_domain [$(#[$attrs])* $vis $name] [; Self::pthread_key_create()] $($($params)*)?);
+    };
+}
+
+#[cfg(all(feature = "pthread-domain", unix))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __pthread_domain {
+    ($(#[$attrs:meta])* $vis:vis $name:ident($borrow_slot_count:expr, $synchronization:ty); $init:expr) => {
         $(#[$attrs])*
         #[derive(Debug)]
         $vis struct $name;
@@ -1096,6 +1061,7 @@ macro_rules! pthread_domain {
         }
         unsafe impl $crate::domain::Domain for $name {
             const BORROW_SLOT_COUNT: usize = $borrow_slot_count;
+            type Synchronization = $synchronization;
             #[inline(always)]
             fn static_list() -> &'static $crate::domain::DomainList<Self> {
                 static LIST: $crate::domain::DomainList<$name> = $crate::domain::DomainList::new();
@@ -1144,9 +1110,9 @@ mod tests {
     #[test]
     fn node_reuse() {
         #[cfg(all(feature = "pthread-domain", unix))]
-        pthread_domain!(TestDomain(2));
+        pthread_domain!(TestDomain(slots = 2));
         #[cfg(not(all(feature = "pthread-domain", unix)))]
-        domain!(TestDomain(2));
+        domain!(TestDomain(slots = 2));
         let list = TestDomain::static_list();
         let _guard = ListAccessGuard::new(list); // prevent gc
         let node1 = list.acquire_node();
@@ -1162,9 +1128,9 @@ mod tests {
     #[test]
     fn reserve() {
         #[cfg(all(feature = "pthread-domain", unix))]
-        pthread_domain!(TestDomain(2));
+        pthread_domain!(TestDomain(slots = 2));
         #[cfg(not(all(feature = "pthread-domain", unix)))]
-        domain!(TestDomain(2));
+        domain!(TestDomain(slots = 2));
         let list = TestDomain::static_list();
         let _guard = ListAccessGuard::new(list); // prevent gc
         let node = list.acquire_node();
@@ -1177,9 +1143,9 @@ mod tests {
     #[test]
     fn deallocation() {
         #[cfg(all(feature = "pthread-domain", unix))]
-        pthread_domain!(TestDomain(2));
+        pthread_domain!(TestDomain(slots = 2));
         #[cfg(not(all(feature = "pthread-domain", unix)))]
-        domain!(TestDomain(2));
+        domain!(TestDomain(slots = 2));
         let list = TestDomain::static_list();
         let guard = ListAccessGuard::new(list); // prevent gc
         let node = list.acquire_node();
@@ -1198,9 +1164,9 @@ mod tests {
     #[test]
     fn no_deallocation_with_borrow() {
         #[cfg(all(feature = "pthread-domain", unix))]
-        pthread_domain!(TestDomain(1));
+        pthread_domain!(TestDomain(slots = 1));
         #[cfg(not(all(feature = "pthread-domain", unix)))]
-        domain!(TestDomain(1));
+        domain!(TestDomain(slots = 1));
         let list = TestDomain::static_list();
         let node = list.acquire_node();
         let slot = node.borrow_slots().next().unwrap();

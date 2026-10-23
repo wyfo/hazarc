@@ -62,7 +62,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use hazarc::{AtomicArc, domain::Domain};
 
-hazarc::pthread_domain!(NoStdDomain(2)); // 2 hazard pointer slots
+hazarc::pthread_domain!(NoStdDomain(slots = 2));
 fn register_domain_cleanup() {
     extern "C" fn deallocate_domain() {
         unsafe { NoStdDomain::static_list().deallocate() };

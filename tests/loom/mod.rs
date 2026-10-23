@@ -4,11 +4,11 @@
 compile_error!("loom tests requires debug_assertions enabled");
 
 #[cfg(not(loom))]
-pub use std::{cell::Cell, sync::Arc, thread};
+pub use std::{cell::Cell, sync::atomic::fence, sync::Arc, thread};
 
 use hazarc::domain::Domain;
 #[cfg(loom)]
-pub use loom::{cell::Cell, sync::Arc};
+pub use loom::{cell::Cell, sync::atomic::fence, sync::Arc};
 
 /// Wraps `loom::model`, releasing the main thread's node of domain `D` at the end of each
 /// iteration: loom drops lazy statics before main thread-locals, so a node acquired by a load in
@@ -21,7 +21,9 @@ pub fn model<D: Domain>(f: impl Fn() + Sync + Send + 'static) {
     #[cfg(not(loom))]
     f();
     #[cfg(loom)]
-    if D::ASYMMETRIC_BARRIERS {
+    if std::any::TypeId::of::<D::Synchronization>()
+        != std::any::TypeId::of::<hazarc::domain::Sequential>()
+    {
         use hazarc::domain::DomainExt;
         loom::model(move || {
             f();

@@ -129,7 +129,7 @@ where
 ///
 /// ```rust
 /// # use std::sync::Arc;
-/// # hazarc::domain!(Domain(8));
+/// # hazarc::domain!(Domain);
 /// # type AtomicArc<T> = hazarc::AtomicArc<T, Domain>;
 /// let atomic_arc = Arc::new(AtomicArc::<usize>::from(0));
 /// let mut cache = hazarc::Cache::new(atomic_arc);
@@ -140,7 +140,7 @@ where
 ///
 /// ```rust
 /// # use std::sync::Arc;
-/// # hazarc::domain!(Domain(8));
+/// # hazarc::domain!(Domain);
 /// # type AtomicOptionArc<T> = hazarc::AtomicOptionArc<T, Domain>;
 /// let atomic_arc = Arc::new(AtomicOptionArc::<usize>::none());
 /// let mut cache = hazarc::Cache::new(atomic_arc);
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn cache() {
-        domain!(TestDomain(1));
+        domain!(TestDomain(slots = 1));
         let atomic_arc = Arc::new(AtomicArc::<usize, TestDomain>::from(0));
         let mut cache = Cache::new(atomic_arc);
         assert_eq!(**cache.load(), 0);
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn cache_option() {
-        domain!(TestDomain(1));
+        domain!(TestDomain(slots = 1));
         let atomic_arc = Arc::new(AtomicOptionArc::<usize, TestDomain>::from(0));
         let mut cache = Cache::new(atomic_arc);
         assert_eq!(**cache.load().unwrap(), 0);

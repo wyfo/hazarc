@@ -53,7 +53,7 @@
 //!
 //! use hazarc::{domain::Domain, AtomicArc};
 //!
-//! hazarc::pthread_domain!(NoStdDomain(2)); // 2 hazard pointer slots
+//! hazarc::pthread_domain!(NoStdDomain(slots = 2));
 //! fn register_domain_cleanup() {
 //!     extern "C" fn deallocate_domain() {
 //!         unsafe { NoStdDomain::static_list().deallocate() };
@@ -80,7 +80,7 @@
 //! - `default-domain` *(enabled by default)*: provides a default domain parameter to [`AtomicArc`]
 //!   using standard thread-local storage.
 //! - `domain-gc`: enables automatic domain deallocation.
-//! - `membarrier`: enables the `membarrier_domain!` macro, using process-wide memory barriers
+//! - `membarrier`: enables `domain::Membarrier` synchronization, using process-wide memory barriers
 //!   (Linux, Android, FreeBSD, Windows and Apple platforms only; on ARM, only AArch64 with `rcpc`).
 //! - `portable-atomic`: uses [`portable-atomic`](https://docs.rs/portable-atomic) atomics instead
 //!   of `core` ones.
@@ -149,16 +149,19 @@
 //!
 //! # Memory ordering
 //!
-//! Without [asymmetric barriers], all `AtomicArc` operations are [`SeqCst`].
+//! The ordering of `AtomicArc` operations depends on the domain's [`Synchronization`]:
+//! - [`Sequential`]: all operations are [`SeqCst`].
+//! - [`AsymmetricBarriers`] implementations, e.g. `Membarrier` with `membarrier` feature: loads
+//!   are [`Acquire`], preceded by a [light barrier], and swaps are [`AcqRel`], followed by a
+//!   [heavy barrier]. The barriers make it possible to use `AtomicArc` in a Dekker algorithm.
+//!   However, loads and swaps are not part of the `SeqCst` total order, so independent reads of
+//!   independent writes (IRIW) may observe the writes in different orders.
 //!
-//! With asymmetric barriers, loads are [`Acquire`], preceded by a [light barrier], and swaps are
-//! [`AcqRel`], followed by a [heavy barrier]. The barriers make it possible to use `AtomicArc` in
-//! a Dekker algorithm. However, loads and swaps are not part of the `SeqCst` total order, so
-//! independent reads of independent writes (IRIW) may observe the writes in different orders.
-//!
-//! [asymmetric barriers]: domain::Domain::ASYMMETRIC_BARRIERS
-//! [light barrier]: domain::Domain::light_barrier
-//! [heavy barrier]: domain::Domain::heavy_barrier
+//! [`Synchronization`]: domain::Domain::Synchronization
+//! [`Sequential`]: domain::Sequential
+//! [`AsymmetricBarriers`]: domain::AsymmetricBarriers
+//! [light barrier]: domain::AsymmetricBarriers::light_barrier
+//! [heavy barrier]: domain::AsymmetricBarriers::heavy_barrier
 //! [`SeqCst`]: core::sync::atomic::Ordering::SeqCst
 //! [`Acquire`]: core::sync::atomic::Ordering::Acquire
 //! [`AcqRel`]: core::sync::atomic::Ordering::AcqRel
@@ -177,21 +180,7 @@ pub mod atomic;
 pub mod cache;
 pub mod domain;
 mod loom;
-// Same platforms as `domain::__ASYMMETRIC_BARRIERS_SUPPORTED`
-#[cfg(all(
-    feature = "membarrier",
-    not(miri),
-    not(loom),
-    any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "windows",
-        target_vendor = "apple"
-    ),
-    not(target_arch = "arm"),
-    any(not(target_arch = "aarch64"), target_feature = "rcpc"),
-))]
+#[cfg(feature = "membarrier")]
 mod membarrier;
 #[cfg(all(hazarc_assume_membarrier, not(feature = "membarrier")))]
 compile_error!("`hazarc_assume_membarrier` cfg requires `membarrier` feature");
@@ -203,8 +192,9 @@ pub mod write_policy;
 #[cfg(feature = "default-domain")]
 domain! {
     #[cfg(feature = "default-domain")]
-    /// Default domain with 32 borrow slots.
-    pub DefaultDomain(32)
+    /// Default domain with [`DEFAULT_BORROW_SLOT_COUNT`](domain::DEFAULT_BORROW_SLOT_COUNT)
+    /// borrow slots.
+    pub DefaultDomain
 }
 #[cfg(loom)]
 #[doc(hidden)]
