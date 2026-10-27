@@ -1,23 +1,14 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    arc::{ArcPtr, NonNullArcPtr},
-    atomic::{ArcPtrBorrow, AtomicArcPtr, AtomicOptionArcPtr},
-    cache::AtomicArcRef,
+    arc::ArcPtr,
+    atomic::{ArcPtrBorrow, AtomicArcPtr, AtomicArcRef},
     domain::Domain,
     write_policy::WritePolicy,
     Cache,
 };
 
 impl<A: ArcPtr + Serialize, D: Domain, W: WritePolicy> Serialize for AtomicArcPtr<A, D, W> {
-    fn serialize<Ser: Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
-        self.load().serialize(serializer)
-    }
-}
-
-impl<A: NonNullArcPtr + Serialize, D: Domain, W: WritePolicy> Serialize
-    for AtomicOptionArcPtr<A, D, W>
-{
     fn serialize<Ser: Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
         self.load().serialize(serializer)
     }
@@ -40,14 +31,6 @@ impl<'de, A: ArcPtr + Deserialize<'de>, D: Domain, W: WritePolicy> Deserialize<'
 {
     fn deserialize<De: Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
         Ok(Self::new(A::deserialize(deserializer)?))
-    }
-}
-
-impl<'de, A: NonNullArcPtr + Deserialize<'de>, D: Domain, W: WritePolicy> Deserialize<'de>
-    for AtomicOptionArcPtr<A, D, W>
-{
-    fn deserialize<De: Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
-        Ok(Self::new(Option::<A>::deserialize(deserializer)?))
     }
 }
 
