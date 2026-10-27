@@ -10,7 +10,10 @@ use std::{
 
 use arc_swap::{ArcSwap, ArcSwapOption, Guard};
 use divan::Bencher;
-use hazarc::{domain::Domain, ArcBorrow, AtomicArc, AtomicOptionArc, DefaultDomain};
+use hazarc::{
+    atomic::AtomicArcPtr, domain::Domain, write_policy::Concurrent, ArcBorrow, AtomicArc,
+    DefaultDomain,
+};
 
 trait LoadBench: Default + Send + Sync {
     const SLOT_COUNT: usize = 0;
@@ -137,11 +140,11 @@ impl<D: Domain> StoreBench for AtomicArc<usize, D> {
         self.store(arc);
     }
 }
-impl<D: Domain> LoadBench for AtomicOptionArc<usize, D> {
+impl<D: Domain> LoadBench for AtomicArcPtr<Option<Arc<usize>>, D, Concurrent> {
     const SLOT_COUNT: usize = D::BORROW_SLOT_COUNT;
     type Guard<'a> = Option<ArcBorrow<usize, D>>;
     fn load(&self) -> Self::Guard<'_> {
-        self.load()
+        self.load_opt()
     }
 }
 #[cfg(all(feature = "pthread-domain", unix))]
@@ -274,7 +277,7 @@ fn hazarc_load_no_slot_spin(b: Bencher) {
 }
 #[divan::bench]
 fn hazarc_load_none(b: Bencher) {
-    AtomicOptionArc::<_, DefaultDomain>::bench_load(b, false);
+    AtomicArcPtr::<Option<Arc<_>>, DefaultDomain, Concurrent>::bench_load(b, false);
 }
 #[divan::bench]
 fn hazarc_load_contended(b: Bencher) {

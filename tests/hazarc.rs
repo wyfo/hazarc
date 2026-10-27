@@ -4,7 +4,7 @@ use std::{mem::ManuallyDrop, ptr};
 use hazarc::domain::Membarrier as TestBarriers;
 use hazarc::{
     arc::ArcPtr,
-    atomic::{ArcPtrBorrow, AtomicArcPtr, AtomicOptionArcPtr},
+    atomic::{ArcPtrBorrow, AtomicArcPtr},
     domain::{Domain, DomainExt},
     write_policy::{Concurrent, Serialized, WritePolicy},
 };
@@ -15,7 +15,7 @@ use crate::loom::{model, thread, Arc, Cell};
 mod loom;
 
 type AtomicArc<T, D, W> = AtomicArcPtr<Arc<T>, D, W>;
-type AtomicOptionArc<T, D, W> = AtomicOptionArcPtr<Arc<T>, D, W>;
+type AtomicOptionArc<T, D, W> = AtomicArcPtr<Option<Arc<T>>, D, W>;
 
 /// Creates isolated domains per tests
 macro_rules! d {
@@ -156,10 +156,10 @@ fn concurrent_writes_option<D: Domain, W: WritePolicy>(
                 assert!(swapped.as_deref() == Some(&1) || swapped.as_deref() == Some(&0));
             });
             s.spawn(|| {
-                let guard = atomic_arc.load();
+                let guard = atomic_arc.load_opt();
                 check_borrow(&guard);
-                check_borrow(&atomic_arc.load());
-                check_borrow(&atomic_arc.load());
+                check_borrow(&atomic_arc.load_opt());
+                check_borrow(&atomic_arc.load_opt());
             });
         });
     });
@@ -324,11 +324,11 @@ fn seq_cst_ordering<D: Domain, W: WritePolicy>(
         thread::scope(|s| {
             let a = s.spawn(|| {
                 x.store(Some(Arc::new(())));
-                y.load()
+                y.load_opt()
             });
             let b = s.spawn(|| {
                 y.store(Some(Arc::new(())));
-                x.load()
+                x.load_opt()
             });
             assert!(a.join().unwrap().is_some() || b.join().unwrap().is_some());
         });

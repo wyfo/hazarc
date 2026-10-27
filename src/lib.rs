@@ -211,15 +211,6 @@ pub type AtomicArc<T, D = DefaultDomain, W = write_policy::Concurrent> =
 /// Alias for `AtomicArcPtr<Arc<T>>`
 #[cfg(all(not(feature = "default-domain"), target_has_atomic = "ptr"))]
 pub type AtomicArc<T, D, W = write_policy::Concurrent> = atomic::AtomicArcPtr<Arc<T>, D, W>;
-/// Alias for `AtomicOptionArcPtr<Arc<T>>`
-#[cfg(all(feature = "default-domain", target_has_atomic = "ptr"))]
-#[cfg_attr(docsrs, doc(cfg(all())))]
-pub type AtomicOptionArc<T, D = DefaultDomain, W = write_policy::Concurrent> =
-    atomic::AtomicOptionArcPtr<Arc<T>, D, W>;
-/// Alias for `AtomicOptionArcPtr<Arc<T>>`
-#[cfg(all(not(feature = "default-domain"), target_has_atomic = "ptr"))]
-pub type AtomicOptionArc<T, D, W = write_policy::Concurrent> =
-    atomic::AtomicOptionArcPtr<Arc<T>, D, W>;
 /// Alias for `ArcPtrBorrow<Arc<T>>`
 #[cfg(all(feature = "default-domain", target_has_atomic = "ptr"))]
 #[cfg_attr(docsrs, doc(cfg(all())))]

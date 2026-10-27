@@ -2,7 +2,7 @@
 
 #[cfg(target_has_atomic = "ptr")]
 use alloc::sync::Arc;
-use core::{fmt, marker::PhantomData, mem, mem::ManuallyDrop, ops::Deref};
+use core::{fmt, marker::PhantomData, mem::ManuallyDrop, ops::Deref};
 
 #[allow(unused_imports)]
 use crate::msrv::{OptionExt, StrictProvenance};
@@ -536,6 +536,14 @@ impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicArcPtr<Option<A>, D, W> 
     pub fn is_none(&self) -> bool {
         self.ptr.load(SeqCst).is_null()
     }
+
+    /// Loads a borrowed Arc, as an `Option`.
+    ///
+    /// See [`load`](Self::load).
+    #[inline]
+    pub fn load_opt(&self) -> Option<ArcPtrBorrow<A, D>> {
+        self.load().transpose()
+    }
 }
 
 impl<A: ArcPtr, D: Domain, W: WritePolicy> Drop for AtomicArcPtr<A, D, W> {
@@ -790,165 +798,37 @@ impl<A: ArcPtr, D: Domain> Deref for CachedOrReloaded<'_, A, D> {
     }
 }
 
-/// A wrapper around `AtomicArcPtr<Option<A>>` with a more ergonomic API.
-///
-/// For example, [`AtomicOptionArcPtr::load`] returns an `Option<ArcPtrBorrow<A, D>>` instead of
-/// `ArcPtrBorrow<Option<A>, D>`.
-#[repr(transparent)]
-pub struct AtomicOptionArcPtr<A: NonNullArcPtr, D: Domain, W: WritePolicy>(
-    AtomicArcPtr<Option<A>, D, W>,
-);
+/// A type that dereferences to an [`AtomicArc`](AtomicArcPtr).
+pub trait AtomicArcRef {
+    /// The Arc pointer stored in the `AtomicArc`.
+    type Arc: ArcPtr;
+    /// The domain of the `AtomicArc`.
+    type Domain: Domain;
+    /// The write policy of the `AtomicArc`.
+    type WritePolicy: WritePolicy;
+    /// Returns a reference to the `AtomicArc`.
+    fn atomic_arc(&self) -> &AtomicArcPtr<Self::Arc, Self::Domain, Self::WritePolicy>;
+}
 
-impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> AtomicOptionArcPtr<A, D, W> {
-    /// Constructs a new Arc atomic storage.
-    #[inline]
-    pub fn new(arc: Option<A>) -> Self {
-        Self(AtomicArcPtr::new(arc))
-    }
-
-    /// Returns a reference to the inner `AtomicArcPtr`.
-    #[inline]
-    pub fn inner(&self) -> &AtomicArcPtr<Option<A>, D, W> {
-        &self.0
-    }
-
-    /// Returns the inner `AtomicArcPtr`.
-    #[inline]
-    pub fn into_inner(self) -> AtomicArcPtr<Option<A>, D, W> {
-        self.0
-    }
-
-    /// Constructs a new Arc atomic storage with `None`.
-    #[inline]
-    #[cfg_attr(loom, const_fn::const_fn(cfg(false)))]
-    pub const fn none() -> Self {
-        Self(AtomicArcPtr::none())
-    }
-
-    /// Returns `true` if the stored Arc is `None`.
-    #[inline]
-    pub fn is_none(&self) -> bool {
-        self.0.is_none()
-    }
-
-    /// Loads a borrowed Arc.
-    #[inline]
-    pub fn load(&self) -> Option<ArcPtrBorrow<A, D>> {
-        self.0.load().transpose()
-    }
-
-    /// Loads an owned Arc.
-    #[inline]
-    pub fn load_owned(&self) -> Option<A> {
-        self.0.load_owned()
-    }
-
-    /// Consumes the atomic storage and returns the stored Arc.
-    #[inline]
-    pub fn into_owned(self) -> Option<A> {
-        self.0.into_owned()
-    }
-
-    /// Returns a reference to the cached Arc, updating it when it is outdated.
-    ///
-    /// See [`Cache`](crate::Cache) for a convenient wrapper around this method.
-    #[inline]
-    pub fn load_cached<'a>(&self, cached: &'a mut Option<A>) -> Option<&'a A> {
-        self.0.load_cached(cached).as_ref()
-    }
-
-    /// Returns a reference to the cached Arc if it is up-to-date, or loads the latest Arc.
-    #[inline]
-    pub fn load_cached_or_reload<'a>(
-        &self,
-        arc: &'a Option<A>,
-    ) -> Option<CachedOrReloaded<'a, A, D>> {
-        self.0.load_cached_or_reload(arc).transpose()
-    }
-
-    /// Stores the Arc and returns the previous one.
-    pub fn swap(&self, new: Option<A>) -> Option<A> {
-        self.0.swap(new)
-    }
-
-    /// Stores the Arc, dropping the previous one.
-    pub fn store(&self, new: Option<A>) {
-        self.0.store(new);
+impl<A: ArcPtr, D: Domain, W: WritePolicy> AtomicArcRef for AtomicArcPtr<A, D, W> {
+    type Arc = A;
+    type Domain = D;
+    type WritePolicy = W;
+    #[inline(always)]
+    fn atomic_arc(&self) -> &AtomicArcPtr<A, D, W> {
+        self
     }
 }
 
-impl<A: NonNullArcPtr, D: Domain> AtomicOptionArcPtr<A, D, Concurrent> {
-    /// Stores the new Arc if the current one matches the argument.
-    ///
-    /// Returns the previous Arc if store succeeds, or loads the current Arc otherwise.
-    pub fn compare_exchange<C: ArcRef<Option<A>>>(
-        &self,
-        current: C,
-        new: Option<A>,
-    ) -> Result<Option<A>, Option<ArcPtrBorrow<A, D>>> {
-        self.0
-            .compare_exchange(current, new)
-            .map_err(ArcPtrBorrow::transpose)
-    }
-
-    /// Fetches the current Arc, applies a function on it and tries to store the result if
-    /// the current Arc has not changed, retrying otherwise.
-    ///
-    /// Returns `Ok` with the previous Arc if the store succeeds, or `Err` with the current Arc
-    /// if the function returns `None`.
-    pub fn try_update<F: FnMut(Option<&A>) -> Option<R>, R: Into<Option<A>>>(
-        &self,
-        mut f: F,
-    ) -> Result<Option<A>, Option<ArcPtrBorrow<A, D>>> {
-        self.0
-            .try_update(|arc| f(arc.as_ref()))
-            .map_err(ArcPtrBorrow::transpose)
-    }
-
-    /// Fetches the current Arc, applies a function on it and tries to store the result if
-    /// the current Arc has not changed, retrying otherwise.
-    ///
-    /// Returns the previous Arc.
-    pub fn update<F: FnMut(Option<&A>) -> R, R: Into<Option<A>>>(&self, mut f: F) -> Option<A> {
-        self.0.update(|arc| f(arc.as_ref()))
-    }
-
-    #[doc(hidden)]
-    #[deprecated(note = "use `try_update` instead")]
-    pub fn fetch_update<F: FnMut(Option<&A>) -> Option<R>, R: Into<Option<A>>>(
-        &self,
-        f: F,
-    ) -> Result<Option<A>, Option<ArcPtrBorrow<A, D>>> {
-        self.try_update(f)
-    }
-}
-impl<A: NonNullArcPtr, D: Domain, W: WritePolicy> Default for AtomicOptionArcPtr<A, D, W> {
-    fn default() -> Self {
-        Self::none()
-    }
-}
-
-impl<A: NonNullArcPtr + fmt::Debug, D: Domain, W: WritePolicy> fmt::Debug
-    for AtomicOptionArcPtr<A, D, W>
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("AtomicOptionArcPtr").field(&self.0).finish()
-    }
-}
-
-impl<T, A: NonNullArcPtr, D: Domain, W: WritePolicy> From<T> for AtomicOptionArcPtr<A, D, W>
+impl<T: Deref> AtomicArcRef for T
 where
-    AtomicArcPtr<Option<A>, D, W>: From<T>,
+    T::Target: AtomicArcRef,
 {
-    fn from(value: T) -> Self {
-        Self(value.into())
-    }
-}
-
-impl<'a, A: NonNullArcPtr, D: Domain, W: WritePolicy> From<&'a AtomicArcPtr<Option<A>, D, W>>
-    for &'a AtomicOptionArcPtr<A, D, W>
-{
-    fn from(value: &'a AtomicArcPtr<Option<A>, D, W>) -> Self {
-        unsafe { mem::transmute::<&'a AtomicArcPtr<Option<A>, D, W>, Self>(value) }
+    type Arc = <T::Target as AtomicArcRef>::Arc;
+    type Domain = <T::Target as AtomicArcRef>::Domain;
+    type WritePolicy = <T::Target as AtomicArcRef>::WritePolicy;
+    #[inline(always)]
+    fn atomic_arc(&self) -> &AtomicArcPtr<Self::Arc, Self::Domain, Self::WritePolicy> {
+        (**self).atomic_arc()
     }
 }

@@ -126,7 +126,7 @@ This library uses unsafe code to deal with `AtomicPtr` manipulation and DST allo
 - Process-wide memory barriers support, e.g. Linux `membarrier`, to make `AtomicArc::load` even faster
 - [Better performance](benches/README.md), especially on ARM architecture
 - Null pointer/`None` load optimized
-- Ergonomic API for `Option`, `AtomicOptionArc<T>::load` returns `Option<ArcBorrow<T>>`
+- Ergonomic API for `Option`, `AtomicArcPtr<Option<Arc<T>>>::load_opt` returns `Option<ArcBorrow<T>>`
 
 ## License
 
