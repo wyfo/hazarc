@@ -61,7 +61,9 @@ impl TaggedPtr for *mut () {
 /// See [crate] documentation.
 pub struct AtomicArcPtr<A: ArcPtr, D: Domain, W: WritePolicy> {
     ptr: AtomicPtr<()>,
-    _arc: PhantomData<A>,
+    /// Invariant: covariance would allow storing an Arc with a shorter lifetime,
+    /// and contravariance loading it with a longer one.
+    _arc: PhantomData<fn(A) -> A>,
     _domain: PhantomData<D>,
     _write_policy: PhantomData<W>,
 }
