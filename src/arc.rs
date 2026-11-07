@@ -1,7 +1,7 @@
 //! Generic traits for `Arc`-like pointer types
 
 #[cfg(target_has_atomic = "ptr")]
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use core::{mem, mem::ManuallyDrop, ops::Deref, pin::Pin, ptr};
 
 #[allow(unused_imports)]
@@ -15,6 +15,11 @@ use crate::{atomic::ArcPtrBorrow, domain::Domain, NULL};
 /// Implementors must have the same semantics as [`Arc`]. The pointer returned by
 /// [`into_ptr`](Self::into_ptr)/[`as_ptr`](Self::as_ptr) must be aligned to 4 and not be null
 /// unless [`NULLABLE`](Self::NULLABLE) is set to true.
+///
+/// Two `ArcPtr` instances must not return the same pointer if they don't hold the same kind of
+/// reference. In particular, the trait cannot be implemented by both strong `Arc` and `Weak`
+/// references if they both return the same pointer. On the other hand, wrappers like `Option<Arc>`
+/// or `Pin<Arc>` can coexist with `Arc`.
 pub unsafe trait ArcPtr: Clone {
     /// Whether this pointer type may be null.
     const NULLABLE: bool = false;
@@ -136,41 +141,6 @@ unsafe impl<T> ArcPtr for loom::sync::Arc<T> {
 #[cfg(loom)]
 unsafe impl<T> NonNullArcPtr for loom::sync::Arc<T> {}
 
-/// `Weak::new()` may return an unaligned pointer, so it is normalized to null.
-#[cfg(all(
-    any(target_has_atomic = "ptr", feature = "portable-atomic-util"),
-    not(target_pointer_width = "16")
-))]
-#[inline(always)]
-fn normalize_weak_ptr<T>(ptr: *const T) -> *mut () {
-    use crate::atomic::TaggedPtr;
-    let ptr = ptr.cast_mut().cast::<()>();
-    if ptr.tag() != 0 {
-        return NULL;
-    }
-    ptr
-}
-
-#[cfg(all(target_has_atomic = "ptr", not(target_pointer_width = "16")))]
-unsafe impl<T> ArcPtr for Weak<T> {
-    const NULLABLE: bool = true;
-    #[inline(always)]
-    unsafe fn from_ptr(ptr: *mut ()) -> Self {
-        if ptr.is_null() {
-            return Weak::new();
-        }
-        unsafe { Weak::from_raw(ptr.cast()) }
-    }
-    #[inline(always)]
-    fn into_ptr(arc: Self) -> *mut () {
-        normalize_weak_ptr(Weak::into_raw(arc))
-    }
-    #[inline(always)]
-    fn as_ptr(arc: &Self) -> *mut () {
-        normalize_weak_ptr(Weak::as_ptr(arc))
-    }
-}
-
 #[cfg(all(feature = "portable-atomic-util", not(target_pointer_width = "16")))]
 unsafe impl<T> ArcPtr for portable_atomic_util::Arc<T> {
     #[inline(always)]
@@ -184,26 +154,6 @@ unsafe impl<T> ArcPtr for portable_atomic_util::Arc<T> {
     #[inline(always)]
     fn as_ptr(arc: &Self) -> *mut () {
         portable_atomic_util::Arc::as_ptr(arc).cast_mut().cast()
-    }
-}
-
-#[cfg(all(feature = "portable-atomic-util", not(target_pointer_width = "16")))]
-unsafe impl<T> ArcPtr for portable_atomic_util::Weak<T> {
-    const NULLABLE: bool = true;
-    #[inline(always)]
-    unsafe fn from_ptr(ptr: *mut ()) -> Self {
-        if ptr.is_null() {
-            return portable_atomic_util::Weak::new();
-        }
-        unsafe { portable_atomic_util::Weak::from_raw(ptr.cast()) }
-    }
-    #[inline(always)]
-    fn into_ptr(arc: Self) -> *mut () {
-        normalize_weak_ptr(portable_atomic_util::Weak::into_raw(arc))
-    }
-    #[inline(always)]
-    fn as_ptr(arc: &Self) -> *mut () {
-        normalize_weak_ptr(portable_atomic_util::Weak::as_ptr(arc))
     }
 }
 
