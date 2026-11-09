@@ -195,6 +195,25 @@ impl StoreBench for RwLockClone<Arc<usize>> {
     }
 }
 
+struct Aarc(aarc::AtomicArc<usize>);
+impl Default for Aarc {
+    fn default() -> Self {
+        Self(aarc::AtomicArc::new(0))
+    }
+}
+impl LoadBench for Aarc {
+    type Guard<'a> = Option<aarc::Guard<'static, usize>>;
+    fn load(&self) -> Self::Guard<'_> {
+        self.0.load()
+    }
+}
+impl LoadBench for aarc::AtomicArc<usize> {
+    type Guard<'a> = Option<aarc::Guard<'static, usize>>;
+    fn load(&self) -> Self::Guard<'_> {
+        self.load()
+    }
+}
+
 #[derive(Default)]
 struct LoadSpin<T>(T);
 impl<T: LoadBench> LoadBench for LoadSpin<T> {
@@ -241,6 +260,15 @@ fn arcswap_store(b: Bencher, threads: usize) {
 #[divan::bench(args = [0, 1, 2, 4, 8, 16])]
 fn arcswap_store_contended(b: Bencher, threads: usize) {
     ArcSwap::bench_store_contended(b, threads);
+}
+
+#[divan::bench]
+fn aarc_load(b: Bencher) {
+    Aarc::bench_load(b, false);
+}
+#[divan::bench]
+fn aarc_load_none(b: Bencher) {
+    aarc::AtomicArc::<usize>::bench_load(b, false);
 }
 
 #[divan::bench]
