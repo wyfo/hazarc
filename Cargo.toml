@@ -42,6 +42,7 @@ loom = "0.7.2"
 const_fn = "0.4.12"
 
 [dev-dependencies]
+aarc = "0.4.0"
 arc-swap = "1.8.0"
 divan = "0.1.21"
 rstest = "0.27.0"
